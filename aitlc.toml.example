@@ -1,0 +1,79 @@
+# Copy to aitlc.toml (or .aitlc.toml) in your project root and fill in.
+# aitlc searches upward from the current directory for this file.
+#
+# `aitlc init` writes this file for you by inspecting the repo — prefer that
+# over filling it in by hand, and keep this as the reference for what each
+# setting means.
+
+[project]
+name = "myproject"
+issue_key_prefix = "PROJ-"
+feature_dir = "features"
+step_dir = "features/steps"
+
+# Where the project defines its locators. Used by `aitlc record
+# --suggest-steps` to tell recorded selectors apart from ones you already have.
+locators_dir = "config/web_locators"
+
+# The project's own per-scenario setup, called with behave's
+# (context, scenario) signature. `aitlc steps run` executes a slice of steps
+# OUTSIDE a real behave run, so before_scenario never fires and any data that
+# hook generates is absent — naming it here is what makes data-dependent steps
+# work in a slice.
+# scenario_setup = "features.environment_helpers:populate_scenario_data"
+
+# A class wrapping a Playwright Page, assigned to context.browser. Most suites
+# write steps against such a wrapper rather than the raw Page. Leave unset if
+# your steps use the Page directly.
+# browser_actions = "helpers.browser:BrowserActions"
+
+# A class exposing launch_local_mobile_browser_via_cdp(playwright, cdp_url,
+# device_name). Only needed to combine --mobile with --cdp-url.
+# browser_factory = "helpers.browser:BrowserFactory"
+
+[env]
+# Maps aitlc's generic credential names to the env var names THIS project uses.
+# Only names live here — aitlc never stores a secret value.
+lt_username = "LT_USERNAME"
+lt_access_key = "LT_ACCESS_KEY"
+lt_proxy_host = "LT_PROXY_HOST"
+lt_proxy_port = "LT_PROXY_PORT"
+jira_email = "JIRA_EMAIL"
+jira_token = "JIRA_TOKEN"
+jira_xray_client_id = "JIRA_XRAY_CLIENT_ID"
+jira_xray_client_secret = "JIRA_XRAY_CLIENT_SECRET"
+s3_access_key_id = "AWS_ACCESS_KEY_ID"
+s3_secret_access_key = "AWS_SECRET_ACCESS_KEY"
+s3_session_token = "AWS_SESSION_TOKEN"
+# `aitlc notify-teams` posts a per-run failure + duration summary here.
+teams_webhook_url = "TEAMS_WEBHOOK_URL"
+
+[mobile]
+mobile_feature_title_pattern = "Mobile browser:"
+mobile_device_env_var = "DEVICE_NAME"
+mobile_device_env_value = "MOBILE_DEVICE"
+
+[lambdatest]
+tunnel_name = "my-tunnel"
+# Confirm the real ceiling for your account; this is only a safe starting point.
+max_concurrent_sessions = 5
+
+# Optional. Run before `aitlc run --remote`; its LAST stdout line becomes
+# PLATFORM_ENVIRONMENT. Needed when a project builds its own capabilities list
+# and setting TESTING_PLATFORM alone is not enough for its hooks. Supports
+# {poetry}, {feature_name}, {platform_name} and {device_name}.
+# platform_environment_command = """{poetry} run python3 -c \"...\""""
+
+[xray]
+graphql_url = "https://xray.cloud.getxray.app/api/v2/graphql"
+
+[jira]
+# Jira Cloud itself, distinct from Xray's GraphQL endpoint above. Used by
+# `aitlc jira create-task`, which goes through Jira's own REST API.
+# server_url = "https://your-org.atlassian.net"
+
+[s3]
+# Where CI uploads reports, for `aitlc s3 fetch-report` / `list-reports`.
+bucket = "my-reports-bucket"
+region = "us-east-2"
+report_prefix = "my_project"

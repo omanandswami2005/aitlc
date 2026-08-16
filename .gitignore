@@ -1,0 +1,8 @@
+# Local dev artifacts — never part of the tracked tool.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+dist_check/

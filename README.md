@@ -1,0 +1,135 @@
+# aitlc
+
+A CLI for debugging Behave + Playwright test suites and keeping them in sync
+with Xray. Structured JSON output first, so a person and an agent can read the
+same result.
+
+**It never asks you to edit the suite it debugs.** No hook blocks, no
+`environment.py` changes, nothing to keep in sync — instrumentation attaches
+through behave's own runner API, with a fallback for versions that lack it.
+
+```bash
+uv tool install aitlc      # or: pipx install aitlc
+cd /path/to/your/project
+aitlc init                 # detects your layout, writes aitlc.toml
+aitlc run PROJ-1234
+```
+
+The command is always `aitlc`. It is published under two names — `aitlc` and
+`dax-aitlc` — which install the same tool; use whichever your org prefers.
+
+## What it does
+
+**Run and target tests.** Bare test IDs resolve recursively, so you never need
+a full path, and never need to tag other features to narrow a run. One Examples
+row of a Scenario Outline can be run on its own.
+
+```bash
+aitlc run PROJ-1234                 # structured JSON result
+aitlc run PROJ-1234 --debug         # halt on failure, browser stays open
+aitlc parallel run -j 4             # concurrent, without editing tags
+aitlc parallel focus PROJ-1234      # pin a selection, then just `aitlc parallel run`
+```
+
+**Debug live.** Keep one browser across many iterations instead of paying setup
+and login on every change. `aitlc steps run --range 14-19` resumes a scenario
+partway through in an already-open browser — replacing the habit of commenting
+out the steps that already passed.
+
+```bash
+aitlc cdp launch                    # detached; survives the shell that started it
+aitlc cdp launch --new              # isolated: own port + own profile
+aitlc steps run PROJ-1234 --range 14-19 --cdp-url http://127.0.0.1:9333
+```
+
+**Read a page as text, not pixels.** The accessibility tree answers "is X on
+screen" as assertable text, and carries nesting, control state and field values
+a screenshot cannot express. Measured on one real page: 55 KB screenshot →
+1,961 characters for the full tree → 20 characters for a targeted query.
+
+```bash
+aitlc cdp inspect --cdp-url http://127.0.0.1:9333 --a11y --a11y-query "Save"
+```
+
+**Find dead step definitions.** behave has no equivalent of Cucumber's
+unused-step report. Matching goes through behave's own registry, so the answer
+agrees with what the runner would dispatch, and steps invoked via
+`context.execute_steps(...)` count as used.
+
+```bash
+aitlc steps unused
+```
+
+**Track real flakiness.** Signature matching only ever covers flakes somebody
+already described. `aitlc history` records every run outcome, so a new flake is
+visible the second time it happens. A test that has only ever failed is
+reported as broken rather than flaky — retrying it spends time to reach the
+same answer.
+
+**Sync with Xray.** Read, compare and write a Test's Gherkin; pull every
+feature from a Test Execution or Plan; find where a step is really used.
+
+**Escape hatches.** `aitlc behave` and `aitlc pw` run those tools directly with
+your project's `.env` and interpreter already set up, so adopting aitlc never
+means losing a flag it does not wrap. `--print-command` shows the exact
+invocation without running it.
+
+## Documentation
+
+| File | For |
+|---|---|
+| `USER-GUIDE.md` | Full reference — written to be read directly by an agent |
+| `user-guide.html` | The same guide as a browsable page |
+| `aitlc.toml.example` | Annotated configuration template |
+
+## Requirements
+
+Python 3.10+. The suite under test keeps its own environment; aitlc runs
+outside it and shells in, so the two never need to share dependencies.
+
+## Design notes
+
+Three rules the code holds to, each learned from a bug that cost real time:
+
+- **Never report success for something that did not happen.** Missing setup, an
+  incomplete feature corpus, or an instrumentation fallback are each reported
+  explicitly, because silence surfaces later as an unrelated-looking failure.
+- **Ask the tool, do not assume its version.** behave's custom-runner option
+  changed both its name and its argument format across releases, so aitlc
+  probes `behave --help` rather than parsing a version string.
+- **Nothing project-specific in the code.** Layout, hook names and credential
+  variable names all come from `aitlc.toml`, and `aitlc init` detects them.
+
+## Development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest tests/ -q
+```
+
+## Releasing
+
+```bash
+.venv/bin/pip install -e ".[publish]"
+python scripts/build_dual_name.py     # both names, into dist/
+python -m twine check dist/*
+python -m twine upload --repository testpypi dist/*
+python -m twine upload dist/*
+```
+
+`build_dual_name.py` rewrites the distribution name, builds, and restores
+`pyproject.toml` in a `finally` — a failed build never leaves the repo holding
+a name nobody chose.
+
+Install from TestPyPI into a scratch environment and run `aitlc init` against a
+real project before the last line. That is the step that catches a broken
+config template or a missing dependency; nothing local will.
+
+Two things about the final upload are irreversible: a version number can never
+be reused, and deleting a project does not release its name. Check the
+`[project.urls]` values first — they are baked into a version's metadata and
+cannot be edited afterwards.
+
+## License
+
+MIT — see `LICENSE`.

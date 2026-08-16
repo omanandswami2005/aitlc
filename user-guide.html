@@ -1,0 +1,615 @@
+<title>aitlc Field Guide</title>
+<style>
+  /* Light palette is the base; every colour is a token so all three
+     theme states (light, dark, un-stamped system) resolve as a set. */
+  :root {
+    --bg:        #f6f6fa;
+    --surface:   #ffffff;
+    --surface-2: #eeeef4;
+    --ink:       #16171f;
+    --ink-2:     #43455a;
+    --muted:     #6b6d82;
+    --rule:      #dcdce6;
+    --signal:    #0d6f7d;   /* diagnostic teal: primary channel */
+    --signal-bg: #e4f2f4;
+    --agent:     #8f5307;   /* warm: reserved for agent-use panels */
+    --agent-bg:  #fbf1e3;
+    --agent-rule:#e8cfa8;
+    --warn:      #9a3412;
+    --warn-bg:   #fbeae4;
+    --code-bg:   #14151d;
+    --code-ink:  #e7e7f0;
+    --code-dim:  #8b8da3;
+    --shadow:    0 1px 2px rgba(22,23,31,.06), 0 8px 24px rgba(22,23,31,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:        #0f1016;
+      --surface:   #171822;
+      --surface-2: #1e1f2b;
+      --ink:       #f2f2f7;
+      --ink-2:     #c3c4d4;
+      --muted:     #8f91a6;
+      --rule:      #2a2b39;
+      --signal:    #4fbecd;
+      --signal-bg: #10303550;
+      --agent:     #e0a75c;
+      --agent-bg:  #2e220f50;
+      --agent-rule:#4a3a1c;
+      --warn:      #f0a58a;
+      --warn-bg:   #33190f50;
+      --code-bg:   #0a0b11;
+      --code-ink:  #e7e7f0;
+      --code-dim:  #7b7d93;
+      --shadow:    0 1px 2px rgba(0,0,0,.5), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:        #0f1016;
+    --surface:   #171822;
+    --surface-2: #1e1f2b;
+    --ink:       #f2f2f7;
+    --ink-2:     #c3c4d4;
+    --muted:     #8f91a6;
+    --rule:      #2a2b39;
+    --signal:    #4fbecd;
+    --signal-bg: #10303550;
+    --agent:     #e0a75c;
+    --agent-bg:  #2e220f50;
+    --agent-rule:#4a3a1c;
+    --warn:      #f0a58a;
+    --warn-bg:   #33190f50;
+    --code-bg:   #0a0b11;
+    --code-ink:  #e7e7f0;
+    --code-dim:  #7b7d93;
+    --shadow:    0 1px 2px rgba(0,0,0,.5), 0 8px 24px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+
+  .wrap {
+    display: grid;
+    grid-template-columns: 250px minmax(0, 1fr);
+    gap: 56px;
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 0 32px 96px;
+  }
+
+  /* ---- masthead ---- */
+  header.top {
+    grid-column: 1 / -1;
+    padding: 64px 0 40px;
+    border-bottom: 1px solid var(--rule);
+    margin-bottom: 48px;
+  }
+  .eyebrow {
+    font-size: 11px; font-weight: 700;
+    letter-spacing: .16em; text-transform: uppercase;
+    color: var(--signal);
+  }
+  h1 {
+    font-size: clamp(2.1rem, 4.4vw, 3.1rem);
+    line-height: 1.05; letter-spacing: -.03em;
+    font-weight: 800; margin: 12px 0 0; text-wrap: balance;
+  }
+  .lede {
+    max-width: 62ch; margin: 16px 0 0;
+    font-size: 1.06rem; color: var(--ink-2);
+  }
+  .pill-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+  .pill {
+    font-size: 12px; font-weight: 600;
+    padding: 5px 11px; border-radius: 999px;
+    background: var(--signal-bg); color: var(--signal);
+    border: 1px solid color-mix(in srgb, var(--signal) 22%, transparent);
+  }
+
+  /* ---- index ---- */
+  nav.index { position: sticky; top: 24px; align-self: start; }
+  nav.index h2 {
+    font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--muted); margin: 0 0 14px; font-weight: 700;
+  }
+  nav.index ol { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+  nav.index a {
+    display: block; padding: 6px 10px; border-radius: 7px;
+    color: var(--ink-2); text-decoration: none; font-size: 14px;
+    border-left: 2px solid transparent;
+  }
+  nav.index a:hover { background: var(--surface-2); color: var(--ink); }
+  nav.index a:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+  nav.index .sub { padding-left: 22px; font-size: 13.5px; color: var(--muted); }
+
+  /* ---- content ---- */
+  main { min-width: 0; display: flex; flex-direction: column; gap: 44px; }
+  section { scroll-margin-top: 24px; }
+  h2.sec {
+    font-size: 1.62rem; letter-spacing: -.02em; font-weight: 750;
+    margin: 0 0 6px; text-wrap: balance;
+  }
+  .sec-note { color: var(--muted); margin: 0 0 22px; max-width: 66ch; }
+  h3 { font-size: 1.06rem; font-weight: 700; margin: 0 0 8px; letter-spacing: -.01em; }
+  p { margin: 0 0 14px; max-width: 68ch; }
+  a { color: var(--signal); }
+
+  /* ---- command card ---- */
+  .cmd {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 12px;
+    padding: 22px 24px;
+    box-shadow: var(--shadow);
+    margin-bottom: 18px;
+  }
+  .cmd-name {
+    display: inline-block;
+    font-size: 15px; font-weight: 700;
+    color: var(--signal);
+    background: var(--signal-bg);
+    padding: 4px 10px; border-radius: 7px;
+    margin-bottom: 10px;
+    border: 1px solid color-mix(in srgb, var(--signal) 20%, transparent);
+  }
+
+  /* ---- steps (real sequence, so numbered) ---- */
+  .steps { counter-reset: s; display: flex; flex-direction: column; gap: 22px; }
+  .step { counter-increment: s; position: relative; padding-left: 46px; }
+  .step::before {
+    content: counter(s);
+    position: absolute; left: 0; top: 0;
+    width: 30px; height: 30px; border-radius: 8px;
+    display: grid; place-items: center;
+    background: var(--signal); color: #fff;
+    font-size: 14px; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  pre {
+    background: var(--code-bg); color: var(--code-ink);
+    padding: 15px 17px; border-radius: 9px;
+    overflow-x: auto; font-size: 13.4px; line-height: 1.62;
+    margin: 0 0 14px;
+  }
+  pre .c { color: var(--code-dim); }
+  :not(pre) > code {
+    background: var(--surface-2); color: var(--ink);
+    padding: 1.5px 5px; border-radius: 4px; font-size: .9em;
+    border: 1px solid var(--rule);
+  }
+
+  /* ---- agent channel: warm, visually distinct from human docs ---- */
+  .agent {
+    background: var(--agent-bg);
+    border: 1px solid var(--agent-rule);
+    border-radius: 9px;
+    padding: 13px 16px;
+    margin-top: 4px;
+  }
+  .agent .tag {
+    font-size: 10.5px; font-weight: 800; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--agent);
+    display: block; margin-bottom: 5px;
+  }
+  .agent p { margin: 0; font-size: 14.4px; color: var(--ink-2); max-width: none; }
+
+  .callout {
+    background: var(--warn-bg);
+    border-left: 3px solid var(--warn);
+    border-radius: 0 8px 8px 0;
+    padding: 13px 16px; margin: 0 0 14px;
+  }
+  .callout p { margin: 0; font-size: 14.6px; }
+  .callout strong { color: var(--warn); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 14.4px; margin: 0 0 14px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .scroll-x { overflow-x: auto; }
+
+  /* Detection column: the distinction is auto-detected vs. written by hand,
+     so it reads as a status word, not a decorative badge. */
+  td.yes, td.no {
+    font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase;
+    font-weight: 700; white-space: nowrap;
+  }
+  td.yes { color: var(--signal); }
+  td.no  { color: var(--warn); }
+
+  .mini-h {
+    font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); font-weight: 700; margin: 20px 0 8px;
+  }
+
+  ul.tight { margin: 0 0 14px; padding-left: 20px; }
+  ul.tight li { margin-bottom: 7px; max-width: 66ch; }
+
+  footer {
+    grid-column: 1 / -1;
+    border-top: 1px solid var(--rule);
+    margin-top: 24px; padding-top: 22px;
+    color: var(--muted); font-size: 14px;
+  }
+
+  @media (max-width: 900px) {
+    .wrap { grid-template-columns: 1fr; gap: 0; padding: 0 20px 64px; }
+    nav.index { position: static; margin-bottom: 40px; }
+    header.top { padding-top: 44px; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="top">
+    <div class="eyebrow">Field Guide</div>
+    <h1>aitlc</h1>
+    <p class="lede">
+      A CLI for debugging Behave&nbsp;+&nbsp;Playwright suites and keeping them in
+      sync with Xray. Structured JSON first, so a person and an agent read the
+      same result.
+    </p>
+    <div class="pill-row">
+      <span class="pill">No project edits required</span>
+      <span class="pill">JSON / TOON output</span>
+      <span class="pill">Attaches via behave's runner API</span>
+    </div>
+  </header>
+
+  <nav class="index">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#setup">Setup</a></li>
+      <li><a href="#independent">Codebase independence</a></li>
+      <li><a href="#running">Running tests</a></li>
+      <li><a href="#running" class="sub">run · parallel · focus</a></li>
+      <li><a href="#debugging">Debugging live</a></li>
+      <li><a href="#debugging" class="sub">cdp · steps run</a></li>
+      <li><a href="#a11y">Reading a page cheaply</a></li>
+      <li><a href="#health">Suite health</a></li>
+      <li><a href="#health" class="sub">steps unused · history</a></li>
+      <li><a href="#xray">Xray sync</a></li>
+      <li><a href="#evidence">Evidence</a></li>
+      <li><a href="#hatches">Escape hatches</a></li>
+      <li><a href="#rest">Everything else</a></li>
+      <li><a href="#trouble">Troubleshooting</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+    <section id="setup">
+      <h2 class="sec">Setup</h2>
+      <p class="sec-note">Three steps. aitlc runs outside your project's virtualenv and shells into it, so it never shares dependencies with the suite under test.</p>
+
+      <div class="steps">
+        <div class="step">
+          <h3>Install</h3>
+<pre><code>uv tool install aitlc      <span class="c"># or: pipx install aitlc</span>
+aitlc --help</code></pre>
+          <p>The same tool is published under two distribution names — <code>aitlc</code> and <code>dax-aitlc</code>. They install identical code and both provide the <code>aitlc</code> command; pick whichever your organisation's index prefers, and install only one.</p>
+        </div>
+
+        <div class="step">
+          <h3>Generate <code>aitlc.toml</code></h3>
+<pre><code>cd /path/to/your/project
+aitlc init --dry-run   <span class="c"># see what it detected, write nothing</span>
+aitlc init             <span class="c"># write the file</span></code></pre>
+          <p><code>init</code> reads the repo and fills the file in — feature and step directories from where the files actually are, the issue-key prefix from feature filenames, and <code>scenario_setup</code> from the call inside your own <code>before_scenario</code>. <code>[env]</code> is populated from your <code>.env</code>: <strong>variable names only, no value is ever read or stored</strong>. Anything undetected is written as a commented placeholder rather than guessed.</p>
+          <p>aitlc searches upward from the current directory, so one file at the repo root covers every subdirectory. The result looks like this:</p>
+<pre><code>[project]
+name = "myproject"
+issue_key_prefix = "PROJ-"
+feature_dir = "features"
+step_dir = "features/steps"
+locators_dir = "config/web_locators"
+
+<span class="c"># Your own per-scenario setup, called with behave's (context, scenario)
+# signature. Without it, a step slice gets no before_scenario at all.</span>
+scenario_setup = "features.environment_helpers:populate_scenario_data"
+
+<span class="c"># The class your steps actually talk to. Most suites wrap Playwright's Page
+# in one; name it and a step slice gets the same context.browser a real run
+# would. Leave unset if your steps use the Page directly.</span>
+browser_actions = "helpers.browser:BrowserActions"
+
+[env]
+<span class="c"># Maps aitlc's generic names -> your actual env var names.
+# aitlc stores no secrets; it only learns which variables to read.</span>
+jira_token = "JIRA_TEST_TOKEN"
+jira_xray_client_id = "JIRA_XRAY_CLIENT_ID"
+jira_xray_client_secret = "JIRA_XRAY_CLIENT_SECRET"</code></pre>
+
+          <h4 class="mini-h">What each <code>[project]</code> setting controls</h4>
+          <div class="scroll-x">
+            <table>
+              <thead><tr><th>Setting</th><th>Detected?</th><th>What it changes</th></tr></thead>
+              <tbody>
+                <tr><td><code>name</code></td><td class="yes">auto</td><td>Labels output only.</td></tr>
+                <tr><td><code>issue_key_prefix</code></td><td class="yes">auto</td><td>Lets you type <code>1234</code> instead of <code>PROJ-1234</code>.</td></tr>
+                <tr><td><code>feature_dir</code></td><td class="yes">auto</td><td>Bare-ID resolution searches here, recursively.</td></tr>
+                <tr><td><code>step_dir</code></td><td class="yes">auto</td><td>Feeds <code>steps unused</code> and the step console's registry.</td></tr>
+                <tr><td><code>locators_dir</code></td><td class="yes">auto</td><td><code>record --suggest-steps</code> uses it to tell a newly recorded selector from one you already have.</td></tr>
+                <tr><td><code>scenario_setup</code></td><td class="yes">auto</td><td>Makes <code>steps run</code> slices work on data-dependent steps.</td></tr>
+                <tr><td><code>browser_actions</code></td><td class="no">manual</td><td>The class assigned to <code>context.browser</code> in a step slice. Without it the raw <code>Page</code> is used, and steps written against a wrapper fail on their first call.</td></tr>
+                <tr><td><code>browser_factory</code></td><td class="no">manual</td><td>A class exposing <code>launch_local_mobile_browser_via_cdp(playwright, cdp_url, device_name)</code>. Only needed to combine <code>--mobile</code> with <code>--cdp-url</code>.</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p>The last two are undetected on purpose: there is no reliable signal for which of a project's many classes is <em>the</em> browser wrapper, and guessing wrong produces a confusing failure several steps later. <code>init</code> writes them as commented placeholders instead.</p>
+        </div>
+
+        <div class="step">
+          <h3>Verify</h3>
+<pre><code>aitlc doctor                    <span class="c"># environment checks</span>
+aitlc run &lt;TEST-ID&gt; --dry-run   <span class="c"># steps resolve, no browser</span></code></pre>
+          <p><code>--dry-run</code> is the cheapest real signal that config, paths and step imports are all correct.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="independent">
+      <h2 class="sec">How it stays codebase-independent</h2>
+      <p class="sec-note">A debugging tool that requires editing the suite it debugs cannot be adopted incrementally, cannot be uninstalled cleanly, and silently becomes a no-op for anyone who installs the tool but not the edit.</p>
+
+      <p>aitlc attaches instead, in three layers:</p>
+      <ul class="tight">
+        <li><strong>behave's own runner option.</strong> aitlc ships a <code>Runner</code> subclass passed via behave's documented <code>--runner-class</code> / <code>--runner</code> flag. It calls <code>super().run_hook(...)</code> for every hook, so all your project hooks still run, unchanged and in order.</li>
+        <li><strong>Version detection.</strong> aitlc asks <code>behave --help</code> what it supports rather than parsing a version string — forks and vendored builds don't follow upstream numbering.</li>
+        <li><strong>A universal fallback.</strong> Where no flag exists, aitlc writes a <code>sitecustomize.py</code> onto <code>PYTHONPATH</code>, which Python imports at startup and which patches <code>ModelRunner.run_hook</code> in place. It no-ops unless <code>AITLC_INSTRUMENT=1</code>, because that file lands on the path of every child process.</li>
+      </ul>
+
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>behave</th><th>Flag</th><th>Class-path format</th></tr></thead>
+          <tbody>
+            <tr><td>1.2.7.dev</td><td><code>--runner-class</code></td><td><code>pkg.module.Class</code></td></tr>
+            <tr><td>1.3+</td><td><code>--runner</code> / <code>-r</code></td><td><code>pkg.module:Class</code></td></tr>
+            <tr><td>1.2.6</td><td>neither</td><td>uses the fallback</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout"><p><strong>Migrating from a hook block?</strong> If your own hooks already carry a pause-on-failure block it is now redundant, but harmless — aitlc's runner gates on its own variable, so the two can never both fire. Delete it when convenient.</p></div>
+    </section>
+
+    <section id="running">
+      <h2 class="sec">Running tests</h2>
+      <p class="sec-note">Bare test IDs resolve recursively, so you never need a full path — and never need to tag other features to narrow a run.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc run &lt;TEST-ID&gt;</span>
+        <p>Run one feature file and report structured results.</p>
+<pre><code>aitlc run PROJ-24026
+aitlc run PROJ-24026 --dry-run          <span class="c"># steps resolve, no browser</span>
+aitlc run PROJ-25466:47                 <span class="c"># one Examples row</span>
+aitlc run PROJ-24026 --debug            <span class="c"># halt on failure, browser stays open</span>
+aitlc run PROJ-24026 --retry 2 --retry-only-if-known-flake</code></pre>
+        <div class="callout"><p><strong>FILE:LINE selects a scenario, not a resume point.</strong> behave runs the scenario containing that line, from its first step. It pays off for a <em>Scenario Outline</em> — one Examples row instead of all of them (measured: 37 passed / 37 untested instead of 74).</p></div>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p>Exit code 0/1; stdout is one JSON object with <code>steps_by_status</code> and a <code>failures[]</code> array carrying <code>step</code> and <code>error</code>. Add <code>--toon</code> for a compact table. Every run is appended to history automatically.</p>
+        </div>
+      </div>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc parallel run [IDS...]</span>
+        <p>Run many features concurrently — without editing tags.</p>
+<pre><code>aitlc parallel run                    <span class="c"># everything discovered</span>
+aitlc parallel run PROJ-1 PROJ-2 -j 4
+aitlc parallel run --list             <span class="c"># preview selection, run nothing</span>
+aitlc parallel run --debug --isolated -j 4</code></pre>
+        <p>Skip tags already in your files are honored, and skipped files are reported <em>with the reason</em> — "skipped by tag" must never look identical to "never discovered".</p>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p><code>--list</code> returns the exact selection as JSON before anything runs — use it to confirm scope. The summary carries per-feature results plus <code>source</code>: <code>focus</code>, <code>args</code> or <code>discovery</code>.</p>
+        </div>
+      </div>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc parallel focus</span>
+        <p>Pin what the bare command runs, so you stop typing filenames.</p>
+<pre><code>aitlc parallel focus PROJ-24026 PROJ-25931   <span class="c"># set once</span>
+aitlc parallel run                            <span class="c"># then just run</span>
+aitlc parallel focus --clear</code></pre>
+        <p>This replaces the "tag every other file, then revert" habit. The selection lives under <code>reports/</code>, so nothing in the repo changes and nothing can be committed by accident.</p>
+      </div>
+    </section>
+
+    <section id="debugging">
+      <h2 class="sec">Debugging live</h2>
+      <p class="sec-note">Keep one browser open across many iterations instead of paying setup and login on every change.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc cdp launch | status | list | stop</span>
+        <p>Own a long-lived debug Chrome that outlives the shell that started it.</p>
+<pre><code>aitlc cdp launch          <span class="c"># detached, mobile-sized by default</span>
+aitlc cdp status          <span class="c"># is it actually answering?</span>
+aitlc cdp list            <span class="c"># every tracked instance, alive or dead</span>
+aitlc cdp launch --new    <span class="c"># isolated: own port + own profile</span>
+aitlc cdp stop --all</code></pre>
+        <ul class="tight">
+          <li>Backgrounding Chrome from a shell ties it to that shell; when the shell exits, the next attach fails with a bare <code>ECONNREFUSED</code>.</li>
+          <li>Liveness is the <strong>port</strong>, not the PID — <code>list</code> shows tracked-but-dead instances as <code>"running": false</code> rather than hiding them.</li>
+          <li><code>stop</code> verifies the PID is still <em>our</em> Chrome before signalling, so a stale state file can't kill an unrelated process group.</li>
+        </ul>
+        <p>Use <code>--new</code> when several browsers must run at once. Separate <em>profiles</em> matter, not just ports: a shared profile directory corrupts under concurrent Chromes and leaks cookies between tests.</p>
+      </div>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc steps run &lt;ID&gt; --range A-B</span>
+        <p>Resume a scenario partway through, in an already-open browser. This replaces commenting out the steps that already passed.</p>
+<pre><code>aitlc cdp launch
+<span class="c"># setup + login once (~2 min)</span>
+aitlc steps run PROJ-24026 --range 6-13 \
+      --cdp-url http://127.0.0.1:9333 --mobile "Galaxy S8"
+
+<span class="c"># iterate on later steps in the SAME session — seconds per cycle</span>
+aitlc steps run PROJ-24026 --range 14-19 \
+      --cdp-url http://127.0.0.1:9333 --mobile "Galaxy S8" \
+      --scenario-setup none</code></pre>
+        <div class="callout"><p><strong>Use <code>--scenario-setup none</code> after the first slice.</strong> Setup mints fresh per-scenario data; re-running it on a resume invalidates the session the earlier slice established.</p></div>
+        <p>A step slice gets no <code>before_scenario</code> — which is where most suites generate per-scenario data. aitlc invokes your real hook via <code>scenario_setup</code> and <strong>stops immediately</strong> if it fails, rather than running on into a failure that surfaces several steps later looking like an app bug.</p>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p>Emits JSON-lines: one object per step with <code>status</code>, <code>duration_s</code> and <code>error</code>, plus a <code>scenario_setup</code> record showing what setup actually produced. <code>--range 31-</code> means "line 31 to the end".</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="a11y">
+      <h2 class="sec">Reading a page cheaply</h2>
+      <p class="sec-note">Answer "is X on screen" as structured text instead of pixels.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc cdp inspect --a11y</span>
+<pre><code>aitlc cdp inspect --cdp-url http://127.0.0.1:9333 --a11y
+aitlc cdp inspect --cdp-url ... --a11y --a11y-query "Apply filters"
+aitlc cdp inspect --cdp-url ... --a11y --a11y-selector "#panel"
+aitlc cdp inspect --cdp-url ... --check "#saveBtn,//button[text()='Close']"</code></pre>
+        <div class="scroll-x">
+          <table>
+            <thead><tr><th>Form</th><th>Size</th><th>Assertable?</th></tr></thead>
+            <tbody>
+              <tr><td>Screenshot PNG</td><td class="num">~55 KB</td><td>needs vision</td></tr>
+              <tr><td>Full a11y tree</td><td class="num">1,961 chars</td><td>yes — text</td></tr>
+              <tr><td>Targeted query</td><td class="num">20 chars</td><td>yes — text</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The tree also carries what a screenshot cannot express: nesting, control state (<code>[expanded]</code>), and field values (<code>textbox "Search filters": City</code>). Built on <code>page.aria_snapshot()</code>; <code>page.accessibility</code> was deprecated for three years then removed, so aitlc falls back to the CDP Accessibility domain only on older Playwright.</p>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p>The cheapest way to check presence, text or state. Start with <code>--a11y-query</code>; the response reports <code>chars</code> and <code>full_chars</code> so you can see what the query saved and tighten it. Reach for a screenshot only when the question is genuinely visual — layout, overlap, styling.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="health">
+      <h2 class="sec">Suite health</h2>
+      <p class="sec-note">Two things behave gives you no answer for on its own.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc steps unused</span>
+        <p>Report step definitions that no feature file uses. behave has no equivalent of Cucumber's unused-step report.</p>
+<pre><code>aitlc steps unused
+aitlc steps unused --no-include-composite   <span class="c"># Cucumber's false positives</span></code></pre>
+        <p>Matching goes through behave's <strong>own registry</strong>, so the answer agrees with what the runner would dispatch. Steps invoked via <code>context.execute_steps(...)</code> are extracted from the AST and counted as used.</p>
+        <div class="callout"><p><strong>Check the corpus before believing the number.</strong> The result is only as complete as the feature files it can see. Where canonical Gherkin lives in a test manager, most steps look dead — measured here, 51 local feature files reported 83% of definitions as unused. The command warns when the ratio is implausible. Treat that as "incomplete corpus", not "delete these".</p></div>
+      </div>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc history show</span>
+        <p>Flake rate from observed outcomes, not hand-written signatures.</p>
+<pre><code>aitlc history show --flaky-only
+aitlc history show --last 200
+aitlc history clear</code></pre>
+        <p><code>aitlc run</code> appends every outcome automatically, so a new flake is visible the second time it happens. <strong>Flaky means it has both passed <em>and</em> failed</strong> — a test that has only ever failed is broken, and retrying it just spends time to reach the same answer.</p>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p>Consult before retrying. <code>is_flaky</code> plus <code>flake_rate</code> are stronger evidence than a signature match, because they come from what actually happened in this repo.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="xray">
+      <h2 class="sec">Xray sync</h2>
+      <p class="sec-note">Xray stores only the step body — no <code>Feature:</code> line, no tags, no <code>Scenario:</code> header, no comments.</p>
+      <div class="cmd">
+<pre><code>aitlc xray get-gherkin PROJ-24026
+aitlc xray compare-gherkin PROJ-24026            <span class="c"># local vs live</span>
+aitlc xray update-gherkin PROJ-24026 --file body.txt
+aitlc xray fetch-features PROJ-29026 --status FAILED
+aitlc xray find-step-usage "click on audience tab"</code></pre>
+        <p><code>compare-gherkin</code> normalizes your local file before diffing so it compares like for like. <code>update-gherkin</code> re-fetches after writing to confirm the write persisted — the mutation echoing your input back is not proof. <code>fetch-features</code> resolves a whole Test Execution or Plan into runnable feature files: the "everything that failed last night" entry point.</p>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <h2 class="sec">Evidence</h2>
+      <p class="sec-note">Escalate in order — a single frame explains most failures, and the interactive viewer costs far more to open and read.</p>
+      <div class="cmd">
+<pre><code>aitlc trace extract-frame trace.zip   <span class="c"># last frame as an image (cheap)</span>
+aitlc trace show trace.zip            <span class="c"># full interactive viewer (expensive)</span>
+aitlc s3 report-summary               <span class="c"># counts + failures, no download</span>
+aitlc report &lt;TEST-ID&gt;                <span class="c"># run + replayable terminal recording</span></code></pre>
+      </div>
+    </section>
+
+    <section id="hatches">
+      <h2 class="sec">Escape hatches</h2>
+      <p class="sec-note">aitlc's own commands cover the paths worth making easy. These cover everything else, so adopting aitlc never means losing a flag it doesn't wrap.</p>
+      <div class="cmd">
+<pre><code>aitlc behave --aitlc-debug features/x.feature   <span class="c"># any behave args, forwarded</span>
+aitlc behave --print-command &lt;args&gt;             <span class="c"># show command, run nothing</span>
+aitlc pw show-trace trace.zip
+aitlc pw codegen https://example.com
+aitlc pw install chromium</code></pre>
+        <p>What they add over typing <code>behave</code> directly: your <code>.env</code> loaded first, the right interpreter and working directory, and aitlc's optional instrumentation. aitlc's own flags are prefixed <code>--aitlc-</code> so they can never collide with a behave flag, now or in a future release.</p>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p><code>--print-command</code> prints the exact invocation as JSON. Use it to hand a reproduction to someone without aitlc, and to state what you're about to run before running it.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="rest">
+      <h2 class="sec">Everything else</h2>
+      <div class="scroll-x">
+        <table>
+          <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>aitlc start</code></td><td>Bootstrap briefing for a fresh agent or engineer</td></tr>
+            <tr><td><code>aitlc classify-failure</code></td><td>Match a failure against <code>patterns.yaml</code></td></tr>
+            <tr><td><code>aitlc propose-fix</code></td><td>Assemble the evidence needed to propose a fix</td></tr>
+            <tr><td><code>aitlc record --suggest-steps</code></td><td>Record a session, diff selectors against existing locators</td></tr>
+            <tr><td><code>aitlc notify-teams</code></td><td>Post a run summary to a Teams webhook</td></tr>
+            <tr><td><code>aitlc jira create-task</code></td><td>Create a Jira Task</td></tr>
+            <tr><td><code>aitlc tunnel status | restart</code></td><td>LambdaTest tunnel health</td></tr>
+            <tr><td><code>aitlc users validate | generate</code></td><td>Pooled test-user maintenance — requires <code>--yes</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout"><p><strong><code>aitlc users</code> acts on a shared pool</strong> and refuses to run without <code>--yes</code>; the underlying scripts have no prompt and no dry run.</p></div>
+    </section>
+
+    <section id="trouble">
+      <h2 class="sec">Troubleshooting</h2>
+      <div class="cmd">
+        <h3><code>--debug</code> did nothing</h3>
+        <p>Check the <code>instrumentation</code> line printed to stderr. If it says <code>sitecustomize</code>, aitlc couldn't use behave's runner option — the <code>detail</code> field distinguishes "this build has no such option" from "behave couldn't be probed at all" (usually a missing virtualenv).</p>
+      </div>
+      <div class="cmd">
+        <h3>Instrumentation silently ignored</h3>
+        <p>Instrumentation flags must precede the positional feature path. behave's positional argument ends option parsing, so anything after it is treated as another path.</p>
+      </div>
+      <div class="cmd">
+        <h3><code>No module named 'aitlc.runtime.runner:AitlcRunner'</code></h3>
+        <p>A path-format mismatch, not a missing install — behave 1.2.7 needs the dotted form. aitlc picks the right shape per detected flag, so seeing this means the flag was overridden by hand.</p>
+      </div>
+      <div class="cmd">
+        <h3>A step slice fails on data-dependent steps</h3>
+        <p><code>scenario_setup</code> is unset, so no per-scenario data exists. The <code>scenario_setup</code> record in the output reads <code>skipped</code> when this happens.</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    aitlc — structured debugging for Behave + Playwright. Machine-readable
+    version of this guide: <code>USER-GUIDE.md</code>.
+  </footer>
+</div>

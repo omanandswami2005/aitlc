@@ -1,0 +1,140 @@
+[project]
+# Published under two names that install the same tool; the command is
+# always `aitlc`. Build both with: python scripts/build_dual_name.py
+name = "aitlc"
+version = "0.1.0"
+description = "Structured, JSON/TOON-first CLI for Behave+Playwright debugging and Xray verification workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Omanand Swami", email = "2005omanandswami@gmail.com" }]
+keywords = ["behave", "playwright", "bdd", "testing", "xray", "cucumber", "cli"]
+# No `License ::` classifier: PyPI rejects it alongside the SPDX `license`
+# field above, which supersedes it (PEP 639).
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Testing :: Acceptance",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "typer>=0.12",
+    "requests>=2.31",
+    "playwright>=1.45",
+    "tomli>=2.0; python_version < '3.11'",
+    "pyyaml>=6.0",
+    "pyte>=0.8",
+    "jira>=3.8",
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    # Only needed to unit-test core/live_status.py directly — at runtime
+    # that file is never imported by aitlc itself, only copied as text into
+    # the TARGET project's own environment (which already has behave,
+    # since that's what's running it). See live_status.py's docstring.
+    "behave>=1.2",
+]
+# Only needed to cut a release. Kept out of `dev` so a contributor running
+# the tests does not pull the publishing toolchain, and so the release
+# steps in README.md are reproducible without guessing what to install.
+publish = [
+    "build>=1.2",
+    "twine>=5.0",
+]
+
+[project.urls]
+# Point these at the public home before the first real upload. A version's
+# metadata cannot be edited or re-uploaded once it is on PyPI, so a wrong
+# URL here is permanent for that version — check it on TestPyPI first.
+Homepage = "https://github.com/omanandswami2005/aitlc"
+Source = "https://github.com/omanandswami2005/aitlc"
+Issues = "https://github.com/omanandswami2005/aitlc/issues"
+Documentation = "https://github.com/omanandswami2005/aitlc/blob/main/USER-GUIDE.md"
+
+[project.scripts]
+aitlc = "aitlc.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aitlc"]
+
+[tool.hatch.build.targets.sdist]
+# Explicit allowlist, not an exclude list — the default would otherwise
+# bundle everything in this directory (planning notes, pattern data, internal
+# design docs) into the public source archive. Those are project-specific
+# planning/data files, not part of the published tool. See ROADMAP.md's
+# "Open source" section — core code is the public artifact, not the
+# project-specific docs/data that live alongside it during development.
+include = [
+    "src/aitlc",
+    "tests",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+    # The config template is the first thing a new user needs — `aitlc`
+    # cannot resolve a project's env var names or feature layout without an
+    # aitlc.toml, and without a shipped template they have to reconstruct
+    # one from the docs. Excluding it made the sdist unusable out of the box.
+    "aitlc.toml.example",
+    "USER-GUIDE.md",
+    "user-guide.html",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Chosen for real defect classes, not style maximalism: correctness (E/F),
+# bug-prone patterns (B), unraised/unused surprises (RUF), import hygiene
+# (I), and modernization (UP). Without an explicit list, ruff's defaults
+# shift between versions and "lint is clean" stops meaning anything.
+select = ["E", "F", "B", "I", "UP", "SIM", "RUF", "PL", "BLE"]
+
+ignore = [
+    # `typer.Option(...)` / `typer.Argument(...)` in defaults IS Typer's
+    # documented API — every command in this package would need a noqa.
+    "B008",
+    # Long help strings and URLs in docstrings; the formatter owns wrapping.
+    "E501",
+    # Subprocess return codes are checked explicitly and surfaced as
+    # structured JSON; `check=True` would raise instead, losing the
+    # captured stdout/stderr these commands report.
+    "PLW1510",
+    # A CLI flag is one parameter. These fire on every Typer command purely
+    # for having many flags, which is the interface, not a design smell.
+    "PLR0913",
+    "PLR0917",
+    # Deliberate late imports: heavy optional deps (playwright, boto3, jira)
+    # stay out of CLI startup, and step_console's script half imports the
+    # TARGET project's modules, which only exist in its interpreter.
+    "PLC0415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately reach into private helpers to pin behavior that the
+# public surface cannot express (e.g. PID-reuse guards).
+"tests/*" = ["SLF001", "PLR2004"]
+# The script half runs inside the TARGET project's interpreter, so its
+# imports are intentionally local/late and its excepts intentionally broad:
+# a debugging aid must degrade, never abort a session mid-slice.
+"src/aitlc/core/step_console.py" = ["BLE001", "PLC0415"]
