@@ -69,6 +69,14 @@ class CdpInstance:
     port: int
     user_data_dir: str
     started_at: float
+    # What last drove this browser. A CDP attach reuses an existing browser
+    # context -- the opposite of isolation -- so a profile accumulates sessions
+    # from everything that has touched it. Once it holds a stale session, a run
+    # fails at the project's own login and reads as a test bug rather than a
+    # dirty profile. Recording this makes "used by something else" visible
+    # before it costs a run.
+    last_driven_by: str = ""
+    driven_count: int = 0
 
     @property
     def cdp_url(self) -> str:
@@ -162,13 +170,56 @@ def _looks_like_our_chrome(instance: CdpInstance) -> bool:
 
 
 def stop_all(root_dir: Path) -> list[int]:
-    """Stop every tracked instance. Returns the ports acted on."""
+    """Stop every tracked instance. Returns the ports acted on.
+
+    Reconciles against reality first: the registry can go empty while browsers
+    are still alive (a state file removed by hand, a crash mid-write), and
+    reporting `count: 0` at someone who can see Chrome windows on screen is
+    worse than useless.
+    """
     stopped: list[int] = []
     for instance in list_instances(root_dir):
         port = instance["port"]
         if stop(root_dir, port=port):
             stopped.append(port)
     return stopped
+
+
+def untracked_ports(root_dir: Path, candidate_ports: list[int]) -> list[int]:
+    """Ports answering CDP that the registry does not know about."""
+    tracked = {i["port"] for i in list_instances(root_dir)}
+    return [p for p in candidate_ports if p not in tracked and probe(p) is not None]
+
+
+def mark_driven(root_dir: Path, port: int, driver: str) -> CdpInstance | None:
+    """Note that `driver` drove this browser, for the warning in `is_dirty_for`."""
+    instance = load_state(root_dir, port=port)
+    if instance is None:
+        return None
+    instance.last_driven_by = driver
+    instance.driven_count += 1
+    save_state(root_dir, instance)
+    return instance
+
+
+def is_dirty_for(root_dir: Path, port: int, driver: str) -> tuple[bool, str]:
+    """Whether attaching `driver` to this profile is risky, and why.
+
+    Not an error: a shared profile is fine when you know what is in it. The
+    failure mode worth preventing is silent -- the run dies at the login step
+    and the profile is the last thing anyone suspects.
+    """
+    instance = load_state(root_dir, port=port)
+    if instance is None:
+        return False, ""
+    if instance.last_driven_by and instance.last_driven_by != driver:
+        return True, (
+            f"port {port} was last driven by {instance.last_driven_by!r} "
+            f"({instance.driven_count} run(s)); a reused profile keeps its "
+            "sessions and can fail this run at its own login. Use "
+            "`aitlc cdp launch --new` for an isolated browser."
+        )
+    return False, ""
 
 
 def find_chrome(explicit: str | None = None) -> str:

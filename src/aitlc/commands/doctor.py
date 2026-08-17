@@ -76,6 +76,86 @@ def _check_tunnel_health(log_path: Path) -> CheckResult:
     return CheckResult("LT tunnel", status.healthy, status.detail)
 
 
+def _versions() -> dict:
+    """Report versions and, where a capability has a fallback, which branch runs.
+
+    Two capabilities here silently degrade with the installed Playwright: the
+    accessibility snapshot (`aria_snapshot`, else the CDP AX tree, which ignores
+    a text query) and CDP-attached emulation. Neither announces itself, so a
+    flag can be accepted and ignored. One line here replaces reading the
+    installed source to find out why.
+    """
+    info: dict = {}
+    try:
+        from importlib.metadata import version
+
+        info["aitlc"] = version("aitlc")
+    except Exception:  # noqa: BLE001 - a missing dist must not fail doctor
+        info["aitlc"] = "unknown"
+
+    try:
+        from importlib.metadata import version
+
+        info["playwright"] = version("playwright")
+    except Exception:  # noqa: BLE001
+        info["playwright"] = "not installed"
+
+    try:
+        from importlib.metadata import version
+
+        info["behave"] = version("behave")
+    except Exception:  # noqa: BLE001
+        info["behave"] = "not installed"
+
+    aria = False
+    try:
+        from playwright.sync_api import Locator
+
+        aria = hasattr(Locator, "aria_snapshot")
+    except Exception:  # noqa: BLE001
+        aria = False
+    info["a11y_path"] = (
+        "aria_snapshot (--a11y-query filters)"
+        if aria
+        else "cdp-nodes fallback (--a11y-query is IGNORED on this path)"
+    )
+    return info
+
+
+def _check_config_preconditions(config) -> list[CheckResult]:
+    """Flag config a later command will need but cannot detect for itself.
+
+    `browser_actions` and `browser_factory` are deliberately not auto-detected,
+    which is defensible -- but the consequence is that `steps run --mobile
+    --cdp-url` cannot work without them, and the only notice is an empty result.
+    Saying so here is cheaper than discovering it mid-debug.
+    """
+    checks = []
+    checks.append(
+        CheckResult(
+            "browser_actions configured",
+            bool(getattr(config, "browser_actions", None)),
+            (
+                "set"
+                if getattr(config, "browser_actions", None)
+                else "unset — steps run cannot build the project driver"
+            ),
+        )
+    )
+    checks.append(
+        CheckResult(
+            "browser_factory configured",
+            bool(getattr(config, "browser_factory", None)),
+            (
+                "set"
+                if getattr(config, "browser_factory", None)
+                else "unset — steps run --mobile with --cdp-url will refuse"
+            ),
+        )
+    )
+    return checks
+
+
 def _check_device_mobile_mismatch(
     config: AitlcConfig, feature_path: Path | None
 ) -> CheckResult:
@@ -132,6 +212,7 @@ def doctor(
 
     feature_path = config.resolve_feature_path(feature) if feature else None
     report.checks.append(_check_device_mobile_mismatch(config, feature_path))
+    report.checks.extend(_check_config_preconditions(config))
 
     if remote:
         report.checks.append(_check_env_var(config, "lt_username", "LT_USERNAME"))
@@ -153,5 +234,7 @@ def doctor(
         else:
             report.checks.append(CheckResult("LT_PROXY_HOST/PORT", True, "Both set"))
 
-    typer.echo(json.dumps(report.to_dict(), indent=2))
+    payload = report.to_dict()
+    payload["versions"] = _versions()
+    typer.echo(json.dumps(payload, indent=2))
     raise typer.Exit(code=0 if report.all_ok else 1)

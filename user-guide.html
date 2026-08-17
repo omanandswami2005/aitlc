@@ -276,6 +276,8 @@
       <li><a href="#independent">Codebase independence</a></li>
       <li><a href="#running">Running tests</a></li>
       <li><a href="#running" class="sub">run · parallel · focus</a></li>
+      <li><a href="#cycle">The debugging cycle</a></li>
+      <li><a href="#cycle" class="sub">triage-run · debug · certify</a></li>
       <li><a href="#debugging">Debugging live</a></li>
       <li><a href="#debugging" class="sub">cdp · steps run</a></li>
       <li><a href="#a11y">Reading a page cheaply</a></li>
@@ -283,6 +285,8 @@
       <li><a href="#health" class="sub">steps unused · history</a></li>
       <li><a href="#xray">Xray sync</a></li>
       <li><a href="#evidence">Evidence</a></li>
+      <li><a href="#journal">Journal &amp; cache</a></li>
+      <li><a href="#locators">Locator hygiene</a></li>
       <li><a href="#hatches">Escape hatches</a></li>
       <li><a href="#rest">Everything else</a></li>
       <li><a href="#trouble">Troubleshooting</a></li>
@@ -429,6 +433,28 @@ aitlc parallel focus --clear</code></pre>
       </div>
     </section>
 
+    <section id="cycle">
+      <h2 class="sec">The debugging cycle</h2>
+      <p class="sec-note">Five commands, in this order. Each replaces a habit that is slower or, on a suite that creates users and moves balances, destructive.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc s3 triage-run &rarr; debug start &rarr; retry &rarr; next &rarr; certify</span>
+        <p>Take a CI failure, drive one kept browser to that point, iterate on the broken step, move forward, then prove it in a fresh instance.</p>
+<pre><code>aitlc s3 triage-run --suite &lt;plan&gt;        <span class="c"># 1. what CI actually failed on</span>
+aitlc debug start PROJ-7449 --at 12       <span class="c"># 2. isolated browser, driven to the step</span>
+aitlc debug retry PROJ-7449               <span class="c"># 3. edit -&gt; re-run THAT step -&gt; repeat</span>
+aitlc debug next PROJ-7449                <span class="c"># 4. forward, from the state you have</span>
+aitlc debug certify PROJ-7449 --times 2   <span class="c"># 5. fresh instance, real feature, twice</span></code></pre>
+        <ul class="tight">
+          <li><strong>Never re-run locally just to see <em>where</em> it failed.</strong> <code>triage-run</code> reads the run's per-execution Behave JSON — a few hundred KB against a multi-megabyte HTML report — and prints the failing step, the real error and the locator.</li>
+          <li><strong><code>debug start</code> always launches an isolated browser.</strong> A CDP attach reuses an existing browser context, so a long-lived profile keeps its sessions and eventually fails a run at your project's own login — a failure that reads as a test bug.</li>
+          <li><strong><code>retry</code> re-runs one step, not the scenario.</strong> After a fix, the state you already have is worth more than a clean start.</li>
+          <li><strong><code>certify</code> is separate and defaults to two passes.</strong> One pass does not disprove a race.</li>
+        </ul>
+        <div class="callout"><p><strong>When the DOM and an assertion disagree, instrument rather than theorise.</strong> One <code>log.info("%r", text)</code> at the read site, for one run, beats another round of inspection — it shows what the code actually read, which is not always what the page shows.</p></div>
+      </div>
+    </section>
+
     <section id="debugging">
       <h2 class="sec">Debugging live</h2>
       <p class="sec-note">Keep one browser open across many iterations instead of paying setup and login on every change.</p>
@@ -463,9 +489,10 @@ aitlc steps run PROJ-24026 --range 14-19 \
       --scenario-setup none</code></pre>
         <div class="callout"><p><strong>Use <code>--scenario-setup none</code> after the first slice.</strong> Setup mints fresh per-scenario data; re-running it on a resume invalidates the session the earlier slice established.</p></div>
         <p>A step slice gets no <code>before_scenario</code> — which is where most suites generate per-scenario data. aitlc invokes your real hook via <code>scenario_setup</code> and <strong>stops immediately</strong> if it fails, rather than running on into a failure that surfaces several steps later looking like an app bug.</p>
+        <p><code>--trace out.zip</code> writes a Playwright trace — screenshots and DOM snapshots per action — which <code>aitlc trace show</code> opens. Tracing is otherwise only produced on the remote grid, so a local session leaves no timeline. <code>--capture-network</code> records the API responses seen during the slice: a slice gets no <code>before_scenario</code>, so any collector your suite installs there is absent.</p>
         <div class="agent">
           <span class="tag">Agent use</span>
-          <p>Emits JSON-lines: one object per step with <code>status</code>, <code>duration_s</code> and <code>error</code>, plus a <code>scenario_setup</code> record showing what setup actually produced. <code>--range 31-</code> means "line 31 to the end".</p>
+          <p>Emits JSON-lines: one object per step with <code>status</code>, <code>duration_s</code> and <code>error</code>, plus a <code>scenario_setup</code> record showing what setup actually produced. <code>--range 31-</code> means "line 31 to the end". A run that reaches no steps is an <em>error</em>, not an empty success — the child's stderr is surfaced and the exit code is non-zero.</p>
         </div>
       </div>
     </section>
@@ -546,6 +573,47 @@ aitlc xray find-step-usage "click on audience tab"</code></pre>
 aitlc trace show trace.zip            <span class="c"># full interactive viewer (expensive)</span>
 aitlc s3 report-summary               <span class="c"># counts + failures, no download</span>
 aitlc report &lt;TEST-ID&gt;                <span class="c"># run + replayable terminal recording</span></code></pre>
+      </div>
+    </section>
+
+    <section id="journal">
+      <h2 class="sec">Journal &amp; cache</h2>
+      <p class="sec-note">Answer a follow-up question by reading, not by running the thing again.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc journal list | show | diff | cache</span>
+        <p>Every <code>run</code> is recorded — argv, exit code, duration, payload — and fetched reports are cached by their source key.</p>
+<pre><code>aitlc journal list --last 5 --command run
+aitlc journal show 20260817T104512-run
+aitlc journal diff &lt;earlier&gt; &lt;later&gt;      <span class="c"># did the fix work, or was that luck?</span>
+aitlc journal cache                        <span class="c"># size on disk; --clear empties it</span></code></pre>
+        <ul class="tight">
+          <li>Payloads pass through the same redaction used for command output <strong>before</strong> touching disk — a journal that writes tokens into an unremarkable directory is worse than no journal.</li>
+          <li>Entries are size-capped and pruned by count; cache keys are hashed, so two test plans holding the same execution filename cannot collide.</li>
+        </ul>
+        <div class="agent">
+          <span class="tag">Agent use</span>
+          <p><code>diff</code> is the cheap answer to "is this flaky or fixed": two runs of the same command, compared, with no browser involved.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="locators">
+      <h2 class="sec">Locator hygiene</h2>
+      <p class="sec-note">Selector shapes that pass, read the wrong element, and fail somewhere else entirely.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">aitlc locators lint | rules</span>
+        <p>Advisory, never fatal. Each finding carries the rewrite, not just the diagnosis.</p>
+<pre><code>aitlc locators lint                    <span class="c"># high severity only</span>
+aitlc locators lint --severity low     <span class="c"># everything, deliberately noisy</span>
+aitlc locators rules                   <span class="c"># what is checked, and why</span></code></pre>
+        <ul class="tight">
+          <li><strong>positional-index</strong> — <code>aria-rowindex='2'</code> follows whatever sorts first, not the record you meant.</li>
+          <li><strong>grid-cell-without-role</strong> — a grid header carries <code>data-field</code> too, so the selector can return the column title where a value was expected.</li>
+          <li><strong>unanchored-xpath</strong> — <code>//*</code> or <code>//div</code> with nothing pinning it; with <code>.first</code> this silently takes an element from another container.</li>
+        </ul>
+        <div class="callout"><p>A relative predicate — <code>//div[@role='row'][.//div[@role='cell' …]]</code>, the xpath analogue of <code>locator.filter(has=…)</code> — counts as anchored. That is the shape the lint steers toward, so it is never flagged.</p></div>
       </div>
     </section>
 

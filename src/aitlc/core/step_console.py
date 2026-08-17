@@ -34,7 +34,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -232,6 +232,17 @@ class StepResult:
     error: str | None = None
 
 
+_KNOWN_EVENTS = frozenset(
+    {
+        "loaded_step_modules",
+        "scenario_setup",
+        "mobile_emulation",
+        "done",
+        "step_module_skipped",
+    }
+)
+
+
 @dataclass
 class ConsoleRunResult:
     """Everything a step-console run produced."""
@@ -239,6 +250,14 @@ class ConsoleRunResult:
     loaded_step_modules: int
     results: list[StepResult]
     exit_code: int
+    # Everything the child said that this parser has no branch for. Without
+    # these two, a fatal child error is indistinguishable from a run that
+    # simply had no steps: the child writes the reason to stderr (or emits a
+    # parse_error event) and the caller prints {"results": []} with exit 0.
+    stderr_tail: str = ""
+    unhandled_events: list[dict] = field(default_factory=list)
+    network: list[dict] = field(default_factory=list)
+    trace_path: str = ""
     # What the project's per-scenario setup did. Surfaced rather than kept
     # internal: "setup silently did not run" is the failure mode that makes
     # later steps fail for reasons that look unrelated.
@@ -270,6 +289,8 @@ def run_console(
     allow_missing_setup: bool = False,
     browser_actions: str | None = None,
     browser_factory: str | None = None,
+    trace: str | None = None,
+    capture_network: bool = False,
 ) -> ConsoleRunResult:
     """Run a slice of a feature file's steps, parsing the JSON-lines output.
 
@@ -298,12 +319,19 @@ def run_console(
         cmd += ["--browser-actions", browser_actions]
     if browser_factory:
         cmd += ["--browser-factory", browser_factory]
+    if trace:
+        cmd += ["--trace", trace]
+    if capture_network:
+        cmd.append("--capture-network")
 
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
     loaded = 0
     setup_record: dict | None = None
     results: list[StepResult] = []
+    unhandled: list[dict] = []
+    network: list[dict] = []
+    trace_path = ""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -317,6 +345,14 @@ def run_console(
             loaded = record.get("count", 0)
         elif event == "scenario_setup":
             setup_record = record
+        elif event == "network":
+            network = record.get("responses", [])
+        elif event == "trace_saved":
+            trace_path = record.get("path", "")
+        elif event in (None, "") and "step" not in record:
+            unhandled.append(record)
+        elif event and "step" not in record and event not in _KNOWN_EVENTS:
+            unhandled.append(record)
         elif "step" in record:
             results.append(
                 StepResult(
@@ -330,6 +366,10 @@ def run_console(
     return ConsoleRunResult(
         loaded_step_modules=loaded,
         results=results,
+        stderr_tail="\n".join(proc.stderr.strip().splitlines()[-12:]),
+        unhandled_events=unhandled,
+        network=network,
+        trace_path=trace_path,
         exit_code=proc.returncode,
         scenario_setup=setup_record,
     )
@@ -471,6 +511,24 @@ def _script_main() -> None:
     )
     parser.add_argument("--example-row", type=int, default=0)
     parser.add_argument("--step-dir", default="features/steps")
+    parser.add_argument(
+        "--trace",
+        default="",
+        help=(
+            "Write a Playwright trace here. Tracing is otherwise only enabled "
+            "on the remote grid, so a local debug session produces no timeline "
+            "-- and `aitlc trace` already knows how to read one."
+        ),
+    )
+    parser.add_argument(
+        "--capture-network",
+        action="store_true",
+        help=(
+            "Record API responses seen during the slice. A slice runs without "
+            "the project's before_scenario, so any collector the suite installs "
+            "there is absent -- this is the substitute."
+        ),
+    )
     parser.add_argument("--cdp-url", default=os.environ.get("PLAYWRIGHT_CDP_URL", ""))
     parser.add_argument(
         "--mobile",
@@ -581,6 +639,39 @@ def _script_main() -> None:
     actions_cls = _load_object(args.browser_actions)
     browser_handle = actions_cls(page) if actions_cls is not None else page
 
+    if args.trace:
+        try:
+            pw_context.tracing.start(screenshots=True, snapshots=True, sources=False)
+        except Exception as exc:  # noqa: BLE001 - tracing must never fail a run
+            print(json.dumps({"event": "trace_error", "error": str(exc)}), flush=True)
+
+    captured: list[dict] = []
+    if args.capture_network:
+
+        def _on_response(response) -> None:  # pragma: no cover - event callback
+            try:
+                request = response.request
+                if request.method != "POST":
+                    return
+                body = request.post_data or ""
+                name = ""
+                if body.startswith("{"):
+                    try:
+                        name = json.loads(body).get("operationName") or ""
+                    except (json.JSONDecodeError, AttributeError):
+                        name = ""
+                captured.append(
+                    {
+                        "operation": name,
+                        "status": response.status,
+                        "url": response.url.split("?")[0],
+                    }
+                )
+            except Exception:  # noqa: BLE001 - never raise from a listener
+                return
+
+        page.on("response", _on_response)
+
     context = MinimalContext(browser_handle, page)
 
     setup_record = apply_scenario_setup(
@@ -670,6 +761,18 @@ def _script_main() -> None:
 
     body = "\n".join(text for _, text in filtered)
     results = run_steps(context, body)
+
+    if args.capture_network:
+        print(
+            json.dumps({"event": "network", "responses": captured[-40:]}),
+            flush=True,
+        )
+    if args.trace:
+        try:
+            pw_context.tracing.stop(path=args.trace)
+            print(json.dumps({"event": "trace_saved", "path": args.trace}), flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"event": "trace_error", "error": str(exc)}), flush=True)
 
     failed = [r for r in results if r["status"] == "failed"]
     print(

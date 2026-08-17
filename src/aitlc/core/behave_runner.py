@@ -106,7 +106,17 @@ def _extract_error_message(step: dict[str, Any]) -> str:
     if not error:
         return ""
 
-    for marker in ("\nCaptured stdout:", "\nCaptured logging:"):
+    # "Captured stderr" belongs here as much as the other two: behave appends
+    # every captured stream after the traceback, and this function returns the
+    # LAST non-blank line. A run that writes to stderr after the assertion --
+    # an HTTPS InsecureRequestWarning, say -- otherwise reports
+    # "warnings.warn(" as the failure. That string is also what
+    # classify-failure matches on, so no pattern library can compensate.
+    for marker in (
+        "\nCaptured stdout:",
+        "\nCaptured logging:",
+        "\nCaptured stderr:",
+    ):
         idx = error.find(marker)
         if idx != -1:
             error = error[:idx]

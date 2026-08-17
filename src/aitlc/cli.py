@@ -6,10 +6,13 @@ import typer
 from aitlc.commands import (
     cdp_cmd,
     classify_cmd,
+    debug_cmd,
 )
 from aitlc.commands import doctor as doctor_module
 from aitlc.commands import (
     history_cmd,
+    journal_cmd,
+    locators_cmd,
     init_cmd,
     jira_cmd,
     notify_cmd,
@@ -52,6 +55,7 @@ app.command("notify-teams")(notify_cmd.notify_teams)
 # (`aitlc xray get-gherkin ...`, `aitlc cdp inspect ...`) — kept as sub-Typers.
 app.add_typer(xray_cmd.app, name="xray")
 app.add_typer(cdp_cmd.app, name="cdp")
+app.add_typer(debug_cmd.app, name="debug")
 app.add_typer(tunnel_cmd.app, name="tunnel")
 app.add_typer(jira_cmd.app, name="jira")
 app.add_typer(trace_cmd.app, name="trace")
@@ -60,6 +64,8 @@ app.add_typer(s3_cmd.app, name="s3")
 app.add_typer(parallel_cmd.app, name="parallel")
 app.add_typer(users_cmd.app, name="users")
 app.add_typer(history_cmd.app, name="history")
+app.add_typer(journal_cmd.app, name="journal")
+app.add_typer(locators_cmd.app, name="locators")
 
 # Escape hatches: everything aitlc does not wrap is still reachable,
 # with the project environment already set up.

@@ -2,7 +2,7 @@
 # Published under two names that install the same tool; the command is
 # always `aitlc`. Build both with: python scripts/build_dual_name.py
 name = "aitlc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Structured, JSON/TOON-first CLI for Behave+Playwright debugging and Xray verification workflows."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -31,6 +31,38 @@ aitlc parallel run -j 4             # concurrent, without editing tags
 aitlc parallel focus PROJ-1234      # pin a selection, then just `aitlc parallel run`
 ```
 
+**Debug a failure end to end.** A session holds one isolated browser and your
+position in the scenario, so fixing a step costs a re-run of *that step* rather
+than the whole scenario — and a scenario with four defects costs one setup
+instead of four.
+
+```bash
+aitlc s3 triage-run --suite <plan>       # what CI actually failed on
+aitlc debug start PROJ-1234 --at 12      # isolated browser, driven to the step
+aitlc debug retry PROJ-1234              # edit -> re-run that step -> repeat
+aitlc debug next PROJ-1234               # forward, from the state you have
+aitlc debug certify PROJ-1234 --times 2  # fresh instance, real feature, twice
+```
+
+`certify` is deliberately separate and never uses the debug browser: a
+CDP-attached browser reuses an existing context, so it is never proof. Two
+consecutive passes are the default because one pass does not disprove a race.
+
+**Read back what already happened.** Every run is recorded, and fetched reports
+are cached, so a follow-up question is a file read rather than another run.
+
+```bash
+aitlc journal list --last 5
+aitlc journal diff <earlier> <later>     # did the fix work, or was that luck?
+```
+
+Payloads are redacted before they touch disk, size-capped and pruned.
+
+**Check locator hygiene.** `aitlc locators lint` flags selectors that pass while
+reading the wrong element — positional row indices, grid cells with no
+`role='cell'` guard (a header carries `data-field` too), unanchored `//*`
+xpaths — each with the rewrite attached, not just the diagnosis.
+
 **Debug live.** Keep one browser across many iterations instead of paying setup
 and login on every change. `aitlc steps run --range 14-19` resumes a scenario
 partway through in an already-open browser — replacing the habit of commenting
@@ -106,29 +138,6 @@ Three rules the code holds to, each learned from a bug that cost real time:
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/pytest tests/ -q
 ```
-
-## Releasing
-
-```bash
-.venv/bin/pip install -e ".[publish]"
-python scripts/build_dual_name.py     # both names, into dist/
-python -m twine check dist/*
-python -m twine upload --repository testpypi dist/*
-python -m twine upload dist/*
-```
-
-`build_dual_name.py` rewrites the distribution name, builds, and restores
-`pyproject.toml` in a `finally` — a failed build never leaves the repo holding
-a name nobody chose.
-
-Install from TestPyPI into a scratch environment and run `aitlc init` against a
-real project before the last line. That is the step that catches a broken
-config template or a missing dependency; nothing local will.
-
-Two things about the final upload are irreversible: a version number can never
-be reused, and deleting a project does not release its name. Check the
-`[project.urls]` values first — they are baked into a version's metadata and
-cannot be edited afterwards.
 
 ## License
 

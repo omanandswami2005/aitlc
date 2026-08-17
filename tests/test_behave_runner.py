@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from aitlc.core.behave_runner import parse_report
+from aitlc.core.behave_runner import _extract_error_message, parse_report
 
 
 def _write_report(tmp_path: Path, features: list) -> Path:
@@ -229,3 +229,26 @@ def test_background_elements_are_not_counted_as_scenarios(tmp_path: Path):
     result = parse_report(_write_report(tmp_path, features))
     assert len(result.scenarios) == 1
     assert result.scenarios[0].name == "Scenario A"
+
+
+def test_extract_error_message_strips_captured_stderr():
+    """A stderr warning after the assertion must not become the failure.
+
+    Observed live: a step failed on a locator assertion but reported
+    "warnings.warn(" -- the continuation line of urllib3's
+    InsecureRequestWarning, which behave had appended under "Captured stderr:".
+    """
+    step = {
+        "result": {
+            "error_message": [
+                "Assertion Failed: Locator expected to be visible",
+                '  - waiting for locator("#hamburger")',
+                "",
+                "Captured stderr:",
+                "/x/urllib3/connectionpool.py:1097: InsecureRequestWarning: ...",
+                "  warnings.warn(",
+            ]
+        }
+    }
+    assert "warnings.warn" not in _extract_error_message(step)
+    assert "#hamburger" in _extract_error_message(step)

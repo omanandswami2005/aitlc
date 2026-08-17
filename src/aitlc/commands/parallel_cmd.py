@@ -159,6 +159,15 @@ def run(
         "--skip-tag",
         help="Feature-level tag that excludes a file (matches skip_checks.py).",
     ),
+    verify_failures: bool = typer.Option(
+        False,
+        "--verify-failures",
+        help=(
+            "Re-run each failure once, serially, after the pool drains, and "
+            "report serial_recheck. A parallel failure can be a concurrency "
+            "artifact rather than a defect."
+        ),
+    ),
     no_skip_tag: bool = typer.Option(
         False,
         "--no-skip-tag",
@@ -335,12 +344,40 @@ def run(
         if line is not None:
             payload["line"] = line
         payload["passed"] = result.passed
+        # "skipped" is its own outcome, not a quiet kind of pass. A feature the
+        # project's own hooks skipped reports passed=true with no failures and
+        # no passed steps, which at twenty features nobody reads closely enough
+        # to notice.
+        counts = payload.get("steps_by_status") or {}
+        ran_anything = any(counts.get(k) for k in ("passed", "failed", "undefined"))
+        payload["outcome"] = (
+            "failed"
+            if not result.passed
+            else ("skipped" if not ran_anything else "passed")
+        )
         return payload
 
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         results = list(pool.map(_run_one, enumerate(to_run)))
 
     failed = [r for r in results if not r["passed"]]
+
+    # A parallel failure is not evidence on its own: of four failures in one
+    # sweep of twenty-one features, three were concurrency artifacts or a
+    # dropped network, and only one was a defect. Re-running each failure
+    # serially, once, is the difference between a work list and a list of
+    # things to go and check by hand.
+    if verify_failures and failed:
+        for row in failed:
+            recheck = behave_runner.run(
+                config.root_dir / row["feature"],
+                cwd=config.root_dir,
+                tags=tags,
+                no_capture=no_capture,
+                env=base_env,
+            )
+            row["serial_recheck"] = "passed" if recheck.passed else "failed"
+        failed = [r for r in failed if r.get("serial_recheck") != "passed"]
     summary = {
         "source": "focus" if used_focus else ("args" if features else "discovery"),
         "total": len(results),

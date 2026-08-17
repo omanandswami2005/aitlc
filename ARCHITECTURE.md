@@ -183,6 +183,29 @@ Docker was considered and dropped. An installed mode and a zero-install mode
 already cover the ground; a container would add packaging surface without
 solving a problem either one leaves open.
 
+### Publishing
+
+```bash
+.venv/bin/pip install -e ".[publish]"
+python scripts/build_dual_name.py     # both names, into dist/
+python -m twine check dist/*
+python -m twine upload --repository testpypi dist/*
+python -m twine upload dist/*
+```
+
+`build_dual_name.py` rewrites the distribution name, builds, and restores
+`pyproject.toml` in a `finally` — a failed build never leaves the repo holding
+a name nobody chose.
+
+Install from TestPyPI into a scratch environment and run `aitlc init` against a
+real project before the last line. That is the step that catches a broken
+config template or a missing dependency; nothing local will.
+
+Two things about the final upload are irreversible: a version number can never
+be reused, and deleting a project does not release its name. Check the
+`[project.urls]` values first — they are baked into a version's metadata and
+cannot be edited afterwards.
+
 ## 8. Non-goals
 
 - **No MCP server.** A CLI is cheaper in tokens and works in more places.

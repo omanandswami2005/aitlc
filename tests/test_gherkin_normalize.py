@@ -1,4 +1,8 @@
-from aitlc.adapters.xray.gherkin_normalize import diff_lines, normalize_local_feature
+from aitlc.adapters.xray.gherkin_normalize import (
+    diff_lines,
+    normalize_gherkin_body,
+    normalize_local_feature,
+)
 
 
 def test_strips_feature_tags_and_scenario_header():
@@ -75,3 +79,41 @@ def test_diff_lines_reports_drift():
     assert diff  # non-empty
     assert any("old step" in line for line in diff)
     assert any("new step" in line for line in diff)
+
+
+def test_normalize_gherkin_body_accepts_a_full_feature_file():
+    """The natural command is `--file <the .feature you just compared>`.
+
+    Sending that verbatim wrote the tags and Feature: line into a live Test and
+    left it invalid, so the write path must normalize exactly as compare does.
+    """
+    body = normalize_gherkin_body(
+        "@skip_login\n"
+        "Feature: Something\n"
+        "\n"
+        "\t@TEST_PROJ-1 @Automation\n"
+        "\tScenario: does a thing\n"
+        "\tGiven open the app\n"
+        "\tWhen click on it\n"
+    )
+    assert body == "Given open the app\nWhen click on it"
+
+
+def test_normalize_gherkin_body_is_idempotent():
+    """A body fetched from Xray and written straight back must not change."""
+    already = "Given open the app\nWhen click on it"
+    assert normalize_gherkin_body(already) == already
+    assert normalize_gherkin_body(normalize_gherkin_body(already)) == already
+
+
+def test_normalize_gherkin_body_refuses_a_payload_with_a_feature_line():
+    """Fail loudly rather than corrupt the Test.
+
+    Corruption here is invisible until the next fetch, so a hard error beats a
+    write that "succeeded".
+    """
+    import pytest
+
+    with pytest.raises(ValueError, match="header lines"):
+        # No Scenario: header, so the Feature: line survives normalization.
+        normalize_gherkin_body("Feature: Something\nGiven open the app")

@@ -68,6 +68,31 @@ def normalize_local_feature(text: str) -> str:
     return "\n".join(kept)
 
 
+def normalize_gherkin_body(text: str) -> str:
+    """Reduce anything the caller passes to the step body Xray stores.
+
+    Accepts either a full `.feature` file or a body that is already normalized,
+    so `--file the-same-file-you-just-compared` is safe. Idempotent: a body
+    with no header survives unchanged.
+
+    Raises ValueError rather than writing a payload that would leave the Test
+    invalid — a `Feature:` line inside the step body is not something Xray can
+    hold, and the resulting corruption is only visible on the next fetch.
+    """
+    body = normalize_local_feature(text)
+    offenders = [
+        line
+        for line in body.splitlines()
+        if _TAG_LINE_RE.match(line) or line.lstrip().startswith("Feature:")
+    ]
+    if offenders:
+        raise ValueError(
+            "refusing to write a Gherkin body that still contains header "
+            f"lines after normalization: {offenders[:3]}"
+        )
+    return body
+
+
 def diff_lines(local_normalized: str, live: str) -> list[str]:
     """Minimal unified-style diff between normalized-local and live Gherkin.
 

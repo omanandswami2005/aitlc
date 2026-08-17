@@ -11,7 +11,7 @@ from pathlib import Path
 import typer
 from aitlc.adapters.lambdatest import queue as remote_queue
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, chrome_cdp
+from aitlc.core import behave_runner, journal, chrome_cdp
 from aitlc.core import history as history_core
 from aitlc.core import locks, toon
 from aitlc.core.dotenv import load_dotenv
@@ -148,6 +148,15 @@ def run(
         "--patterns",
         help="Path to patterns.yaml (default: <config root>/patterns.yaml).",
     ),
+    mobile: bool = typer.Option(
+        False,
+        "--mobile",
+        help=(
+            "Run locally with mobile emulation: sets TEST_TYPE=mobile_browser "
+            "and the device variable from [mobile] in aitlc.toml. Without it a "
+            "mobile scenario runs at desktop viewport and nothing says so."
+        ),
+    ),
     remote: bool = typer.Option(
         False,
         "--remote",
@@ -261,7 +270,26 @@ def run(
                 typer.echo(json.dumps({"error": str(exc)}), err=True)
                 raise typer.Exit(code=2) from exc
 
+    local_mobile_env: dict[str, str] = {}
+    if mobile:
+        if remote:
+            typer.echo(
+                json.dumps(
+                    {"error": "--mobile is for local runs; --remote already implies it"}
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        local_mobile_env = {
+            "TEST_TYPE": "mobile_browser",
+            config.mobile.mobile_device_env_var: config.mobile.mobile_device_env_value,
+        }
+
     if debug:
+        dirty, why = chrome_cdp.is_dirty_for(config.root_dir, cdp_port, base_test_id)
+        if dirty:
+            typer.echo(json.dumps({"warning": why}), err=True)
+
         if remote:
             typer.echo(
                 json.dumps(
@@ -278,6 +306,8 @@ def run(
             typer.echo(json.dumps({"error": str(exc)}), err=True)
             raise typer.Exit(code=2) from exc
         remote_env["PLAYWRIGHT_CDP_URL"] = instance.cdp_url
+        # Claim the profile, so the next run against it can say who was here.
+        chrome_cdp.mark_driven(config.root_dir, instance.port, base_test_id)
 
         # Pause-on-failure is attached through behave's own runner option
         # rather than a hook block the project has to carry. Projects that
@@ -315,7 +345,7 @@ def run(
             name_pattern=name,
             dry_run=dry_run,
             no_capture=no_capture,
-            env=remote_env or None,
+            env={**remote_env, **local_mobile_env} or None,
             status_file=status_path,
             line=line,
             extra_args=debug_extra_args,
@@ -398,5 +428,18 @@ def run(
 
     output = redact_text(output, secret_values)
     typer.echo(output)
+
+    # Journalled because this is the most expensive command in the tool: a run
+    # takes minutes and, on suites that create users or move balances, changes
+    # real state. Re-running it to re-read an answer is the cost this avoids.
+    journal.record(
+        config.root_dir,
+        command="run",
+        argv=[base_test_id],
+        exit_code=0 if result.passed else 1,
+        payload=payload,
+        secret_values=secret_values,
+        tags=["run", base_test_id],
+    )
 
     raise typer.Exit(code=0 if result.passed else 1)

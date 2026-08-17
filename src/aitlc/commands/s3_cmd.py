@@ -18,6 +18,7 @@ from typing import Any
 
 import typer
 from aitlc.adapters.s3 import evidence as s3_evidence
+from aitlc.core import artifact_cache, journal, triage
 from aitlc.config import AitlcConfig, ConfigError
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.report_summary import parse_html_report
@@ -182,6 +183,19 @@ def report_summary(
 def list_reports(
     name_contains: str = typer.Option("detailed_report", "--name-contains"),
     limit: int = typer.Option(10, "--limit"),
+    prefix: str | None = typer.Option(
+        None,
+        "--prefix",
+        help=(
+            "Narrow to this key prefix, e.g. one suite folder. Without it, "
+            "finding a single run means listing hundreds of keys and grepping."
+        ),
+    ),
+    runs: bool = typer.Option(
+        False,
+        "--runs",
+        help="Group into distinct runs (timestamp + report count) instead of listing objects.",
+    ),
 ) -> None:
     """List recent reports without downloading them.
 
@@ -195,8 +209,28 @@ def list_reports(
 
     client = _build_s3_client(config)
     matches = s3_evidence.find_objects(
-        client, config.s3_bucket, name_contains, prefix=config.s3_report_prefix
+        client,
+        config.s3_bucket,
+        name_contains,
+        prefix=prefix or config.s3_report_prefix,
     )
+    if runs:
+        grouped: dict[str, int] = {}
+        for match in matches:
+            stamp = triage.run_timestamp(match.key)
+            if stamp:
+                grouped[stamp] = grouped.get(stamp, 0) + 1
+        listed = sorted(grouped.items(), reverse=True)[:limit]
+        typer.echo(
+            json.dumps(
+                {
+                    "count": len(listed),
+                    "runs": [{"at": at, "reports": n} for at, n in listed],
+                },
+                indent=2,
+            )
+        )
+        return
     typer.echo(
         json.dumps(
             {
@@ -209,3 +243,97 @@ def list_reports(
             indent=2,
         )
     )
+
+
+@app.command("triage-run")
+def triage_run(
+    at: str | None = typer.Option(
+        None, "--at", help="Run timestamp (or a prefix of one) to triage."
+    ),
+    suite: str | None = typer.Option(
+        None, "--suite", help="Only reports whose key contains this."
+    ),
+    name_contains: str = typer.Option(
+        "behave_results",
+        "--name-contains",
+        help="Substring identifying report objects.",
+    ),
+    limit: int = typer.Option(500, "--limit", help="How many keys to consider."),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Ignore the artifact cache and re-download."
+    ),
+) -> None:
+    """Triage one CI run: totals plus one row per failure.
+
+    Replaces listing hundreds of keys, downloading each report singly, and
+    hand-writing a parser. The per-execution Behave JSON is a fraction of the
+    HTML report's size and already carries per-step status and error text.
+    """
+    config = AitlcConfig.find_and_load()
+    if not config.s3_bucket:
+        typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
+        raise typer.Exit(code=2)
+
+    client = _build_s3_client(config)
+    matches = s3_evidence.find_objects(
+        client, config.s3_bucket, name_contains, prefix=config.s3_report_prefix
+    )
+    keys = [m.key for m in matches][:limit]
+    if suite:
+        keys = [k for k in keys if suite in k]
+    if at:
+        keys = [k for k in keys if at in k]
+    else:
+        # Default to the newest run rather than mixing several: a "run" is every
+        # object sharing one timestamp, which is how a job covering two test
+        # plans appears.
+        stamps = sorted(
+            {t for k in keys if (t := triage.run_timestamp(k))}, reverse=True
+        )
+        if stamps:
+            keys = [k for k in keys if stamps[0] in k]
+
+    if not keys:
+        typer.echo(
+            json.dumps(
+                {"error": "no report objects matched", "at": at, "suite": suite}
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    documents: list[tuple[str, object]] = []
+    cached_hits = 0
+    for key in keys:
+        local = None if refresh else artifact_cache.get(config.root_dir, key)
+        if local is None:
+            raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
+            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(raw)
+            local = artifact_cache.put(config.root_dir, key, tmp, source="s3")
+            tmp.unlink(missing_ok=True)
+        else:
+            cached_hits += 1
+        try:
+            documents.append((key.rsplit("/", 1)[-1], json.loads(local.read_text())))
+        except json.JSONDecodeError:
+            continue
+
+    result = triage.triage_documents(documents)
+    payload = {
+        "run": at or (triage.run_timestamp(keys[0]) if keys else None),
+        "reports": len(keys),
+        "from_cache": cached_hits,
+        **result.to_dict(),
+    }
+    typer.echo(json.dumps(payload, indent=2))
+    journal.record(
+        config.root_dir,
+        command="s3 triage-run",
+        argv=[a for a in [at, suite] if a],
+        exit_code=0 if not result.failures else 1,
+        payload=payload,
+        tags=["triage"],
+    )
+    raise typer.Exit(code=0 if not result.failures else 1)

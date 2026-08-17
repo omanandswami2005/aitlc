@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from aitlc.adapters.xray.gherkin_normalize import diff_lines, normalize_local_feature
+from aitlc.adapters.xray.gherkin_normalize import (
+    diff_lines,
+    normalize_gherkin_body,
+    normalize_local_feature,
+)
 
 
 class XrayError(RuntimeError):
@@ -162,7 +166,14 @@ class XrayClient:
         actually persisted — the mutation response echoing back what was
         sent is not proof of a real write (verified pattern from this
         project's real usage).
+
+        The body is normalized the same way ``compare_gherkin`` normalizes,
+        because Xray stores only the step body. Without this, passing the
+        `.feature` file you just compared writes its tags and ``Feature:``
+        line into the Test and leaves it invalid — a real corruption of a
+        shared Test, recovered by hand.
         """
+        new_gherkin = normalize_gherkin_body(new_gherkin)
         current = self.get_gherkin(key)
 
         mutation = """
@@ -180,9 +191,15 @@ class XrayClient:
 
         fresh = self.get_gherkin(key)
         if fresh.gherkin != new_gherkin:
+            # Deliberately explicit that the Test WAS modified: the previous
+            # wording ("write did not persist as sent") reads as "nothing
+            # happened", and someone acting on that walks away from a Test
+            # they have just changed.
             raise XrayError(
-                f"update_gherkin for {key}: write did not persist as sent. "
-                "Re-fetched Gherkin does not match what was written."
+                f"update_gherkin for {key}: the Test WAS written, but the "
+                "re-fetched Gherkin differs from what was sent — Xray may "
+                "have reshaped it. Compare before writing again.\n"
+                f"--- sent ---\n{new_gherkin}\n--- live now ---\n{fresh.gherkin}"
             )
         return fresh
 

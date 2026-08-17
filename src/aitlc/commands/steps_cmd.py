@@ -22,6 +22,23 @@ def run(
     example_row: int = typer.Option(
         0, "--example-row", help="Scenario Outline Examples row index."
     ),
+    trace: str | None = typer.Option(
+        None,
+        "--trace",
+        help=(
+            "Write a Playwright trace (screenshots + DOM snapshots) here. "
+            "`aitlc trace show` opens it; tracing is otherwise only produced "
+            "on the remote grid."
+        ),
+    ),
+    capture_network: bool = typer.Option(
+        False,
+        "--capture-network",
+        help=(
+            "Record API responses seen during the slice. A slice gets no "
+            "before_scenario, so a collector the suite installs there is absent."
+        ),
+    ),
     cdp_url: str | None = typer.Option(
         None,
         "--cdp-url",
@@ -83,9 +100,11 @@ def run(
         allow_missing_setup=allow_missing_setup,
         browser_actions=config.browser_actions,
         browser_factory=config.browser_factory,
+        trace=trace,
+        capture_network=capture_network,
     )
 
-    payload = {
+    payload: dict = {
         "loaded_step_modules": result.loaded_step_modules,
         "scenario_setup": result.scenario_setup,
         "results": [
@@ -98,8 +117,31 @@ def run(
             for r in result.results
         ],
     }
+    # A child that died before running anything used to print exactly the same
+    # thing as a successful empty run — {"results": []} with exit 0 — while the
+    # reason sat unread on stderr. Say what happened instead.
+    if result.exit_code != 0 or (not result.results and result.stderr_tail):
+        payload["error"] = (
+            "the step child exited non-zero and ran no steps"
+            if not result.results
+            else "the step child exited non-zero"
+        )
+        if result.stderr_tail:
+            payload["stderr_tail"] = result.stderr_tail
+    if result.unhandled_events:
+        payload["unhandled_events"] = result.unhandled_events
+    if result.network:
+        payload["network"] = result.network
+    if result.trace_path:
+        payload["trace"] = result.trace_path
+
     typer.echo(json.dumps(payload, indent=2))
-    raise typer.Exit(code=0 if result.passed else 1)
+    failed = (
+        not result.passed
+        or result.exit_code != 0
+        or (not result.results and bool(result.stderr_tail))
+    )
+    raise typer.Exit(code=1 if failed else 0)
 
 
 @app.command("unused")
