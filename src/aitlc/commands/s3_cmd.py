@@ -18,7 +18,7 @@ from typing import Any
 
 import typer
 from aitlc.adapters.s3 import evidence as s3_evidence
-from aitlc.core import artifact_cache, journal, triage
+from aitlc.core import artifact_cache, journal, test_history, test_lookup, triage
 from aitlc.config import AitlcConfig, ConfigError
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.report_summary import parse_html_report
@@ -278,7 +278,11 @@ def triage_run(
     matches = s3_evidence.find_objects(
         client, config.s3_bucket, name_contains, prefix=config.s3_report_prefix
     )
-    keys = [m.key for m in matches][:limit]
+    # Filter first, truncate second. The other order silently hides an older
+    # run behind `--limit` newer ones and reports "no report objects matched",
+    # which reads as "that run does not exist" -- it cost three guesses at
+    # `--limit` before a real run appeared.
+    keys = [m.key for m in matches]
     if suite:
         keys = [k for k in keys if suite in k]
     if at:
@@ -292,6 +296,7 @@ def triage_run(
         )
         if stamps:
             keys = [k for k in keys if stamps[0] in k]
+    keys = keys[:limit]
 
     if not keys:
         typer.echo(
@@ -337,3 +342,300 @@ def triage_run(
         tags=["triage"],
     )
     raise typer.Exit(code=0 if not result.failures else 1)
+
+
+def _behave_objects(client: Any, config: AitlcConfig, name_contains: str) -> list:
+    return s3_evidence.find_objects(
+        client, config.s3_bucket, name_contains, prefix=config.s3_report_prefix
+    )
+
+
+def _newest_runs(keys: list[str], count: int) -> list[str]:
+    """The `count` newest run timestamps present in these keys."""
+    stamps = {t for k in keys if (t := triage.run_timestamp(k))}
+    return sorted(stamps, reverse=True)[:count]
+
+
+def _runs_within_days(keys: list[str], days: int) -> list[str]:
+    """Every run timestamp falling on one of the `days` most recent dates.
+
+    A suite runs many times a day, so "the last 10 runs" can all share one
+    date and collapse a history matrix to a single column -- confirmed live,
+    which is why day-scoping is the default for history.
+    """
+    stamps = sorted({t for k in keys if (t := triage.run_timestamp(k))}, reverse=True)
+    dates = sorted({test_history.run_date(s) for s in stamps if test_history.run_date(s)}, reverse=True)
+    wanted = set(dates[:days])
+    return [s for s in stamps if test_history.run_date(s) in wanted]
+
+
+@app.command("find-test")
+def find_test(
+    test_keys: list[str] = typer.Argument(..., help="One or more test keys."),
+    runs: int = typer.Option(
+        1, "--runs", help="How many recent runs to consider, newest first."
+    ),
+    name_contains: str = typer.Option("behave_results", "--name-contains"),
+) -> None:
+    """Locate the run artifacts for one or more test keys, without downloading.
+
+    Answers "which plan ran this, and in which run" from the object listing
+    alone. A key that names an execution resolves here for free; a key that
+    only exists as a scenario tag inside another file cannot be seen without
+    reading the documents, and is reported as needing `verify-test` rather
+    than as "did not run" -- confusing those two is what sends someone
+    guessing at report titles and downloading megabytes to check.
+    """
+    config = AitlcConfig.find_and_load()
+    if not config.s3_bucket:
+        typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
+        raise typer.Exit(code=2)
+
+    client = _build_s3_client(config)
+    keys = [m.key for m in _behave_objects(client, config, name_contains)]
+    wanted_runs = _newest_runs(keys, runs)
+    scoped = [k for k in keys if any(stamp in k for stamp in wanted_runs)]
+
+    found: dict[str, list[dict]] = {}
+    for test_key in test_keys:
+        hits = [k for k in scoped if test_lookup.key_names_test(k, test_key)]
+        found[test_key] = [
+            info.__dict__
+            for k in hits
+            if (info := test_lookup.parse_object_key(k)) is not None
+        ]
+
+    unresolved = [k for k, v in found.items() if not v]
+    payload = {
+        "runs_considered": wanted_runs,
+        "objects_in_scope": len(scoped),
+        "found": found,
+    }
+    if unresolved:
+        payload["not_named_by_any_object"] = unresolved
+        payload["hint"] = (
+            "these keys are not execution keys; they may still have run as "
+            "scenario tags inside another file -- `aitlc s3 verify-test` reads "
+            "the documents and will find them"
+        )
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("verify-test")
+def verify_test(
+    test_keys: list[str] = typer.Argument(..., help="One or more test keys."),
+    runs: int = typer.Option(
+        1, "--runs", help="How many recent runs to consider, newest first."
+    ),
+    name_contains: str = typer.Option("behave_results", "--name-contains"),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Ignore the artifact cache and re-download."
+    ),
+) -> None:
+    """Did these tests pass in the most recent run, and if not, where did they stop?
+
+    The command that closes the loop after pushing a fix: it resolves each key
+    to its run artifact, reads it, and reports pass/fail with the failing step
+    and its real error. It deliberately reads the per-test Behave JSON rather
+    than the HTML report -- the JSON is orders of magnitude smaller, already
+    structured, and carries the scenario tags that make a nested test key
+    findable at all.
+    """
+    config = AitlcConfig.find_and_load()
+    if not config.s3_bucket:
+        typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
+        raise typer.Exit(code=2)
+
+    client = _build_s3_client(config)
+    keys = [m.key for m in _behave_objects(client, config, name_contains)]
+    wanted_runs = _newest_runs(keys, runs)
+    scoped = [k for k in keys if any(stamp in k for stamp in wanted_runs)]
+
+    # Read the named objects first; only fall back to the whole run for keys
+    # that no object name accounts for. On a suite where every key is an
+    # execution key this downloads exactly as many objects as keys asked for.
+    named: dict[str, list[str]] = {
+        t: [k for k in scoped if test_lookup.key_names_test(k, t)] for t in test_keys
+    }
+    to_read = {k for hits in named.values() for k in hits}
+    if any(not hits for hits in named.values()):
+        to_read = set(scoped)
+
+    documents: list[tuple[str, object]] = []
+    for key in sorted(to_read):
+        local = None if refresh else artifact_cache.get(config.root_dir, key)
+        if local is None:
+            raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
+            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(raw)
+            local = artifact_cache.put(config.root_dir, key, tmp, source="s3")
+            tmp.unlink(missing_ok=True)
+        try:
+            documents.append((key, json.loads(local.read_text())))
+        except json.JSONDecodeError:
+            continue
+
+    results = []
+    any_failed = False
+    for test_key in test_keys:
+        best = None
+        for key, doc in documents:
+            outcome = test_lookup.outcome_for_test(doc, test_key, source=key)
+            if outcome.status != "not_found":
+                best = outcome
+                break
+        if best is None:
+            best = test_lookup.TestOutcome(test_key=test_key)
+        if best.status == "failed":
+            any_failed = True
+        results.append(best.to_dict())
+
+    payload = {
+        "runs_considered": wanted_runs,
+        "objects_read": len(documents),
+        "results": results,
+    }
+    typer.echo(json.dumps(payload, indent=2))
+    journal.record(
+        config.root_dir,
+        command="s3 verify-test",
+        argv=list(test_keys),
+        exit_code=1 if any_failed else 0,
+        payload=payload,
+        tags=["triage"],
+    )
+    raise typer.Exit(code=1 if any_failed else 0)
+
+
+@app.command("history")
+def history_compare(
+    test_keys: list[str] = typer.Argument(..., help="One or more test keys."),
+    days: int = typer.Option(
+        7,
+        "--days",
+        help=(
+            "How many recent calendar days to cover. Days, not runs: a suite "
+            "executes many times a day, so a run count collapses the matrix "
+            "into a single column."
+        ),
+    ),
+    runs: int | None = typer.Option(
+        None, "--runs", help="Consider exactly this many recent runs instead of --days."
+    ),
+    name_contains: str = typer.Option("behave_results", "--name-contains"),
+    refresh: bool = typer.Option(False, "--refresh", help="Re-download, ignore cache."),
+    store: bool = typer.Option(
+        True, "--store/--no-store", help="Update the consolidated history file."
+    ),
+) -> None:
+    """How have these tests behaved across the last N runs -- chronic or flaky?
+
+    One run says "it failed". This says whether it fails the *same way* every
+    time, which is the thing that decides what to do next: a deterministic
+    failure is worth reproducing locally, an intermittent one needs a base rate
+    before anyone bisects anything. Answering it by hand took a bespoke script
+    every time, and got the Scenario Outline aggregation wrong on the first try.
+
+    The result is also written to `reports/.aitlc/test-history.json`, so the
+    next person reads the answer instead of re-downloading every artifact.
+    """
+    config = AitlcConfig.find_and_load()
+    if not config.s3_bucket:
+        typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
+        raise typer.Exit(code=2)
+
+    client = _build_s3_client(config)
+    keys = [m.key for m in _behave_objects(client, config, name_contains)]
+    if runs is not None:
+        wanted_runs = _newest_runs(keys, runs)
+    else:
+        wanted_runs = _runs_within_days(keys, days)
+    scoped = [k for k in keys if any(stamp in k for stamp in wanted_runs)]
+    if not scoped:
+        typer.echo(json.dumps({"error": "no run artifacts found"}), err=True)
+        raise typer.Exit(code=1)
+
+    documents: list[tuple[str, object]] = []
+    for key in sorted(scoped):
+        local = None if refresh else artifact_cache.get(config.root_dir, key)
+        if local is None:
+            raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
+            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(raw)
+            local = artifact_cache.put(config.root_dir, key, tmp, source="s3")
+            tmp.unlink(missing_ok=True)
+        try:
+            documents.append((key, json.loads(local.read_text())))
+        except json.JSONDecodeError:
+            continue
+
+    # One outcome per (test, run). A test's scenarios can be spread over more
+    # than one object in a run, so outcomes are folded per run rather than
+    # taking the first object that mentions the key.
+    per_test: dict[str, dict[str, test_history.RunOutcome]] = {t: {} for t in test_keys}
+    for key, doc in documents:
+        info = test_lookup.parse_object_key(key)
+        if info is None:
+            continue
+        for test_key in test_keys:
+            found = test_lookup.outcome_for_test(doc, test_key, source=key)
+            if found.status == "not_found":
+                continue
+            slot = per_test[test_key].get(info.run_timestamp)
+            failure = found.failures[0] if found.failures else None
+            outcome = test_history.RunOutcome(
+                date=test_history.run_date(info.run_timestamp),
+                run=info.run_timestamp,
+                outcome=found.status,
+                plan=info.plan,
+                execution_key=info.execution_key,
+                step=failure["step"] if failure else "",
+                error=failure["error"] if failure else "",
+                signature=(
+                    test_history.signature_of(failure["step"], failure["error"])
+                    if failure
+                    else ""
+                ),
+            )
+            # A failure anywhere in the run outranks a pass elsewhere in it.
+            if slot is None or (slot.outcome == "passed" and outcome.outcome == "failed"):
+                per_test[test_key][info.run_timestamp] = outcome
+
+    by_run: dict[str, list[test_history.RunOutcome]] = {}
+    for outcomes in per_test.values():
+        for stamp, outcome in outcomes.items():
+            by_run.setdefault(stamp, []).append(outcome)
+    outages = test_history.mark_infrastructure_runs(by_run)
+    for outcomes in per_test.values():
+        for stamp, outcome in outcomes.items():
+            if stamp in outages:
+                outcome.infrastructure = True
+
+    histories = [
+        test_history.build_history(test_key, list(per_test[test_key].values()))
+        for test_key in test_keys
+    ]
+
+    payload = {
+        "runs_considered": wanted_runs,
+        "objects_read": len(documents),
+        "infrastructure_runs": sorted(outages),
+        "matrix": test_history.matrix(histories),
+        "tests": [h.to_dict() for h in histories],
+    }
+    if store:
+        path = test_history.default_store(config.root_dir)
+        test_history.merge_into_store(path, histories)
+        payload["stored_at"] = str(path.relative_to(config.root_dir))
+
+    typer.echo(json.dumps(payload, indent=2))
+    journal.record(
+        config.root_dir,
+        command="s3 history",
+        argv=list(test_keys),
+        exit_code=0,
+        payload={"runs": wanted_runs, "tests": [h.test_key for h in histories]},
+        tags=["triage"],
+    )
