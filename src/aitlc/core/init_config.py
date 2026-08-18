@@ -428,3 +428,69 @@ def render_toml(profile: ProjectProfile) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def merge_toml(existing: str, generated: str) -> tuple[str, list[str]]:
+    """Fill gaps in an existing config from a freshly detected one.
+
+    Re-running `init` on a project that has been configured is the normal
+    case, not the exception: the layout drifts, a new setting is added to
+    the tool, someone wants the detector's opinion again. Overwriting is the
+    wrong answer, because every hand-edit -- the ones that made the file
+    correct -- is discarded silently.
+
+    So an existing setting always wins, and only keys the file does not
+    already set are added. Commented placeholders count as *unset*: they are
+    what `init` writes when it cannot detect something, so a later run that
+    can detect it should fill it in.
+
+    Returns the merged text and the list of keys that were added, so the
+    caller can report exactly what changed rather than "written".
+    """
+    set_keys = set()
+    for line in existing.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("["):
+            continue
+        if "=" in stripped:
+            set_keys.add(stripped.split("=", 1)[0].strip())
+
+    # Walk the generated file section by section so an added key lands under
+    # the heading it belongs to, not appended at the end where TOML would
+    # read it as part of whichever section happens to be last.
+    additions: dict[str, list[str]] = {}
+    added_keys: list[str] = []
+    section = ""
+    for line in generated.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+            continue
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in set_keys:
+            continue
+        additions.setdefault(section, []).append(line)
+        added_keys.append(f"{section}{key}" if section else key)
+
+    if not additions:
+        return existing, []
+
+    merged = existing.rstrip("\n").splitlines()
+    for section, lines in additions.items():
+        if section and section in (line.strip() for line in merged):
+            index = max(
+                i for i, line in enumerate(merged) if line.strip() == section
+            )
+            # Insert at the end of that section, before the next heading.
+            end = index + 1
+            while end < len(merged) and not merged[end].strip().startswith("["):
+                end += 1
+            merged[end:end] = lines
+        else:
+            if section:
+                merged.append("")
+                merged.append(section)
+            merged.extend(lines)
+    return "\n".join(merged) + "\n", added_keys

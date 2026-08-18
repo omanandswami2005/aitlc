@@ -25,6 +25,12 @@ def init(
     force: bool = typer.Option(
         False, "--force", help="Overwrite an existing aitlc.toml."
     ),
+    merge: bool = typer.Option(
+        False,
+        "--merge",
+        help="Add newly detected keys to an existing aitlc.toml, keeping every "
+        "value already set there.",
+    ),
 ) -> None:
     """Detect this project's layout and write a working aitlc.toml.
 
@@ -48,12 +54,22 @@ def init(
         raise typer.Exit(code=2)
 
     target = project_root / "aitlc.toml"
-    if target.exists() and not force and not dry_run:
+    if merge and force:
+        typer.echo(
+            json.dumps({"error": "--merge and --force are mutually exclusive"}),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if target.exists() and not force and not merge and not dry_run:
         typer.echo(
             json.dumps(
                 {
                     "error": f"{target} already exists",
-                    "hint": "re-run with --force to overwrite, or --dry-run to preview",
+                    "hint": (
+                        "re-run with --merge to add only newly detected keys and "
+                        "keep your edits, --force to overwrite, or --dry-run to "
+                        "preview"
+                    ),
                 }
             ),
             err=True,
@@ -67,8 +83,22 @@ def init(
     payload["target"] = str(target)
     payload["written"] = False
 
+    added: list[str] = []
+    if merge and target.exists():
+        content, added = init_config.merge_toml(
+            target.read_text(encoding="utf-8"), content
+        )
+        payload["merged"] = True
+        payload["added_keys"] = added
+
     if dry_run:
         payload["preview"] = content
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    if merge and target.exists() and not added:
+        payload["written"] = False
+        payload["message"] = "nothing to add; every detected key is already set"
         typer.echo(json.dumps(payload, indent=2))
         return
 
