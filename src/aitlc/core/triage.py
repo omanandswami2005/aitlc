@@ -35,6 +35,9 @@ class Failure:
     step: str
     error: str
     locator: str = ""
+    resolved: str = ""
+    intercepted_by: str = ""
+    retries: int = 0
 
 
 @dataclass
@@ -91,6 +94,64 @@ def extract_error(error_message: str | list[str] | None) -> tuple[str, str]:
     return head, locator
 
 
+def call_log_highlights(error_message: str | list[str] | None) -> dict:
+    """The lines of a Playwright call log that actually explain the failure.
+
+    A timeout's first line only says a click timed out; the call log below it
+    says *why*, and two of its lines carry almost all of the signal:
+
+    - `locator resolved to <button ... disabled>` — the element's real state
+      at click time. A disabled button is not a waiting problem, and reading
+      this line is the difference between fixing a timeout and fixing the
+      thing that kept the button disabled.
+    - `<div ...> intercepts pointer events` — an overlay swallowed the click.
+      Names the culprit element, which is the fix.
+
+    Both sat one line below what the triage table used to print. Returned as
+    fields rather than a blob so a table can show them without re-parsing.
+    """
+    if isinstance(error_message, list):
+        error_message = "\n".join(error_message)
+    text = error_message or ""
+    for marker in _CAPTURED_MARKERS:
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx]
+    # A retry counter prefixes the line in real logs:
+    # "123 x locator resolved to <span>under maintenance</span>". Matching on
+    # a bare "locator resolved to" misses every repeated attempt, which is
+    # most of them -- confirmed against real CI output, where the counter form
+    # was the only form present.
+    lines = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("- ").strip()
+        if not line:
+            continue
+        lines.append(re.sub(r"^\d+\s*[x\u00d7]\s+", "", line))
+
+    def first(predicate) -> str:
+        return next((line for line in lines if predicate(line)), "")
+
+    resolved = first(lambda line: line.startswith("locator resolved to"))
+    intercepted = first(lambda line: "intercepts pointer events" in line)
+    waiting_for = first(lambda line: line.startswith("waiting for"))
+
+    # "58 × waiting for element to be visible, enabled and stable" — the
+    # retry count separates "never appeared" from "appeared but was blocked".
+    retries = 0
+    for raw in text.splitlines():
+        match = re.match(r"\s*-?\s*(\d+)\s*[x\u00d7]\s", raw)
+        if match:
+            retries = max(retries, int(match.group(1)))
+
+    return {
+        "resolved": resolved,
+        "intercepted_by": intercepted,
+        "waiting_for": waiting_for,
+        "retries": retries,
+    }
+
+
 def run_timestamp(key: str) -> str | None:
     """The run timestamp embedded in a report key, if there is one."""
     match = _RUN_TS.search(key)
@@ -137,17 +198,28 @@ def triage_documents(documents: list[tuple[str, object]]) -> TriageResult:
                 error, locator = extract_error(
                     (step.get("result") or {}).get("error_message")
                 )
+                highlights = call_log_highlights(
+                    (step.get("result") or {}).get("error_message")
+                )
                 result.failures.append(
                     Failure(
                         test_key=_test_key(element.get("tags") or [], execution),
                         execution_key=execution,
                         feature=feature.get("name", ""),
                         scenario=element.get("name", ""),
-                        step=(
-                            (step.get("keyword") or "") + (step.get("name") or "")
-                        ).strip(),
+                        step=" ".join(
+                            part
+                            for part in (
+                                (step.get("keyword") or "").strip(),
+                                (step.get("name") or "").strip(),
+                            )
+                            if part
+                        ),
                         error=error,
                         locator=locator,
+                        resolved=highlights["resolved"],
+                        intercepted_by=highlights["intercepted_by"],
+                        retries=highlights["retries"],
                     )
                 )
             if feature_failed:
