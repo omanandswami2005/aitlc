@@ -25,7 +25,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, step_console, chrome_cdp, debug_session
+from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, step_console
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.step_console import run_console
 from aitlc.core import workspace
@@ -389,3 +389,157 @@ def console(
             }
         )
     )
+
+
+@app.command("checkpoint")
+def checkpoint_cmd(
+    name: str = typer.Argument(..., help="Name for this snapshot."),
+    test_id: str = typer.Option("", "--test-id", help="Session to snapshot."),
+    cdp_url: str | None = typer.Option(None, "--cdp-url"),
+    port: int = typer.Option(chrome_cdp.DEFAULT_PORT, "--port"),
+    value: list[str] = typer.Option(
+        [], "--value", help="A run-scoped KEY=VALUE to record. Repeatable."
+    ),
+    entity: list[str] = typer.Option(
+        [], "--entity", help="Something created on the server, e.g. user=a@b.c."
+    ),
+) -> None:
+    """Snapshot the current session so an expensive setup can be returned to.
+
+    Fifteen minutes of setup before the interesting step used to mean paying
+    it again on every look. Record the session here and `restore` returns to
+    it.
+    """
+    config = AitlcConfig.find_and_load()
+    session = debug_session.load(config.root_dir, test_id) if test_id else None
+
+    url = cdp_url or (session.cdp_url if session else None)
+    if not url:
+        instance = chrome_cdp.load_state(config.root_dir, port)
+        url = f"http://127.0.0.1:{instance.port}" if instance else None
+    if not url:
+        typer.echo(
+            json.dumps({"error": "no live browser to snapshot; pass --cdp-url"}),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        state = checkpoint.capture_browser_state(url)
+    except Exception as exc:
+        typer.echo(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), err=True)
+        raise typer.Exit(code=2) from exc
+
+    def pairs(items):
+        out = {}
+        for item in items:
+            key, _, val = item.partition("=")
+            if key:
+                out[key.strip()] = val.strip()
+        return out
+
+    record = checkpoint.Checkpoint(
+        name=name,
+        test_id=test_id or (session.test_id if session else ""),
+        feature=session.feature if session else "",
+        step_index=session.index if session else 0,
+        storage_state=state,
+        run_values=pairs(value),
+        created_entities=[pairs([e]) for e in entity],
+    )
+    path = checkpoint.save(config.root_dir, record)
+    payload = record.summary()
+    payload["saved_to"] = str(path.relative_to(config.root_dir))
+    if not payload["cookies"]:
+        # A checkpoint with no cookies restores nothing. Saying so now beats
+        # discovering it when a restore silently lands on a login page.
+        payload["warning"] = (
+            "no cookies were captured, so this snapshot carries no session"
+        )
+    typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("restore")
+def restore_cmd(
+    name: str = typer.Argument(..., help="Checkpoint to restore."),
+    cdp_url: str | None = typer.Option(None, "--cdp-url"),
+    port: int = typer.Option(chrome_cdp.DEFAULT_PORT, "--port"),
+    ttl: float = typer.Option(
+        checkpoint.DEFAULT_TTL_SECONDS,
+        "--ttl",
+        help="Refuse to restore a checkpoint older than this many seconds.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Restore even when past the TTL."
+    ),
+) -> None:
+    """Replay a checkpoint's session into a live browser."""
+    config = AitlcConfig.find_and_load()
+    try:
+        record = checkpoint.load(config.root_dir, name)
+    except checkpoint.CheckpointError as exc:
+        typer.echo(json.dumps({"error": str(exc)}), err=True)
+        raise typer.Exit(code=2) from exc
+    if record is None:
+        typer.echo(json.dumps({"error": f"no checkpoint named {name!r}"}), err=True)
+        raise typer.Exit(code=2)
+
+    if record.is_stale(ttl) and not force:
+        # A dead session restored silently produces exactly the false failure
+        # this is meant to prevent.
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "checkpoint is older than the TTL and may no longer work",
+                    "age_seconds": round(record.age_seconds(), 1),
+                    "ttl_seconds": ttl,
+                    "hint": "re-take it, or pass --force to restore anyway",
+                }
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    url = cdp_url
+    if not url:
+        instance = chrome_cdp.load_state(config.root_dir, port)
+        url = f"http://127.0.0.1:{instance.port}" if instance else None
+    if not url:
+        typer.echo(json.dumps({"error": "no live browser; pass --cdp-url"}), err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        applied = checkpoint.restore_browser_state(url, record.storage_state)
+    except Exception as exc:
+        typer.echo(json.dumps({"error": f"{type(exc).__name__}: {exc}"}), err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(
+        json.dumps(
+            {
+                **record.summary(),
+                **applied,
+                "run_values": record.run_values,
+                "created_entities": record.created_entities,
+            },
+            indent=2,
+        )
+    )
+
+
+@app.command("checkpoints")
+def checkpoints_cmd(
+    delete: str = typer.Option("", "--delete", help="Remove this checkpoint."),
+    ttl: float = typer.Option(checkpoint.DEFAULT_TTL_SECONDS, "--ttl"),
+) -> None:
+    """List saved checkpoints, newest first, with whether each is still usable."""
+    config = AitlcConfig.find_and_load()
+    if delete:
+        typer.echo(json.dumps({"deleted": checkpoint.delete(config.root_dir, delete)}))
+        return
+    rows = []
+    for record in checkpoint.list_all(config.root_dir):
+        row = record.summary()
+        row["usable"] = not record.is_stale(ttl)
+        rows.append(row)
+    typer.echo(json.dumps({"count": len(rows), "checkpoints": rows}, indent=2))
