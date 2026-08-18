@@ -13,6 +13,7 @@ adapters/s3/evidence.py's trace search.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -39,11 +40,34 @@ def _load_env(
 
 
 def _build_s3_client(config: AitlcConfig) -> Any:
+    """An S3 client from a named profile when one is configured, else static keys.
+
+    A profile is preferred because botocore resolves it on every call, so an
+    SSO session refreshed in another terminal is picked up without editing
+    anything. Static keys in a file expire silently and then take precedence
+    over the refreshed profile, which makes `aws sso login` look broken.
+    """
+    profile = os.environ.get("AWS_PROFILE") or config.s3_profile
+    if profile:
+        return s3_evidence.build_client_from_profile(profile, config.s3_region)
     try:
         access_key = config.require_env("s3_access_key_id")
         secret_key = config.require_env("s3_secret_access_key")
     except ConfigError as exc:
-        typer.echo(json.dumps({"error": str(exc)}), err=True)
+        message = str(exc)
+        typer.echo(
+            json.dumps(
+                {
+                    "error": message,
+                    "hint": (
+                        "set [s3].profile in aitlc.toml (or AWS_PROFILE) to use a "
+                        "named AWS profile, including an SSO one, instead of "
+                        "static keys that expire"
+                    ),
+                }
+            ),
+            err=True,
+        )
         raise typer.Exit(code=2) from exc
     session_token = config.env.resolve("s3_session_token")
     return s3_evidence.build_client(

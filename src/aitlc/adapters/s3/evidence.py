@@ -52,6 +52,46 @@ def build_client(
     return boto3.client("s3", **kwargs)
 
 
+def build_client_from_profile(profile: str, region: str) -> Any:
+    """Build an S3 client from a named AWS profile, including SSO profiles.
+
+    Static keys in a `.env` expire, and when they do every S3 command fails
+    with a credential error that a fresh `aws sso login` does *not* fix --
+    because the stale values in the file take precedence over the refreshed
+    profile. The only way out was exporting credentials by hand into the
+    project's own variable names, which is both undiscoverable and re-done
+    every few hours.
+
+    A profile is resolved by botocore at call time, so an SSO session
+    refreshed in the background is picked up without touching any file.
+    """
+    session = boto3.Session(profile_name=profile, region_name=region)
+    return session.client("s3")
+
+
+def credentials_are_usable(client: Any) -> tuple[bool, str]:
+    """Whether this client can actually authenticate, and why not if it cannot.
+
+    Checked up front so an expired token is reported as an expired token,
+    rather than surfacing several calls later as a traceback out of a
+    paginator, which is how it reads today.
+    """
+    try:
+        client.list_buckets()
+        return True, ""
+    except Exception as exc:  # botocore raises many distinct types here
+        text = str(exc)
+        if "ExpiredToken" in text or "InvalidClientTokenId" in text:
+            return False, (
+                "AWS credentials have expired. Refresh them, or point aitlc at "
+                "an AWS profile with [s3].profile in aitlc.toml so they are "
+                "resolved fresh on every call."
+            )
+        if "AccessDenied" in text:
+            return False, "AWS credentials are valid but lack S3 permission."
+        return False, text
+
+
 def find_objects(
     client: Any, bucket: str, name_contains: str, *, prefix: str = ""
 ) -> list[S3ObjectMatch]:

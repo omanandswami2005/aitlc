@@ -120,6 +120,10 @@ class AitlcConfig:
     jira_server_url: str | None = None
     s3_bucket: str | None = None
     s3_region: str = "us-east-2"
+    # A named AWS profile (including an SSO profile). When set it wins over
+    # static keys, because a profile is resolved fresh on every call and
+    # static keys in a file go stale without announcing it.
+    s3_profile: str = ""
     # Real confirmed key shape for this project's daily HTML report:
     # {s3_report_prefix}/{name}... (S3Utility.upload_file_and_get_presigned_url).
     # Left blank by default since the exact folder naming is project-specific.
@@ -178,6 +182,7 @@ class AitlcConfig:
             jira_server_url=jira_data.get("server_url"),
             s3_bucket=s3_data.get("bucket"),
             s3_region=s3_data.get("region", "us-east-2"),
+            s3_profile=s3_data.get("profile", ""),
             s3_report_prefix=s3_data.get("report_prefix", ""),
             env=EnvMap(**env_data),
             mobile=MobileConfig(**mobile_data),
