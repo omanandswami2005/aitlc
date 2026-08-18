@@ -12,11 +12,20 @@ callers pass in whatever selectors they care about.
 
 from __future__ import annotations
 
+from datetime import datetime
+
+import time
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import sync_playwright
+
+
+def _iso(epoch: float) -> str:
+    """Local-time ISO stamp, so a measurement lines up with a human-read log."""
+    return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
 
 
 @dataclass
@@ -245,3 +254,121 @@ def inspect(
         # session (e.g. one frozen by DEBUG_PAUSE_ON_FAILURE) that the
         # caller/test process still owns.
         return result
+
+
+@dataclass
+class ConditionTiming:
+    """How long a page condition actually took to come true."""
+
+    selector: str
+    condition: str
+    met: bool
+    waited_s: float
+    started_at: str
+    ended_at: str
+    confirmed_start_state: bool
+    polls: int
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "selector": self.selector,
+            "condition": self.condition,
+            "met": self.met,
+            "waited_s": round(self.waited_s, 1),
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "confirmed_start_state": self.confirmed_start_state,
+            "polls": self.polls,
+            "note": self.note,
+        }
+
+
+def time_condition(
+    cdp_url: str,
+    selector: str,
+    *,
+    condition: str = "hidden",
+    timeout_s: float = 900.0,
+    poll_s: float = 2.0,
+    require_start_state: bool = True,
+) -> ConditionTiming:
+    """Measure how long a page takes to satisfy a condition, in wall-clock time.
+
+    Written after two failed attempts to measure the same thing by hand. The
+    trap both times was the same: if the element is *already* in the target
+    state when measuring begins -- because the page never loaded, or the app
+    logged itself out -- the condition is instantly true and the run reports
+    a triumphant "cleared in 0.4s" for something that never happened.
+
+    So `require_start_state` insists the element is first observed in the
+    opposite state, and says plainly when it was not. A measurement that
+    cannot be trusted is reported as untrusted rather than as a number,
+    because a wrong number here gets written into a timeout and quietly
+    breaks a suite.
+    """
+    if condition not in ("hidden", "visible"):
+        raise ValueError("condition must be 'hidden' or 'visible'")
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(cdp_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        locator = page.locator(selector)
+
+        def satisfied() -> bool:
+            try:
+                visible = locator.first.is_visible()
+            except Exception:
+                visible = False
+            return (not visible) if condition == "hidden" else visible
+
+        started = time.time()
+        confirmed_start = not satisfied()
+        if require_start_state and not confirmed_start:
+            return ConditionTiming(
+                selector=selector,
+                condition=condition,
+                met=False,
+                waited_s=0.0,
+                started_at=_iso(started),
+                ended_at=_iso(started),
+                confirmed_start_state=False,
+                polls=0,
+                note=(
+                    f"the element was already {condition} before waiting began, so "
+                    "nothing was measured. Re-run once the opposite state is on "
+                    "screen, or pass require_start_state=False if that is expected."
+                ),
+            )
+
+        polls = 0
+        deadline = started + timeout_s
+        while time.time() < deadline:
+            polls += 1
+            if satisfied():
+                ended = time.time()
+                return ConditionTiming(
+                    selector=selector,
+                    condition=condition,
+                    met=True,
+                    waited_s=ended - started,
+                    started_at=_iso(started),
+                    ended_at=_iso(ended),
+                    confirmed_start_state=confirmed_start,
+                    polls=polls,
+                )
+            time.sleep(poll_s)
+
+        ended = time.time()
+        return ConditionTiming(
+            selector=selector,
+            condition=condition,
+            met=False,
+            waited_s=ended - started,
+            started_at=_iso(started),
+            ended_at=_iso(ended),
+            confirmed_start_state=confirmed_start,
+            polls=polls,
+            note=f"still not {condition} after {timeout_s:.0f}s",
+        )

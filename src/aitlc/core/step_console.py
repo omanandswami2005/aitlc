@@ -31,6 +31,7 @@ step is itself just a registered step like any other.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -222,6 +223,16 @@ def _mobile_context_options(playwright: Any, device_name: str) -> dict:
     return options
 
 
+def _stamp(epoch: float) -> str:
+    """A local-time ISO stamp for correlating a step with an external log.
+
+    Local rather than UTC because the logs it gets compared against -- CI
+    console output, an application's own log -- are read in local time, and
+    a stamp nobody can line up by eye does not get used.
+    """
+    return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+
+
 @dataclass
 class StepResult:
     """One dispatched step and how it ended."""
@@ -230,6 +241,13 @@ class StepResult:
     status: str
     duration_s: float
     error: str | None = None
+    # Absolute wall-clock, not just a duration. A duration answers "how long
+    # did this step take"; it cannot answer "when did the app clear that
+    # banner", which is the question asked whenever a wait is tuned against
+    # a real backend job. Correlating a step with a server-side log needs a
+    # timestamp both sides share.
+    started_at: str = ""
+    ended_at: str = ""
 
 
 _KNOWN_EVENTS = frozenset(
@@ -360,6 +378,8 @@ def run_console(
                     status=record["status"],
                     duration_s=record.get("duration_s", 0.0),
                     error=record.get("error"),
+                    started_at=record.get("started_at", ""),
+                    ended_at=record.get("ended_at", ""),
                 )
             )
 
@@ -481,16 +501,24 @@ def _script_main() -> None:
             context.table = step.table
             context.text = step.text
             started = time.time()
+            record["started_at"] = _stamp(started)
             try:
                 match.run(context)
+                ended = time.time()
                 record.update(
-                    {"status": "passed", "duration_s": round(time.time() - started, 2)}
+                    {
+                        "status": "passed",
+                        "duration_s": round(ended - started, 2),
+                        "ended_at": _stamp(ended),
+                    }
                 )
             except Exception as exc:
+                ended = time.time()
                 record.update(
                     {
                         "status": "failed",
-                        "duration_s": round(time.time() - started, 2),
+                        "duration_s": round(ended - started, 2),
+                        "ended_at": _stamp(ended),
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )

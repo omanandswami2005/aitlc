@@ -8,6 +8,7 @@ from pathlib import Path
 import typer
 from aitlc.config import AitlcConfig
 from aitlc.core import chrome_cdp
+from aitlc.core import cdp_attach
 from aitlc.core.cdp_attach import inspect as cdp_inspect
 
 app = typer.Typer(help="Launch, inspect and stop a live Chromium instance over CDP.")
@@ -177,3 +178,60 @@ def stop(
         return
     stopped = chrome_cdp.stop(config.root_dir, port=port)
     typer.echo(json.dumps({"port": port, "stopped": stopped}))
+
+
+@app.command("time-until")
+def time_until(
+    selector: str = typer.Argument(..., help="CSS or XPath selector to watch."),
+    condition: str = typer.Option(
+        "hidden", "--condition", help="'hidden' or 'visible'."
+    ),
+    port: int = typer.Option(chrome_cdp.DEFAULT_PORT, "--port"),
+    cdp_url: str | None = typer.Option(None, "--cdp-url", help="Attach to this URL."),
+    timeout: float = typer.Option(900.0, "--timeout", help="Give up after N seconds."),
+    poll: float = typer.Option(2.0, "--poll", help="Seconds between checks."),
+    allow_already: bool = typer.Option(
+        False,
+        "--allow-already",
+        help="Do not require the opposite state first (measurement is then untrusted).",
+    ),
+) -> None:
+    """Measure how long the page takes to satisfy a condition, in wall-clock time.
+
+    For tuning a wait against a real backend job: how long does that banner
+    actually stay up? Guessing produces either a flaky test or a timeout so
+    large it hides a regression.
+
+    By default the element must first be observed in the *opposite* state.
+    Without that check an element that is already hidden -- because the page
+    never loaded, or the session dropped -- reports a confident "cleared in
+    0.4s" for something that never happened, which is how two hand-run
+    measurements produced numbers that were quietly meaningless.
+    """
+    config = AitlcConfig.find_and_load()
+    url = cdp_url
+    if not url:
+        instance = chrome_cdp.load_state(config.root_dir, port)
+        if instance is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": f"no tracked browser on port {port}",
+                        "hint": "start one with `aitlc cdp launch`, or pass --cdp-url",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        url = f"http://127.0.0.1:{instance.port}"
+
+    timing = cdp_attach.time_condition(
+        url,
+        selector,
+        condition=condition,
+        timeout_s=timeout,
+        poll_s=poll,
+        require_start_state=not allow_already,
+    )
+    typer.echo(json.dumps(timing.to_dict(), indent=2))
+    raise typer.Exit(code=0 if timing.met else 1)
