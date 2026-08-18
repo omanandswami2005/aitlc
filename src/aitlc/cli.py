@@ -21,6 +21,7 @@ from aitlc.commands import (
     jira_cmd,
     notify_cmd,
     parallel_cmd,
+    preflight_cmd,
     passthrough_cmd,
     propose_fix_cmd,
     record_cmd,
@@ -112,6 +113,7 @@ app.command("notify-teams")(notify_cmd.notify_teams)
 app.add_typer(xray_cmd.app, name="xray")
 app.add_typer(cdp_cmd.app, name="cdp")
 app.add_typer(call_cmd.app, name="call")
+app.add_typer(preflight_cmd.app, name="preflight")
 app.add_typer(debug_cmd.app, name="debug")
 app.add_typer(tunnel_cmd.app, name="tunnel")
 app.add_typer(jira_cmd.app, name="jira")
