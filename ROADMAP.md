@@ -3,22 +3,18 @@
 What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-**Tracker: 38 of 44 closed, 6 open.** Every row below came
+**Tracker: 44 of 44 closed.** Every row below came
 from a real debugging session that the tool made harder than it needed to be;
 none of them are speculative features.
 
 ## Open
 
-Ordered by how much a real investigation pays for them.
+Every gap raised from a real session is closed. What remains is verification
+that one of them fully delivers:
 
-| # | Gap | Notes |
+| # | Item | Status |
 |---|---|---|
-| G9 | no way to read page state or call a project function | Biggest remaining hole for interactive debugging. |
-| G10 | `parallel run` streams every child's transcript to stdout | Output is summarised but not separable per child. |
-| G15 | the skip-tag pre-filter is narrower than the project's rule |  |
-| G39 | a local run silently differs from the CI run of the same feature | Setup takes a different branch and nothing logs the switch. |
-| G40 | parallel results are not separable; attribution rests on a re-run |  |
-| G42 | the debug cycle cannot survive an expensive scenario | Sessions are not resumable across a restart. |
+| G42 | checkpoint restore | Cookie-level restore verified against a real logged-in session: 49 cookies captured and all 49 restored byte-identically, with the check proven falsifiable by clearing them first. **Whether the application accepts the restored session end to end is unverified** — one attempt landed on a sign-in page, a second timed out on a slow network, and neither ruled the other out. Treat restore as "session material replayed", not yet as "you are signed in". |
 
 ## Closed
 
@@ -63,6 +59,12 @@ Ordered by how much a real investigation pays for them.
 | G37 | per-step processes regenerate run-scoped data | Closed with G36: one process, one set of that data. |
 | G38 | no wall-clock stamps or condition timer | `started_at`/`ended_at` per step, plus `cdp time-until`. |
 | — | artifacts scattered across `reports/` | `--workspace` puts one investigation in one directory, applied at core level. |
+| G9 | no way to read page state or call a project function | `cdp inspect --storage` (values fingerprinted) and `aitlc call 'module:attr'`. |
+| G10 | `parallel run` streams every child's transcript | Each run writes `<workspace>/.parallel/<stem>.log`. |
+| G15 | the skip pre-filter was narrower than the suite's own rule | Matches the tag at any placement, plus `_prod`/`_stage`/`_dev`. |
+| G39 | a local run silently differs from the CI one | `aitlc preflight` reports missing session, misplaced hook tags, order dependence. |
+| G40 | parallel failures needed a re-run to attribute | Overlap and shared-account evidence, free; `--verify-failures` stays opt-in. |
+| G42 | the debug cycle could not survive an expensive scenario | `debug checkpoint` / `restore` / `checkpoints`, with a TTL. |
 
 ## Not planned
 
