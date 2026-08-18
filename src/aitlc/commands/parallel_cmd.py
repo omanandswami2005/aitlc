@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -46,6 +47,7 @@ from aitlc.core.feature_select import (
     split_line_spec,
 )
 from aitlc.core.redact import redact_text
+from aitlc.core import interference, workspace
 
 app = typer.Typer(
     help="Run many features in parallel — the `paver run parallel` workflow without tag edits."
@@ -321,6 +323,10 @@ def run(
         if per_job_cdp:
             claimed = browser_pool.get()
             env.update(chrome_cdp.debug_env(claimed))
+        log_path = workspace.output_path(
+            config.root_dir, ".parallel", f"{path.stem}.log"
+        )
+        started_at = time.time()
         try:
             result = behave_runner.run(
                 path,
@@ -329,10 +335,12 @@ def run(
                 no_capture=no_capture,
                 env=env,
                 line=line,
-                status_file=config.root_dir
-                / "reports"
-                / ".status"
-                / f"{path.stem}.json",
+                # Was hardcoded to reports/, so a parallel run wrote its status
+                # outside the workspace everything else honours.
+                status_file=workspace.output_path(
+                    config.root_dir, ".status", f"{path.stem}.json"
+                ),
+                log_file=log_path,
             )
         finally:
             # Return it even if the run raised, or one failure would
@@ -341,6 +349,10 @@ def run(
                 browser_pool.put(claimed)
         payload = result.to_dict()
         payload["feature"] = _display(path, config.root_dir)
+        payload["log"] = str(log_path.relative_to(config.root_dir))
+        payload["started_at"] = started_at
+        payload["ended_at"] = time.time()
+        payload["task_id"] = index
         if line is not None:
             payload["line"] = line
         payload["passed"] = result.passed
@@ -378,12 +390,36 @@ def run(
             )
             row["serial_recheck"] = "passed" if recheck.passed else "failed"
         failed = [r for r in failed if r.get("serial_recheck") != "passed"]
+    # Free attribution evidence, whether or not --verify-failures was used:
+    # a run that never overlapped cannot have interfered, and two runs driving
+    # the same account at the same time explain most "corrupted state"
+    # failures in a suite that shares accounts across features.
+    accounts_by_feature: dict[str, set[str]] = {}
+    for row in results:
+        feature_path = config.root_dir / row["feature"]
+        try:
+            accounts_by_feature[row["feature"]] = interference.accounts_in(
+                feature_path.read_text(encoding="utf-8")
+            )
+        except OSError:
+            accounts_by_feature[row["feature"]] = set()
+
+    for row in failed:
+        suspects = interference.suspects_for(row, results, accounts_by_feature)
+        row["concurrent_with"] = [s.to_dict() for s in suspects[:5]]
+        row["interference"] = interference.interference_note(suspects)
+
     summary = {
         "source": "focus" if used_focus else ("args" if features else "discovery"),
         "total": len(results),
         "passed": len(results) - len(failed),
         "failed": len(failed),
         "skipped_by_tag": skipped,
+        "logs": str(
+            workspace.output_path(config.root_dir, ".parallel").relative_to(
+                config.root_dir
+            )
+        ),
         "results": results,
     }
 

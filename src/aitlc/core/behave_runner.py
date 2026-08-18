@@ -235,6 +235,7 @@ def run(
     status_file: Path | None = None,
     line: int | None = None,
     extra_args: list[str] | None = None,
+    log_file: Path | None = None,
 ) -> RunResult:
     """Run one feature file through Behave, capturing a JSON report.
 
@@ -275,7 +276,18 @@ def run(
         proc_env["AITLC_STATUS_FILE"] = str(status_file)
         status_file.parent.mkdir(parents=True, exist_ok=True)
 
-    proc = subprocess.run(cmd, cwd=cwd, env=proc_env)
+    if log_file is not None:
+        # Keep this run's complete console output. With several features in
+        # flight the summary's stderr tail is not enough: the one run whose
+        # failure looks unlike the others is exactly the one you need to read
+        # in full, and afterwards it is gone.
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with log_file.open("wb") as handle:
+            proc = subprocess.run(
+                cmd, cwd=cwd, env=proc_env, stdout=handle, stderr=subprocess.STDOUT
+            )
+    else:
+        proc = subprocess.run(cmd, cwd=cwd, env=proc_env)
 
     result = parse_report(report_path)
     result.exit_code = proc.returncode
