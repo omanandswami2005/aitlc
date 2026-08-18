@@ -3,7 +3,7 @@
 What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-**Tracker: 31 of 44 closed, 13 open.** Every row below came
+**Tracker: 38 of 44 closed, 6 open.** Every row below came
 from a real debugging session that the tool made harder than it needed to be;
 none of them are speculative features.
 
@@ -13,42 +13,12 @@ Ordered by how much a real investigation pays for them.
 
 | # | Gap | Notes |
 |---|---|---|
-| G3 | `init` has no merge mode | Re-running it overwrites a hand-edited `aitlc.toml`. Needs `--merge`. |
-| G6 | no `--version` | `aitlc --version` still errors. One callback; trivial and still missing. |
 | G9 | no way to read page state or call a project function | Biggest remaining hole for interactive debugging. |
 | G10 | `parallel run` streams every child's transcript to stdout | Output is summarised but not separable per child. |
 | G15 | the skip-tag pre-filter is narrower than the project's rule |  |
-| G27 | `triage-run` truncates the call log to its least useful line | The `locator resolved to ...` line is the highest-value one and is still dropped. |
-| G31 | no way to use an AWS SSO profile | Static keys in `.env` are still the only path; an expired token has to be exported by hand. |
-| G36 | every `next`/`retry` pays full process startup | **Next up.** See *Persistent step console* below. |
-| G37 | per-step processes regenerate run-scoped data | Same root cause as G36; stateful tails can never pass until it is fixed. |
-| G38 | no wall-clock stamps, and no way to time an app condition | Durations exist; absolute timestamps do not. |
 | G39 | a local run silently differs from the CI run of the same feature | Setup takes a different branch and nothing logs the switch. |
 | G40 | parallel results are not separable; attribution rests on a re-run |  |
 | G42 | the debug cycle cannot survive an expensive scenario | Sessions are not resumable across a restart. |
-
-### Persistent step console (G36 + G37)
-
-The single biggest correctness *and* speed problem left, and one root cause for
-both. Every `debug next` / `debug retry` spawns a fresh interpreter that
-re-imports the step registry, re-runs scenario setup, and reconnects to the
-browser. That is slow, and worse, it is **wrong**: run-scoped data (generated
-names, ids, emails) is regenerated per process, so a step that waits for
-something an earlier step created polls forever for a name that never existed.
-It looks exactly like the application hanging.
-
-Planned shape, in the same style as `cdp launch`:
-
-1. `debug start` also launches a **detached, long-lived step console** holding
-   the imported registry, the behave context, and the CDP connection.
-2. `retry` / `next` talk to it over newline-delimited JSON on a local socket,
-   recorded in the session state file next to the browser's.
-3. `debug stop` shuts it down; an idle timeout means it cannot leak.
-4. **If the console is unreachable, fall back to today's per-step subprocess.**
-   No regression: it degrades to correct-but-slow rather than failing.
-
-Fixing the process boundary is what makes stateful tails runnable at all, so
-G37 closes with it rather than separately.
 
 ## Closed
 
@@ -85,6 +55,14 @@ G37 closes with it rather than separately.
 | G41 | no per-test history across runs | `s3 history` — matrix, signatures, verdict, break date, persisted to one file. |
 | G43 | no way to ask "did test X pass in the latest run" | `s3 find-test` / `s3 verify-test`. |
 | G44 | tests mocked the boundary the bugs lived on | `test_fake_fidelity.py`: real-launch integration, contract checks, property guards. |
+| G3 | `init` has no merge mode | `--merge` adds only newly detected keys, keeping every value already set. |
+| G6 | no `--version` | Read from package metadata, not a constant. |
+| G27 | `triage-run` truncates the call log | The resolved element, the intercepting overlay and the retry count now reach the table. |
+| G31 | no way to use an AWS SSO profile | `[s3].profile` / `AWS_PROFILE`, resolved fresh on every call. |
+| G36 | every `next`/`retry` pays full process startup | Persistent step console, with a fallback to a process. |
+| G37 | per-step processes regenerate run-scoped data | Closed with G36: one process, one set of that data. |
+| G38 | no wall-clock stamps or condition timer | `started_at`/`ended_at` per step, plus `cdp time-until`. |
+| — | artifacts scattered across `reports/` | `--workspace` puts one investigation in one directory, applied at core level. |
 
 ## Not planned
 

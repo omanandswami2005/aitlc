@@ -13,6 +13,7 @@ keep in sync. See [How it stays codebase-independent](#how-it-stays-codebase-ind
 ## Contents
 
 - [Setup](#setup)
+- [One directory per investigation](#one-directory-per-investigation) — `--workspace`
 - [How it stays codebase-independent](#how-it-stays-codebase-independent)
 - [Running tests](#running-tests) — `run`, `parallel`, `behave`
 - [Debugging live](#debugging-live) — `cdp`, `steps`
@@ -20,9 +21,49 @@ keep in sync. See [How it stays codebase-independent](#how-it-stays-codebase-ind
 - [Suite health](#suite-health) — `steps unused`, `history`, `doctor`
 - [Xray sync](#xray-sync) — `xray`
 - [Evidence](#evidence) — `trace`, `s3`, `report`
+- [What happened in CI](#what-happened-in-ci) — `s3 find-test`, `verify-test`, `history`
 - [Escape hatches](#escape-hatches) — `behave`, `pw`
 - [Everything else](#everything-else)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## One directory per investigation
+
+Every command produces something — traces, cached CI reports, session state,
+browser profiles, logs. Point a workspace at whatever you are working on and
+all of it lands in one place:
+
+```bash
+aitlc --workspace PROJ-29019 debug start PROJ-29019
+aitlc -w PROJ-29019 s3 verify-test PROJ-29019
+```
+
+```
+PROJ-29019/
+  .aitlc/artifacts/    cached CI reports, fetched once
+  .aitlc/debug/        session state
+  .aitlc/runs/         the command journal
+  .cdp/                browser profiles and logs
+  traces/              Playwright traces
+```
+
+Switch the name and the previous investigation stays intact beside it, so
+"what did we collect last time" is answered by looking rather than by
+remembering. Delete the directory and everything from that investigation goes
+with it.
+
+Three ways to set it, most specific first:
+
+| Where | Use it for |
+|---|---|
+| `--workspace` / `-w` | one command |
+| `AITLC_WORKSPACE` | a shell working on one thing for a while |
+| `[project].workspace` in `aitlc.toml` | a project that always wants it |
+
+Unset, everything stays under `reports/` exactly as before. The name is
+relative to the project root; an absolute path is refused rather than quietly
+turned into one inside the project.
 
 ---
 
@@ -250,6 +291,26 @@ Use `--new` when several browsers must run at once (parallel suites, or
 multiple agents). Separate *profiles* matter, not just ports: a shared profile
 directory corrupts under concurrent Chromes and leaks cookies between tests.
 
+### The persistent step console
+
+`debug start` also starts a long-lived step console, and `retry` / `next` use
+it instead of spawning a process each time.
+
+```bash
+aitlc debug console PROJ-1          # is one running?
+aitlc debug console PROJ-1 --stop   # shut it down
+```
+
+This is a correctness feature before it is a speed one. A process per step
+re-imports the step registry and re-runs scenario setup, but the real damage
+is that **run-scoped data is regenerated per process** — generated names, ids,
+emails. A step waiting for something an earlier step created then polls
+forever for a name that never existed, which looks exactly like the
+application hanging.
+
+If the console is not running, `retry` and `next` fall back to spawning a
+process, so a missing console is slow, never broken.
+
 ### `aitlc steps run <ID> --range A-B`
 
 Resume a scenario partway through, in an already-open browser. This replaces
@@ -397,6 +458,58 @@ Escalate in that order — a single frame explains most failures, and the
 interactive viewer costs far more to open and read.
 
 ---
+
+## What happened in CI
+
+Three questions, three commands, none of which need you to know which suite
+report a test lives in.
+
+```bash
+aitlc s3 find-test PROJ-1                 # which plan and run, no download
+aitlc s3 verify-test PROJ-1 PROJ-2        # pass/fail + the failing step
+aitlc s3 history PROJ-1 --days 14         # chronic or intermittent?
+```
+
+`verify-test` reads the per-test Behave JSON rather than the HTML report:
+orders of magnitude smaller, already structured, and it carries the scenario
+tags that make a nested test key findable at all.
+
+**A test key is usually not an execution key.** A plan runs one feature file
+per execution key, and the tests inside carry their own `@TEST_<KEY>` scenario
+tags. Searching object names for such a key finds nothing, which reads exactly
+like "it did not run" — so `find-test` reports `not_named_by_any_object` and
+points at `verify-test`, which reads the documents.
+
+`history` answers the question that decides what to do next:
+
+```
+test         08-11 08-12 08-14 08-15   rate   verdict
+PROJ-1       FAIL  FAIL  FAIL  FAIL    4/4    deterministic
+PROJ-2       FAIL  PASS  .     FAIL    2/3    intermittent
+```
+
+Deterministic means one signature every time — reproduce it, a single run will
+show it. Intermittent means the signatures vary — establish a base rate before
+bisecting anything. Failures are grouped by signature with volatile parts
+(timings, generated ids) masked, so one defect does not look like five. A run
+where *every* test failed is labelled an outage and excluded from the rates
+rather than inflating them. Everything is written to
+`<workspace>/.aitlc/test-history.json` so the next reader does not re-download
+it.
+
+Scoped by **day**, not by run: a suite executes many times a day, and a run
+count collapses the matrix into a single column.
+
+### Credentials
+
+```toml
+[s3]
+profile = "my-sso-profile"   # resolved fresh on every call
+```
+
+Static keys in a `.env` expire, and when they do `aws sso login` does *not*
+fix it — the stale values in the file take precedence over the refreshed
+profile. A named profile (or `AWS_PROFILE`) avoids that entirely.
 
 ## Escape hatches
 

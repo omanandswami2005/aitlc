@@ -20,6 +20,17 @@ The command is always `aitlc`. It is published under two names — `aitlc` and
 
 ## What it does
 
+**Keep one investigation in one directory.** Point a workspace at what you are
+working on and every artifact from every command lands there — traces, cached
+CI reports, session state, browser profiles, logs.
+
+```bash
+aitlc --workspace PROJ-29019 debug start PROJ-29019
+```
+
+Switch the name and the previous investigation stays beside it; delete the
+directory and it all goes together. Unset, everything stays under `reports/`.
+
 **Run and target tests.** Bare test IDs resolve recursively, so you never need
 a full path, and never need to tag other features to narrow a run. One Examples
 row of a Scenario Outline can be run on its own.
@@ -43,6 +54,25 @@ aitlc debug retry PROJ-1234              # edit -> re-run that step -> repeat
 aitlc debug next PROJ-1234               # forward, from the state you have
 aitlc debug certify PROJ-1234 --times 2  # fresh instance, real feature, twice
 ```
+
+`retry` and `next` run in a persistent step console rather than a new process
+each time. That is a correctness feature first: a process per step regenerates
+run-scoped data — generated names, ids, emails — so a step waiting on
+something an earlier step created polls forever for a name that never existed,
+which looks exactly like the application hanging. Without a console they fall
+back to spawning a process, so it is slow, never broken.
+
+**Find out what CI did, without guessing which report to open.**
+
+```bash
+aitlc s3 verify-test PROJ-1 PROJ-2   # pass/fail + the failing step and error
+aitlc s3 history PROJ-1 --days 14    # chronic, intermittent, or an outage day
+```
+
+A test key is usually a scenario tag inside a differently-named file, not an
+execution key, so a filename-only lookup reports "did not run" for a test that
+ran. `history` groups failures by signature: one signature every time means
+reproduce it, varying signatures mean establish a base rate before bisecting.
 
 `certify` is deliberately separate and never uses the debug browser: a
 CDP-attached browser reuses an existing context, so it is never proof. Two

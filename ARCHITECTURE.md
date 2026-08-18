@@ -111,6 +111,32 @@ aitlc learns which variable to read, never what is in it.
 identify as a commented placeholder. A wrong value written confidently fails
 later, somewhere unrelated, and costs far more than a blank.
 
+## 4a. Where output goes — `core/workspace.py`
+
+Every artifact path resolves through one module. Commands never build an
+output path themselves, which is what makes `--workspace` total rather than
+something each command has to remember to honour.
+
+```
+workspace.output_path(root_dir, ".aitlc", "runs")
+```
+
+Resolution, most specific first: `--workspace`, `AITLC_WORKSPACE`,
+`[project].workspace`, then `reports/`. The value is process-global state set
+once at CLI start — deliberately, because core helpers receive a `root_dir`
+and not a config object, and threading config through nineteen call sites to
+avoid one module-level value would be worse.
+
+The name must be relative to the project root. Absoluteness is checked on the
+raw string before any trimming: stripping a leading slash first turns
+`-w /etc` into `<project>/etc`, writing somewhere the caller never asked for
+rather than refusing.
+
+One exception, and it is an OS limit rather than a choice: the step console's
+Unix socket lives in the system temp directory, keyed by a digest of project
+root and test id. A socket path is capped near 104 bytes by the kernel, and a
+path under a deeply nested project exceeds it and fails at `bind()`.
+
 ## 5. Attaching without editing the target project
 
 A debugging tool that requires editing the suite it debugs cannot be adopted
