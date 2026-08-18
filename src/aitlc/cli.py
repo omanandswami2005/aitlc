@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import typer
 from aitlc.commands import (
     cdp_cmd,
@@ -38,6 +40,41 @@ app = typer.Typer(
     help="Structured, JSON/TOON-first CLI for Behave+Playwright debugging and Xray verification.",
     no_args_is_help=True,
 )
+
+
+def _version() -> str:
+    """The installed version, read from package metadata rather than a constant.
+
+    A hardcoded string is a second place to forget to bump, and it silently
+    disagrees with what is actually installed -- which is exactly the question
+    `--version` is asked to settle when a fix "did not take".
+    """
+    try:
+        from importlib.metadata import version
+
+        return version("aitlc")
+    except Exception:  # pragma: no cover - only when running from a bare tree
+        return "unknown"
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(json.dumps({"aitlc": _version()}))
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        "-V",
+        callback=_version_callback,
+        is_eager=True,
+        help="Print the installed version and exit.",
+    ),
+) -> None:
+    """Structured CLI for Behave + Playwright debugging."""
 
 # `run` and `doctor` are single direct commands (`aitlc run PROJ-123`, not
 # `aitlc run run PROJ-123`) — registered as plain commands, not sub-Typers.
