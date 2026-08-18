@@ -116,12 +116,20 @@ class TestHistory:
 
 
 def mark_infrastructure_runs(
-    outcomes_by_run: dict[str, list[RunOutcome]], *, min_tests: int = 2
+    outcomes_by_run: dict[str, list[RunOutcome]], *, min_tests: int = 4
 ) -> set[str]:
     """Runs where every test failed -- an outage, not N independent defects.
 
-    `min_tests` guards the degenerate case: one test failing in a window that
-    only ever looked at one test is not evidence of an outage.
+    `min_tests` is the guard against the degenerate case, and it has to be
+    higher than it looks. Asking about two or three tests that genuinely all
+    broke would otherwise label the run an outage, drop those failures from
+    every rate, and report a broken test as healthy -- turning a small query
+    into a wrong answer. Four is the point where "all of them, at once" starts
+    to say more about the environment than about the tests.
+
+    Being wrong in this direction is the safe one: a real outage that goes
+    unlabelled inflates a failure rate, which is visible. A real failure
+    labelled an outage disappears, which is not.
     """
     outages = set()
     for run, outcomes in outcomes_by_run.items():
@@ -187,18 +195,37 @@ def build_history(test_key: str, runs: list[RunOutcome]) -> TestHistory:
 def matrix(histories: list[TestHistory]) -> dict:
     """A test-by-date grid: the artifact that makes a pattern visible at a glance."""
     dates = sorted({r.date for h in histories for r in h.runs if r.date})
-    symbol = {"passed": "PASS", "failed": "FAIL", "not_found": "-"}
     rows = []
     for history in histories:
-        by_date = {r.date: r for r in history.runs}
+        # A suite runs many times a day, so a date holds several runs. Taking
+        # the last one hid failures behind a later pass -- the same
+        # last-one-wins mistake that once reported a failing test as passing.
+        # A real failure outranks a pass; an outage-only day is neither, and
+        # gets its own symbol so the grid cannot contradict the rate beside
+        # it.
+        by_date: dict[str, list[RunOutcome]] = {}
+        for run in history.runs:
+            if run.date:
+                by_date.setdefault(run.date, []).append(run)
+
+        def cell(date: str) -> str:
+            runs = by_date.get(date) or []
+            if not runs:
+                return "."
+            real = [r for r in runs if not r.infrastructure]
+            if any(r.outcome == "failed" for r in real):
+                return "FAIL"
+            if any(r.outcome == "passed" for r in real):
+                return "PASS"
+            if any(r.infrastructure for r in runs):
+                return "OUT"
+            return "-"
+
         rows.append(
             {
                 "test_key": history.test_key,
                 "verdict": history.verdict,
-                "cells": [
-                    symbol.get(by_date[d].outcome, "-") if d in by_date else "."
-                    for d in dates
-                ],
+                "cells": [cell(d) for d in dates],
                 "fail_rate": (
                     f"{history.runs_failed}/{history.runs_considered}"
                     if history.runs_considered

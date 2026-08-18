@@ -120,10 +120,19 @@ def test_next_advances_and_history_accumulates(monkeypatch, tmp_path):
             index=0,
         ),
     )
+    # This asserted the old behaviour, where the first `next` advanced past
+    # the parked step without running it. Moving forward through a scenario
+    # cannot mean skipping a step, so the first call now runs the step under
+    # the cursor and only the second one moves on.
+    runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
+    session = load(tmp_path, "PROJ-1")
+    assert session.index == 0
+    assert [a.status for a in session.attempts] == ["passed"]
+
     runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
     session = load(tmp_path, "PROJ-1")
     assert session.index == 1
-    assert [a.status for a in session.attempts] == ["passed"]
+    assert [a.status for a in session.attempts] == ["passed", "passed"]
 
 
 def test_commands_refuse_without_a_session(monkeypatch, tmp_path):
@@ -202,3 +211,54 @@ def test_a_lone_continuation_step_is_promoted_before_dispatch(monkeypatch, tmp_p
 
     assert result.exit_code == 0, result.output
     assert ran[-1] == ["When click the button"]
+
+
+def test_next_runs_the_parked_step_before_moving_past_it(monkeypatch, tmp_path):
+    """`start --at N` parks on N without running it.
+
+    Advancing first meant the very first `next` skipped N, and every later
+    step that depended on it failed -- which reads as the application being
+    broken rather than a step never having run.
+    """
+    ran: list = []
+    _wire(monkeypatch, tmp_path, ran)
+    _session_at(tmp_path, ["Given open the app", "When open the panel", "Then use it"], 1)
+
+    result = runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
+
+    assert result.exit_code == 0, result.output
+    assert ran[-1] == ["When open the panel"], "the parked step must actually run"
+    assert load(tmp_path, "PROJ-1").index == 1
+
+
+def test_next_advances_once_the_current_step_has_run(monkeypatch, tmp_path):
+    ran: list = []
+    _wire(monkeypatch, tmp_path, ran)
+    _session_at(tmp_path, ["Given open the app", "When open the panel", "Then use it"], 1)
+
+    runner.invoke(debug_cmd.app, ["next", "PROJ-1"])   # runs the parked step
+    runner.invoke(debug_cmd.app, ["next", "PROJ-1"])   # now moves on
+
+    assert ran[-1] == ["Then use it"]
+    assert load(tmp_path, "PROJ-1").index == 2
+
+
+def test_console_start_loads_env_before_spawning(monkeypatch, tmp_path):
+    """The console is a child that inherits this process's environment.
+
+    Without the env file every step module fails to import, the scenario
+    setup that mints run-scoped values raises, and the console dies before it
+    listens -- reported only as "did not begin listening in time".
+    """
+    _wire(monkeypatch, tmp_path, [])
+    loaded: list = []
+    monkeypatch.setattr(debug_cmd, "load_dotenv", lambda path, *_a, **_k: loaded.append(path))
+    monkeypatch.setattr(
+        debug_cmd, "_launch_console", lambda *_a, **_k: {"started": True}
+    )
+    _session_at(tmp_path, ["Given open the app"], 0)
+
+    result = runner.invoke(debug_cmd.app, ["console", "PROJ-1", "--start"])
+
+    assert result.exit_code == 0, result.output
+    assert loaded, "`debug console --start` spawned a console without loading .env"

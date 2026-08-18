@@ -21,6 +21,8 @@ Verbs:
 from __future__ import annotations
 
 import json
+import time
+import subprocess
 from pathlib import Path
 
 import typer
@@ -121,6 +123,69 @@ def _require(config, test_id: str) -> debug_session.DebugSession:
     return session
 
 
+def _launch_console(config, session) -> dict:
+    """Start the persistent step console for this session, detached.
+
+    Without this the console is unreachable code: `_run_steps` looks for a
+    socket, never finds one, and silently falls back to spawning a process per
+    step -- which is the slow *and* incorrect path the console exists to
+    replace. Nothing failed, which is exactly why it went unnoticed.
+
+    Detached and non-fatal: a session whose console will not start is still a
+    working session, just a slower one.
+    """
+    socket_path = step_console.console_socket(config.root_dir, session.test_id)
+    if step_console.console_is_alive(socket_path):
+        return {"started": False, "reason": "already running", "socket": str(socket_path)}
+
+    script = Path(step_console.__file__).resolve()
+    cmd = behave_runner.resolve_poetry() + [
+        "run",
+        "python3",
+        str(script),
+        str(session.feature),
+        "--serve",
+        str(socket_path),
+        "--step-dir",
+        config.step_dir,
+        "--cdp-url",
+        session.cdp_url,
+    ]
+    if config.scenario_setup:
+        cmd += ["--scenario-setup", config.scenario_setup]
+    else:
+        cmd.append("--allow-missing-setup")
+    if config.browser_actions:
+        cmd += ["--browser-actions", config.browser_actions]
+
+    log_path = workspace.ensure(config.root_dir, ".aitlc", "debug", "console.log")
+    try:
+        with log_path.open("ab") as handle:
+            subprocess.Popen(
+                cmd,
+                cwd=config.root_dir,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        return {"started": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    # Wait briefly for it to bind; a console that is not listening yet would
+    # send the first retry down the fallback path for no reason.
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if step_console.console_is_alive(socket_path):
+            return {"started": True, "socket": str(socket_path)}
+        time.sleep(0.5)
+    return {
+        "started": False,
+        "reason": "console did not begin listening in time",
+        "log": str(log_path),
+    }
+
+
 @app.command("start")
 def start(
     test_id: str = typer.Argument(..., help="Test ID or feature file path."),
@@ -133,6 +198,12 @@ def start(
         help="Examples row to bind, 0-based. Scenario Outlines only.",
     ),
     env_file: str = typer.Option(".env", "--env-file"),
+    window_size: str = typer.Option(
+        chrome_cdp.DESKTOP_WINDOW_SIZE,
+        "--window-size",
+        help="Browser window as WIDTH,HEIGHT. Desktop by default, to match a "
+        "real run; pass a phone size for a mobile suite.",
+    ),
 ) -> None:
     """Launch an isolated browser and drive the feature to a step."""
     config = AitlcConfig.find_and_load()
@@ -154,7 +225,9 @@ def start(
     # Always a fresh, isolated browser: a long-lived shared profile accumulates
     # sessions and eventually fails a run at the framework's own login, which
     # reads as a test bug rather than a dirty profile.
-    instance, _reused = chrome_cdp.launch(config.root_dir, port=None)
+    instance, _reused = chrome_cdp.launch(
+        config.root_dir, port=None, window_size=window_size
+    )
     session = debug_session.DebugSession(
         test_id=test_id,
         feature=str(feature),
@@ -165,6 +238,10 @@ def start(
     )
     ran = _run_steps(config, session, session.slice_through(session.index))
     debug_session.save(config.root_dir, session)
+    # Start the console only once the browser is at the parked step: it
+    # attaches to that same browser and holds one set of run-scoped data from
+    # here on, which is what makes retry/next both fast and correct.
+    console_state = _launch_console(config, session)
     typer.echo(
         json.dumps(
             {
@@ -172,6 +249,7 @@ def start(
                 "cdp_url": session.cdp_url,
                 "total_steps": len(steps),
                 "parked_at": session.index,
+                "console": console_state,
                 "current_step": (session.current or "").strip(),
                 "setup": ran["results"],
             },
@@ -208,7 +286,15 @@ def _run_current(config, session, advance: bool) -> None:
     if session.finished:
         typer.echo(json.dumps({"done": True, "message": "no steps left"}))
         return
-    if advance:
+    # `start --at N` parks *on* step N without running it, so the first `next`
+    # used to advance to N+1 and silently skip N entirely. Every later step
+    # that depended on it then failed, and the session looked like the app was
+    # broken -- confirmed live: parking at "Open Admin Panel" and stepping
+    # forward left the panel closed, so three admin steps failed in a row.
+    #
+    # "next" means move forward through the scenario. If the step under the
+    # cursor has never been attempted, running it *is* moving forward.
+    if advance and session.attempts_for_current():
         session.advance()
         if session.finished:
             debug_session.save(config.root_dir, session)
@@ -360,6 +446,12 @@ def stop(test_id: str = typer.Argument(...)) -> None:
 def console(
     test_id: str = typer.Argument(...),
     stop_it: bool = typer.Option(False, "--stop", help="Shut the console down."),
+    start_it: bool = typer.Option(
+        False,
+        "--start",
+        help="Start one for an existing session, without re-running its setup.",
+    ),
+    env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Report (or stop) the session's persistent step console.
 
@@ -370,6 +462,21 @@ def console(
     """
     config = AitlcConfig.find_and_load()
     socket_path = step_console.console_socket(config.root_dir, test_id)
+    if start_it:
+        # Without this, a console that died left no way back except `start`,
+        # which re-runs every setup step -- the exact cost the console exists
+        # to avoid paying twice.
+        #
+        # The env file has to be loaded here for the same reason retry/next
+        # need it: the console is a child process that inherits this
+        # environment, and without it every step module fails to import, the
+        # scenario setup that mints the run-scoped values raises, and the
+        # console dies before it ever listens. `start` loaded it and this
+        # path did not, which is exactly the shape of the earlier bug.
+        load_dotenv(config.root_dir / env_file)
+        session = _require(config, test_id)
+        typer.echo(json.dumps(_launch_console(config, session), indent=2))
+        return
     if stop_it:
         typer.echo(
             json.dumps({"stopped": step_console.stop_console(socket_path)})

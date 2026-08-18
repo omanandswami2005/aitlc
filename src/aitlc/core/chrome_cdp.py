@@ -47,6 +47,12 @@ DEFAULT_PORT = 9333
 # Matches the mobile window the debugging cycle for this project standardized
 # on; see module docstring point 3 for why it is set at launch time.
 DEFAULT_WINDOW_SIZE = "375,812"
+# A real desktop run maximises the window; the debug browser must match it or
+# the app renders its mobile layout and every desktop-nav step fails to find
+# an element that is real but collapsed behind a hamburger. Confirmed live: a
+# session parked correctly, signed in, on the right page, still could not
+# click a nav item because the window was 500px wide.
+DESKTOP_WINDOW_SIZE = "1920,1080"
 
 _MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 _CHROME_CANDIDATES = (

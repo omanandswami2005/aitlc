@@ -78,13 +78,24 @@ class TestOutageDays:
 
     def test_a_run_where_every_test_failed_is_flagged(self):
         by_run = {
-            "r1": [_run("2026-08-13", "failed"), _run("2026-08-13", "failed")],
-            "r2": [_run("2026-08-14", "failed"), _run("2026-08-14", "passed")],
+            "r1": [_run("2026-08-13", "failed") for _ in range(5)],
+            "r2": [_run("2026-08-14", "failed") for _ in range(4)]
+            + [_run("2026-08-14", "passed")],
         }
         assert th.mark_infrastructure_runs(by_run) == {"r1"}
 
     def test_a_single_test_failing_alone_is_not_called_an_outage(self):
         by_run = {"r1": [_run("2026-08-13", "failed")]}
+        assert th.mark_infrastructure_runs(by_run) == set()
+
+    def test_a_small_query_is_not_mistaken_for_an_outage(self):
+        """Asking about three tests that all broke must not erase them.
+
+        Labelling that an outage drops every failure from the rates and
+        reports a broken test as healthy -- a small query turning into a
+        wrong answer.
+        """
+        by_run = {"r1": [_run("2026-08-13", "failed") for _ in range(3)]}
         assert th.mark_infrastructure_runs(by_run) == set()
 
     def test_an_outage_day_does_not_make_a_healthy_test_deterministic(self):
@@ -143,3 +154,46 @@ class TestMatrixAndStore:
         th.merge_into_store(path, [th.build_history("PROJ-2", [_run("2026-08-11", "passed")])])
         stored = json.loads(path.read_text())
         assert set(stored) == {"PROJ-1", "PROJ-2"}
+
+
+class TestMatrixAggregatesADay:
+    """A suite runs many times a day; a date cell must not be last-one-wins."""
+
+    def test_a_failure_anywhere_in_the_day_shows_as_failed(self):
+        history = th.build_history(
+            "PROJ-1",
+            [
+                _run("2026-08-18", "failed", step="s", error="E: x"),
+                _run("2026-08-18", "passed"),
+            ],
+        )
+        assert th.matrix([history])["rows"][0]["cells"] == ["FAIL"]
+
+    def test_a_day_of_passes_shows_as_passed(self):
+        history = th.build_history(
+            "PROJ-1", [_run("2026-08-18", "passed"), _run("2026-08-18", "passed")]
+        )
+        assert th.matrix([history])["rows"][0]["cells"] == ["PASS"]
+
+    def test_an_outage_only_day_is_neither_pass_nor_fail(self):
+        """Otherwise the grid says FAIL beside a rate that excludes it."""
+        history = th.build_history(
+            "PROJ-1",
+            [_run("2026-08-18", "failed", step="s", error="E: x", infra=True)],
+        )
+        row = th.matrix([history])["rows"][0]
+        assert row["cells"] == ["OUT"]
+        assert row["fail_rate"] == "0/1"
+
+    def test_the_grid_and_the_rate_agree(self):
+        history = th.build_history(
+            "PROJ-1",
+            [
+                _run("2026-08-17", "failed", step="s", error="E: x", infra=True),
+                _run("2026-08-18", "passed"),
+            ],
+        )
+        row = th.matrix([history])["rows"][0]
+        assert row["cells"] == ["OUT", "PASS"]
+        assert row["fail_rate"] == "0/2"
+        assert row["verdict"] == th.VERDICT_HEALTHY
