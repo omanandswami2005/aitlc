@@ -97,13 +97,26 @@ def start(
     at: int = typer.Option(
         0, "--at", help="Step index to park on (0-based). Steps before it are run."
     ),
+    example: int = typer.Option(
+        0,
+        "--example",
+        help="Examples row to bind, 0-based. Scenario Outlines only.",
+    ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Launch an isolated browser and drive the feature to a step."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     feature = config.resolve_feature_path(test_id)
-    steps = debug_session.feature_steps(Path(feature).read_text())
+    try:
+        steps = debug_session.feature_steps(
+            Path(feature).read_text(), example=example
+        )
+    except debug_session.ExampleBindingError as exc:
+        typer.echo(
+            json.dumps({"error": str(exc), "feature": str(feature)}), err=True
+        )
+        raise typer.Exit(code=2)
     if not steps:
         typer.echo(json.dumps({"error": f"no steps found in {feature}"}), err=True)
         raise typer.Exit(code=2)
@@ -111,7 +124,7 @@ def start(
     # Always a fresh, isolated browser: a long-lived shared profile accumulates
     # sessions and eventually fails a run at the framework's own login, which
     # reads as a test bug rather than a dirty profile.
-    instance = chrome_cdp.launch(config.root_dir, port=None)
+    instance, _reused = chrome_cdp.launch(config.root_dir, port=None)
     session = debug_session.DebugSession(
         test_id=test_id,
         feature=str(feature),
@@ -172,8 +185,20 @@ def _run_current(config, session, advance: bool) -> None:
             typer.echo(json.dumps({"done": True, "message": "reached the end"}))
             return
     step = session.current or ""
-    out = _run_steps(config, session, [step])
-    status_ = out["results"][0]["status"] if out["results"] else "failed"
+    # A lone And/But cannot open a parsed block, exactly as in slice_through.
+    # Without this the console silently returns nothing and the step reads as
+    # failed -- roughly half of real feature lines start with a continuation.
+    runnable = debug_session.promote_leading_continuation([step])
+    out = _run_steps(config, session, runnable)
+    results = out.get("results") or []
+
+    # Three outcomes, not two. An empty result list means the console never ran
+    # the step; reporting that as "failed" sends the user to fix working code.
+    if results:
+        status_ = results[0]["status"]
+    else:
+        status_ = "not_run"
+
     session.record(status_)
     debug_session.save(config.root_dir, session)
     payload = {
@@ -181,25 +206,45 @@ def _run_current(config, session, advance: bool) -> None:
         "index": session.index,
         "status": status_,
         "attempts_here": len(session.attempts_for_current()),
-        **({"error": out["results"][0]["error"]} if out["results"] else {}),
     }
+    if results:
+        payload["error"] = results[0]["error"]
+    else:
+        payload["message"] = (
+            "the step console produced no result -- the step did not run. "
+            "This is not a step failure."
+        )
     if out.get("stderr_tail"):
         payload["stderr_tail"] = out["stderr_tail"]
+    if out.get("unhandled_events"):
+        payload["unhandled_events"] = out["unhandled_events"]
     typer.echo(json.dumps(payload, indent=2))
     raise typer.Exit(code=0 if status_ == "passed" else 1)
 
 
 @app.command("retry")
-def retry(test_id: str = typer.Argument(...)) -> None:
+def retry(
+    test_id: str = typer.Argument(...),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
     """Re-run the current step after an edit, without restarting the scenario."""
     config = AitlcConfig.find_and_load()
+    # Without this the step modules fail to import for want of config, every
+    # step resolves as "undefined", and the run reports a failure that never
+    # happened. `start` loaded it; `retry`/`next` did not, so a session worked
+    # until the first re-run and then reported nonsense.
+    load_dotenv(config.root_dir / env_file)
     _run_current(config, _require(config, test_id), advance=False)
 
 
 @app.command("next")
-def next_step(test_id: str = typer.Argument(...)) -> None:
+def next_step(
+    test_id: str = typer.Argument(...),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
     """Advance one step and run it, keeping the state you already have."""
     config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
     _run_current(config, _require(config, test_id), advance=True)
 
 

@@ -14,6 +14,7 @@ arithmetic is where the mistakes live, so it is unit-testable on its own.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,6 +25,10 @@ from pathlib import Path
 # not promote them fails on the majority of positions a user will pick.
 _CONTINUATION = ("and ", "but ", "* ")
 _STEP_KEYWORDS = ("given ", "when ", "then ") + _CONTINUATION
+
+
+class ExampleBindingError(ValueError):
+    """Raised when a Scenario Outline's placeholders cannot be bound."""
 
 
 def is_step_line(line: str) -> bool:
@@ -52,8 +57,70 @@ def promote_leading_continuation(steps: list[str]) -> list[str]:
     return steps
 
 
-def feature_steps(feature_text: str) -> list[str]:
-    """The step lines of a feature, in order, excluding the Examples table."""
+def _table_row(line: str) -> list[str]:
+    """Split a Gherkin table row into trimmed cells."""
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def examples_rows(feature_text: str) -> list[dict[str, str]]:
+    """Every Examples data row, as {placeholder_name: value}.
+
+    Only the first Examples block is read. Behave supports several, but a debug
+    session parks on one concrete position, and picking a row across blocks
+    would make `--example N` mean something different from what the feature
+    reads like.
+    """
+    lines = feature_text.splitlines()
+    examples_at = next(
+        (i for i, line in enumerate(lines) if line.strip().startswith("Examples")),
+        None,
+    )
+    if examples_at is None:
+        return []
+    table = [
+        line for line in lines[examples_at + 1 :] if line.strip().startswith("|")
+    ]
+    if len(table) < 2:
+        return []
+    header = _table_row(table[0])
+    rows: list[dict[str, str]] = []
+    for raw in table[1:]:
+        cells = _table_row(raw)
+        # A short row would silently bind the wrong column; skip it rather than
+        # zip-truncate into a plausible-looking but wrong substitution.
+        if len(cells) != len(header):
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
+
+
+def bind_example(step: str, row: dict[str, str]) -> str:
+    """Substitute <placeholders> in one step from one Examples row."""
+    for name, value in row.items():
+        step = step.replace(f"<{name}>", value)
+    return step
+
+
+def unbound_placeholders(step: str) -> list[str]:
+    """Placeholder names still present in a step after binding."""
+    return re.findall(r"<([^<>]+)>", step)
+
+
+def feature_steps(
+    feature_text: str, example: int | None = 0
+) -> list[str]:
+    """The step lines of a feature, in order, with an Examples row bound.
+
+    `example` is the 0-based index of the Examples data row to bind. Pass None
+    to keep the raw placeholder text.
+
+    Binding is not optional polish: Behave runs a Scenario Outline once per
+    example row with the placeholders substituted, so a debug session that
+    skipped this would execute text Behave never executes -- typing the literal
+    "<audience_name>" into an input, and reporting it as the step having run.
+    Every conclusion drawn from such a session is unsound, so an unbindable
+    feature is an error rather than a fallback to raw text.
+    """
     lines = feature_text.splitlines()
     examples_at = next(
         (i for i, line in enumerate(lines) if line.strip().startswith("Examples")),
@@ -61,7 +128,37 @@ def feature_steps(feature_text: str) -> list[str]:
     )
     if examples_at is not None:
         lines = lines[:examples_at]
-    return [line for line in lines if is_step_line(line)]
+    steps = [line for line in lines if is_step_line(line)]
+    if example is None:
+        return steps
+
+    rows = examples_rows(feature_text)
+    if not rows:
+        # A plain Scenario has no Examples and no placeholders -- nothing to do.
+        # A Scenario Outline whose table we could not read is a real problem.
+        unbound = sorted({p for s in steps for p in unbound_placeholders(s)})
+        if unbound:
+            raise ExampleBindingError(
+                "feature uses placeholders but no Examples row could be read: "
+                + ", ".join(f"<{name}>" for name in unbound)
+            )
+        return steps
+
+    if not 0 <= example < len(rows):
+        raise ExampleBindingError(
+            f"example row {example} out of range: {len(rows)} row(s) available"
+        )
+
+    row = rows[example]
+    bound = [bind_example(step, row) for step in steps]
+    leftover = sorted({p for s in bound for p in unbound_placeholders(s)})
+    if leftover:
+        raise ExampleBindingError(
+            "no Examples column for: "
+            + ", ".join(f"<{name}>" for name in leftover)
+            + f" (row {example} has: {', '.join(sorted(row))})"
+        )
+    return bound
 
 
 @dataclass

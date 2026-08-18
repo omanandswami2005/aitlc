@@ -7,8 +7,12 @@ no record of whether a step had passed once or three times.
 
 from __future__ import annotations
 
+import pytest
+
 from aitlc.core.debug_session import (
     DebugSession,
+    ExampleBindingError,
+    examples_rows,
     clear,
     feature_steps,
     is_step_line,
@@ -119,3 +123,78 @@ def test_session_round_trips_through_disk(tmp_path):
     assert clear(tmp_path, "PROJ-1") is True
     assert load(tmp_path, "PROJ-1") is None
     assert clear(tmp_path, "PROJ-1") is False
+
+
+OUTLINE = """Feature: outline
+
+\t@TEST_PROJ-2 @Automation
+\tScenario Outline: creates a thing
+\tGiven open the app
+\tWhen select category: "<category>" and filter: "<Filter>"
+\tAnd go to ID: "audienceName" and type: "<audience_name>"
+\tThen validate "<audience_name>" exists
+
+\tExamples:
+\t| audience_name | category | Filter |
+\t| random_name | Buyer Intent | Topics and Score Range |
+\t| second_name | Firmographics | Employee Size |
+"""
+
+
+def test_examples_row_is_bound_by_default():
+    """A Scenario Outline must run the values Behave would run, not the text.
+
+    This is the regression for the bug where a live session typed the literal
+    "<category>" into a search box and reported the step as having run.
+    """
+    steps = [s.strip() for s in feature_steps(OUTLINE)]
+    assert steps == [
+        "Given open the app",
+        'When select category: "Buyer Intent" and filter: "Topics and Score Range"',
+        'And go to ID: "audienceName" and type: "random_name"',
+        'Then validate "random_name" exists',
+    ]
+
+
+def test_example_index_selects_the_row():
+    steps = [s.strip() for s in feature_steps(OUTLINE, example=1)]
+    assert 'type: "second_name"' in steps[2]
+    assert '"Firmographics"' in steps[1]
+
+
+def test_example_none_keeps_raw_placeholders():
+    steps = [s.strip() for s in feature_steps(OUTLINE, example=None)]
+    assert "<category>" in steps[1]
+
+
+def test_out_of_range_example_is_an_error_not_a_silent_first_row():
+    with pytest.raises(ExampleBindingError) as exc:
+        feature_steps(OUTLINE, example=7)
+    assert "2 row(s)" in str(exc.value)
+
+
+def test_placeholder_with_no_column_is_an_error():
+    """Better to refuse than to run a step still containing <...>."""
+    broken = OUTLINE.replace("| audience_name | category | Filter |", "| category | Filter |").replace(
+        "| random_name | Buyer Intent | Topics and Score Range |", "| Buyer Intent | Topics and Score Range |"
+    ).replace(
+        "| second_name | Firmographics | Employee Size |", "| Firmographics | Employee Size |"
+    )
+    with pytest.raises(ExampleBindingError) as exc:
+        feature_steps(broken)
+    assert "<audience_name>" in str(exc.value)
+
+
+def test_plain_scenario_without_examples_still_works():
+    plain = "Feature: f\n\tScenario: s\n\tGiven open the app\n"
+    assert [s.strip() for s in feature_steps(plain)] == ["Given open the app"]
+
+
+def test_short_example_row_is_skipped_not_mis_bound():
+    """A ragged row must not zip-truncate into a wrong-but-plausible binding."""
+    ragged = OUTLINE.replace(
+        "| second_name | Firmographics | Employee Size |", "| second_name | Firmographics |"
+    )
+    rows = examples_rows(ragged)
+    assert len(rows) == 1
+    assert rows[0]["audience_name"] == "random_name"
