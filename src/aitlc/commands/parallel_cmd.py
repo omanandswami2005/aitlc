@@ -170,6 +170,11 @@ def run(
             "artifact rather than a defect."
         ),
     ),
+    extra_skip_tag: list[str] = typer.Option(
+        [],
+        "--extra-skip-tag",
+        help="Another tag that means 'do not run this'. Repeatable.",
+    ),
     no_skip_tag: bool = typer.Option(
         False,
         "--no-skip-tag",
@@ -242,7 +247,10 @@ def run(
             raise typer.Exit(code=2)
         discovered = discover_features(root, recursive=recursive)
         annotated = select_features(
-            discovered, skip_tag=None if no_skip_tag else skip_tag
+            discovered,
+            skip_tag=None if no_skip_tag else skip_tag,
+            environment=getattr(config, "environment", None),
+            extra_skip_tags=list(extra_skip_tag),
         )
         selections = [(s.path, None, s.skipped_by) for s in annotated]
 

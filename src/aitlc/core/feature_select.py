@@ -116,8 +116,58 @@ def discover_features(feature_root: Path, *, recursive: bool = True) -> list[Pat
     return sorted(feature_root.glob(pattern))
 
 
+def scenario_tags(path: Path) -> frozenset[str]:
+    """Tag names appearing below the ``Feature:`` line.
+
+    Kept separate from ``feature_tags`` because the distinction is load-
+    bearing for hooks -- but a *skip* tag means "do not run this" wherever it
+    is written, and a suite's own skip check applies the base tag at scenario
+    level too. Reading only feature-level tags meant every such file cost a
+    spawned behave process to discover a skip that was visible in the text.
+    """
+    tags: set[str] = set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+
+    seen_feature = False
+    for raw_line in text.splitlines():
+        if _FEATURE_LINE_RE.match(raw_line):
+            seen_feature = True
+            continue
+        if seen_feature and _TAG_LINE_RE.match(raw_line):
+            for token in raw_line.split():
+                if token.startswith("@"):
+                    tags.add(token[1:])
+    return frozenset(tags)
+
+
+def skip_tag_variants(skip_tag: str, environment: str | None = None) -> list[str]:
+    """The base skip tag plus the environment-specific forms of it.
+
+    A suite's skip check honours `<tag>_prod` / `_stage` / `_dev` as well as
+    the bare tag. Matching only the bare one let an environment-tagged file
+    launch a process that immediately skipped itself.
+
+    With no environment named, every known variant is treated as a skip: the
+    pre-filter's job is to avoid paying for a process that will skip anyway,
+    and being wrong in that direction only costs a file being listed as
+    skipped when it would have skipped itself.
+    """
+    known = ("prod", "stage", "dev")
+    if environment:
+        suffix = environment.strip().lower()
+        return [skip_tag, f"{skip_tag}_{suffix}"]
+    return [skip_tag, *(f"{skip_tag}_{name}" for name in known)]
+
+
 def select_features(
-    paths: list[Path], *, skip_tag: str | None = DEFAULT_SKIP_TAG
+    paths: list[Path],
+    *,
+    skip_tag: str | None = DEFAULT_SKIP_TAG,
+    environment: str | None = None,
+    extra_skip_tags: list[str] | None = None,
 ) -> list[FeatureSelection]:
     """Annotate each path with its feature-level tags and skip decision.
 
@@ -126,9 +176,17 @@ def select_features(
     exact ambiguity this replaces, where a mis-tagged file looked identical
     to a file that simply wasn't picked up.
     """
+    wanted: list[str] = []
+    if skip_tag:
+        wanted.extend(skip_tag_variants(skip_tag, environment))
+    wanted.extend(extra_skip_tags or [])
+
     selections: list[FeatureSelection] = []
     for path in paths:
         tags = feature_tags(path)
-        skipped_by = skip_tag if (skip_tag and skip_tag in tags) else None
+        # A skip applies wherever it is written; hooks care about placement,
+        # a skip decision does not.
+        all_tags = tags | scenario_tags(path)
+        skipped_by = next((tag for tag in wanted if tag in all_tags), None)
         selections.append(FeatureSelection(path=path, tags=tags, skipped_by=skipped_by))
     return selections
