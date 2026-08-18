@@ -766,7 +766,136 @@ def _setup_with_behave_hooks(feature_file, cdp_url, step_dir):
     }
 
 
-def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
+# Modules that must never be reloaded: they hold the live browser handle and
+# the resolved configuration. Re-importing them hands the session a fresh
+# object while the browser it was driving stays behind, which detaches the
+# console from the very thing it exists to hold.
+_NEVER_RELOAD = ("helper.", "config.configs", "features.behave_env", "features.environment")
+
+
+def _reloadable(module, project_root):
+    """A project module safe to re-import."""
+    name = getattr(module, "__name__", "") or ""
+    path = getattr(module, "__file__", None)
+    if not path or not name:
+        return False
+    if any(name == skip or name.startswith(skip) for skip in _NEVER_RELOAD):
+        return False
+    try:
+        return str(Path(path).resolve()).startswith(str(Path(project_root).resolve()))
+    except OSError:
+        return False
+
+
+def _module_mtimes(project_root):
+    """Current mtime of every reloadable project module now imported."""
+    import sys as _sys
+
+    stamps = {}
+    for name, module in list(_sys.modules.items()):
+        if not _reloadable(module, project_root):
+            continue
+        try:
+            stamps[name] = os.path.getmtime(module.__file__)
+        except OSError:
+            continue
+    return stamps
+
+
+def _reload_changed(project_root, step_dir, tracked):
+    """Re-import project modules whose files changed, in dependency order.
+
+    The order is not cosmetic. Step definitions bind page objects with
+    `from ... import` at import time, so reloading a page module alone updates
+    that module and leaves the step module holding the object it imported
+    before. Page objects and locators are reloaded first, then the step
+    modules, so the bindings are rebuilt against the new code.
+
+    Without this the console runs whatever it imported at startup: an edit has
+    no effect, `retry` re-runs the old code, and it reports a pass or a failure
+    for a version of the file that no longer exists on disk. That is worse
+    than being slow, which is why it happens automatically rather than on
+    request.
+    """
+    import importlib
+    import sys as _sys
+
+    current = _module_mtimes(project_root)
+    changed = [
+        name for name, stamp in current.items()
+        if name in tracked and stamp != tracked[name]
+    ]
+    # A module imported since the last check is new, not changed -- record it
+    # so a later edit to it is noticed.
+    tracked.update(current)
+    if not changed:
+        return []
+
+    step_prefix = str(Path(step_dir)).replace("/", ".").replace("\\", ".")
+    supporting = sorted(n for n in changed if not n.startswith(step_prefix))
+    step_modules = sorted(n for n in changed if n.startswith(step_prefix))
+
+    # A page object changing is not enough on its own. Step definitions bind
+    # those objects with `from ... import` at import time, so a step module
+    # that did not change still holds the object it imported before. Every
+    # step module is therefore re-executed whenever anything beneath it moved
+    # -- caught by a test that edited only a page object and watched the step
+    # keep returning the old value.
+    if supporting:
+        step_modules = sorted(
+            {
+                name
+                for name in _sys.modules
+                if name.startswith(step_prefix) and _sys.modules[name] is not None
+            }
+            | set(step_modules)
+        )
+
+    reloaded = []
+    for name in supporting + step_modules:
+        module = _sys.modules.get(name)
+        if module is None:
+            continue
+        try:
+            importlib.reload(module)
+            reloaded.append(name)
+        except Exception as exc:
+            print(
+                json.dumps({"event": "reload_failed", "module": name,
+                            "error": f"{type(exc).__name__}: {exc}"}),
+                flush=True,
+            )
+
+    # Rebuild the registry bindings: re-executing a step module re-runs its
+    # @given/@when/@then decorators against the freshly imported page objects.
+    if step_modules:
+        try:
+            from behave.step_registry import registry
+
+            for attr in ("steps", "_steps"):
+                table = getattr(registry, attr, None)
+                if isinstance(table, dict):
+                    for keyword in table:
+                        table[keyword] = [
+                            m for m in table[keyword]
+                            if getattr(m.func, "__module__", "") not in step_modules
+                        ]
+            for name in step_modules:
+                importlib.reload(_sys.modules[name])
+        except Exception as exc:
+            print(
+                json.dumps({"event": "reload_failed", "module": "step registry",
+                            "error": f"{type(exc).__name__}: {exc}"}),
+                flush=True,
+            )
+
+    tracked.update(_module_mtimes(project_root))
+    return reloaded
+
+
+def _serve_forever(
+    socket_path, *, context, run_steps, idle_timeout, project_root=None, step_dir=""
+) -> None:
     """Answer step batches over a socket, keeping one live context.
 
     This is what makes the fast loop both fast and *correct*. Spawning a
@@ -787,6 +916,10 @@ def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
+
+    # What the process imported at startup. Anything edited after this point is
+    # re-imported before the next step runs.
+    tracked = _module_mtimes(project_root) if project_root else {}
 
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(str(path))
@@ -825,11 +958,29 @@ def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
                 if request.get("cmd") == "ping":
                     conn.sendall((json.dumps({"alive": True}) + "\n").encode())
                     continue
+                if request.get("cmd") == "reload":
+                    forced = (
+                        _reload_changed(project_root, step_dir, tracked)
+                        if project_root else []
+                    )
+                    conn.sendall(
+                        (json.dumps({"reloaded": forced}) + "\n").encode()
+                    )
+                    continue
 
                 steps = request.get("steps") or []
+                reloaded = []
+                if project_root:
+                    # Before every batch, so an edit is picked up without the
+                    # caller having to remember. `retry` means "run this again
+                    # with my change", and it cannot mean that against code
+                    # imported minutes ago.
+                    reloaded = _reload_changed(project_root, step_dir, tracked)
                 try:
                     results = run_steps(context, "\n".join(steps))
                     reply = {"results": results}
+                    if reloaded:
+                        reply["reloaded"] = reloaded
                 except Exception as exc:  # a bad batch must not kill the server
                     reply = {
                         "results": [],
@@ -1363,6 +1514,8 @@ def _script_main() -> None:
             context=context,
             run_steps=run_steps,
             idle_timeout=args.idle_timeout,
+            project_root=os.getcwd(),
+            step_dir=args.step_dir,
         )
         sys.exit(0)
 

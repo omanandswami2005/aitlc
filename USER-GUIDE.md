@@ -193,6 +193,39 @@ re-running setup:
 aitlc debug console PROJ-1234 --start
 ```
 
+### What happens when you edit something
+
+Both kinds of edit are picked up automatically, before the next step runs.
+
+**Python — a step definition, a page object, a locator.** The console
+re-imports what changed. Page objects and locators reload first, then the step
+modules are re-executed: step definitions bind page objects with `from ...
+import` at import time, so reloading a page alone updates the module and leaves
+the step holding the object it imported before. Anything holding live state —
+the driver wrapper, resolved config, the behave hooks — is deliberately never
+reloaded, because replacing those detaches the console from the browser it is
+driving.
+
+```
+no edit                → 1.4 s
+first call after edit  → 5.7 s   (modules rebound once)
+next call              → 1.5 s   (back to baseline)
+```
+
+You pay the rebind once, not per step.
+
+**Gherkin — the feature file itself.** The session re-reads it and the cursor
+follows the step it was on **by text, not by index**: inserting a step above
+the cursor shifts every index below it, so keeping the number would silently
+move you onto a different step. If the step you were on is gone, the index is
+clamped and that is reported rather than guessed at. The same Examples row is
+bound again, and an edit that cannot be bound is refused rather than
+half-applied.
+
+```json
+"feature": {"steps_before": 57, "steps_after": 58, "cursor": "followed", "index": 13}
+```
+
 ### Certify is not the debug browser
 
 `certify` launches a fresh instance and runs the real feature, twice by

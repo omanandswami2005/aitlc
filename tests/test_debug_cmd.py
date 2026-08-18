@@ -102,7 +102,7 @@ def test_retry_reruns_only_the_current_step(monkeypatch, tmp_path):
     )
     result = runner.invoke(debug_cmd.app, ["retry", "PROJ-1"])
     assert result.exit_code == 0, result.output
-    assert ran[-1] == ["When click the button"]
+    assert [s.strip() for s in ran[-1]] == ["When click the button"]
     assert load(tmp_path, "PROJ-1").index == 1  # position unchanged
 
 
@@ -143,6 +143,13 @@ def test_commands_refuse_without_a_session(monkeypatch, tmp_path):
 
 
 def _session_at(tmp_path, steps, index):
+    # The feature file is authoritative: a session now re-reads it before
+    # running, so a fixture whose steps disagree with the file on disk is
+    # testing a state that cannot exist.
+    (tmp_path / "f.feature").write_text(
+        "Feature: f\n\n\t@TEST_PROJ-1\n\tScenario: s\n"
+        + "".join(f"\t{line}\n" for line in steps)
+    )
     save(
         tmp_path,
         DebugSession(
@@ -210,7 +217,7 @@ def test_a_lone_continuation_step_is_promoted_before_dispatch(monkeypatch, tmp_p
     result = runner.invoke(debug_cmd.app, ["retry", "PROJ-1"])
 
     assert result.exit_code == 0, result.output
-    assert ran[-1] == ["When click the button"]
+    assert [s.strip() for s in ran[-1]] == ["When click the button"]
 
 
 def test_next_runs_the_parked_step_before_moving_past_it(monkeypatch, tmp_path):
@@ -227,7 +234,9 @@ def test_next_runs_the_parked_step_before_moving_past_it(monkeypatch, tmp_path):
     result = runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
 
     assert result.exit_code == 0, result.output
-    assert ran[-1] == ["When open the panel"], "the parked step must actually run"
+    assert [s.strip() for s in ran[-1]] == ["When open the panel"], (
+        "the parked step must actually run"
+    )
     assert load(tmp_path, "PROJ-1").index == 1
 
 
@@ -239,7 +248,7 @@ def test_next_advances_once_the_current_step_has_run(monkeypatch, tmp_path):
     runner.invoke(debug_cmd.app, ["next", "PROJ-1"])   # runs the parked step
     runner.invoke(debug_cmd.app, ["next", "PROJ-1"])   # now moves on
 
-    assert ran[-1] == ["Then use it"]
+    assert [s.strip() for s in ran[-1]] == ["Then use it"]
     assert load(tmp_path, "PROJ-1").index == 2
 
 

@@ -182,6 +182,9 @@ class DebugSession:
     port: int
     index: int = 0
     steps: list[str] = field(default_factory=list)
+    # Which Examples row was bound, so the file can be re-read later and bound
+    # the same way. Without it a refresh would silently switch rows.
+    example: int = 0
     attempts: list[Attempt] = field(default_factory=list)
 
     @property
@@ -249,3 +252,47 @@ def clear(root_dir: Path, test_id: str) -> bool:
         path.unlink()
         return True
     return False
+
+
+def resync(session, feature_text: str) -> dict:
+    """Re-read a feature into a live session, keeping the cursor meaningful.
+
+    Editing the Gherkin mid-session is normal -- inserting a wait, correcting
+    a step's wording -- and the session held the list parsed when it started.
+    `retry` then re-ran text that is no longer in the file and reported a
+    result for a step that no longer exists, which is the same class of lie as
+    running stale Python.
+
+    The cursor follows the step it was on **by text**, not by index: inserting
+    a step above the cursor shifts every index below it, so keeping the number
+    would silently move the session onto a different step. When the step it
+    was on is gone, the index is clamped and that is reported rather than
+    guessed at.
+    """
+    try:
+        refreshed = feature_steps(feature_text, example=session.example)
+    except ExampleBindingError as exc:
+        return {"feature_reloaded": False, "error": str(exc)}
+
+    if refreshed == session.steps:
+        return {"feature_reloaded": False}
+
+    was_on = session.steps[session.index] if session.index < len(session.steps) else None
+    before = len(session.steps)
+    session.steps = refreshed
+
+    if was_on is not None and was_on in refreshed:
+        moved_to = refreshed.index(was_on)
+        cursor = "kept" if moved_to == session.index else "followed"
+        session.index = moved_to
+    else:
+        session.index = min(session.index, max(0, len(refreshed) - 1))
+        cursor = "clamped"
+
+    return {
+        "feature_reloaded": True,
+        "steps_before": before,
+        "steps_after": len(refreshed),
+        "cursor": cursor,
+        "index": session.index,
+    }

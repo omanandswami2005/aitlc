@@ -69,6 +69,7 @@ def _run_steps(config, session: debug_session.DebugSession, steps: list[str]) ->
         pass
     else:
         return {
+            **({"reloaded": reply["reloaded"]} if reply.get("reloaded") else {}),
             "results": [
                 {
                     "step": r.get("step", ""),
@@ -235,6 +236,7 @@ def start(
         port=instance.port,
         steps=steps,
         index=max(0, min(at, len(steps))),
+        example=example,
     )
     ran = _run_steps(config, session, session.slice_through(session.index))
     debug_session.save(config.root_dir, session)
@@ -283,6 +285,17 @@ def status(test_id: str = typer.Argument(...)) -> None:
 
 
 def _run_current(config, session, advance: bool) -> None:
+    # Pick up an edit to the Gherkin before deciding which step to run. The
+    # session held the list parsed when it started, so without this `retry`
+    # re-runs text that may no longer be in the file.
+    resynced: dict = {}
+    try:
+        resynced = debug_session.resync(session, Path(session.feature).read_text())
+    except OSError:
+        resynced = {}
+    if resynced.get("feature_reloaded"):
+        debug_session.save(config.root_dir, session)
+
     if session.finished:
         typer.echo(json.dumps({"done": True, "message": "no steps left"}))
         return
