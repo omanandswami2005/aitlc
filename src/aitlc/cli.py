@@ -7,6 +7,7 @@ import json
 import typer
 from aitlc.core import workspace
 from aitlc.commands import (
+    call_cmd,
     cdp_cmd,
     classify_cmd,
     debug_cmd,
@@ -110,6 +111,7 @@ app.command("notify-teams")(notify_cmd.notify_teams)
 # (`aitlc xray get-gherkin ...`, `aitlc cdp inspect ...`) — kept as sub-Typers.
 app.add_typer(xray_cmd.app, name="xray")
 app.add_typer(cdp_cmd.app, name="cdp")
+app.add_typer(call_cmd.app, name="call")
 app.add_typer(debug_cmd.app, name="debug")
 app.add_typer(tunnel_cmd.app, name="tunnel")
 app.add_typer(jira_cmd.app, name="jira")

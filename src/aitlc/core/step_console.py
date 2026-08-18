@@ -292,6 +292,64 @@ class ConsoleRunResult:
         return self.exit_code == 0
 
 
+def call_project_function(
+    spec: str,
+    *,
+    cwd: Path,
+    poetry_cmd: list[str],
+    args: list[str] | None = None,
+    cdp_url: str | None = None,
+    step_dir: str = "features/steps",
+    scenario_setup: str | None = None,
+    browser_actions: str | None = None,
+    pass_browser: str = "auto",
+    feature_file: Path | None = None,
+) -> dict:
+    """Call one project function in the target's interpreter and return its record.
+
+    A separate entry point rather than a step, because the thing worth calling
+    is usually not a step: a page object's private helper that answers "which
+    user does the app think is signed in" has no Gherkin expression, and
+    checking it meant writing a Playwright script by hand.
+    """
+    script_path = Path(__file__).resolve()
+    target_feature = feature_file or script_path.parent / "_empty.feature"
+    if feature_file is None and not target_feature.exists():
+        target_feature.write_text("Feature: call\n\n  Scenario: call\n")
+
+    cmd = poetry_cmd + ["run", "python3", str(script_path), str(target_feature)]
+    cmd += ["--call", spec, "--step-dir", step_dir]
+    cmd += ["--call-pass-browser", pass_browser]
+    for value in args or []:
+        cmd += ["--call-arg", value]
+    if cdp_url:
+        cmd += ["--cdp-url", cdp_url]
+    if scenario_setup:
+        cmd += ["--scenario-setup", scenario_setup]
+    else:
+        cmd.append("--allow-missing-setup")
+    if browser_actions:
+        cmd += ["--browser-actions", browser_actions]
+
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("event") in ("call_result", "call_error"):
+            return record
+    return {
+        "event": "call_error",
+        "target": spec,
+        "error": "the console produced no result",
+        "stderr_tail": "\n".join(proc.stderr.strip().splitlines()[-12:]),
+    }
+
+
 class ConsoleUnavailable(RuntimeError):
     """The persistent console could not be reached; fall back to a one-shot run."""
 
@@ -504,6 +562,109 @@ def run_console(
 # imports behave/playwright/the target project's own modules — never aitlc
 # itself, since it executes inside the TARGET's environment, not aitlc's.
 # ---------------------------------------------------------------------------
+
+
+def _run_call(spec, *, raw_args, pass_browser, browser_handle, page, context) -> None:
+    """Call one project function against the live browser and print the result.
+
+    The fast loop stops at the Gherkin boundary, and real debugging keeps
+    crossing it: asserting on a page object's private helper -- "which user
+    does the app think is signed in" -- is not a step and had no expression
+    at all, so it was done with hand-written scripts against the same
+    browser.
+
+    Runs inside the *target project's* interpreter, which is the only place
+    its modules are importable. Whether the browser handle is passed is
+    detected from the signature by default, because project helpers are
+    inconsistent about it and guessing wrong produces a TypeError that looks
+    like the helper is broken.
+    """
+    import importlib
+    import inspect as _inspect
+
+    def parse(value):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+
+    module_name, _, attr_path = spec.partition(":")
+    if not module_name or not attr_path:
+        print(
+            json.dumps(
+                {
+                    "event": "call_error",
+                    "error": f"expected 'module:attr', got {spec!r}",
+                }
+            ),
+            flush=True,
+        )
+        sys.exit(2)
+
+    try:
+        target = importlib.import_module(module_name)
+        for part in attr_path.split("."):
+            target = getattr(target, part)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"event": "call_error", "error": f"{type(exc).__name__}: {exc}"}
+            ),
+            flush=True,
+        )
+        sys.exit(2)
+
+    call_args = [parse(value) for value in raw_args]
+
+    if pass_browser == "yes":
+        wants_browser = True
+    elif pass_browser == "no":
+        wants_browser = False
+    else:
+        try:
+            parameters = list(_inspect.signature(target).parameters)
+        except (TypeError, ValueError):
+            parameters = []
+        named = {"driver", "browser", "page", "context", "self"}
+        wants_browser = bool(parameters) and parameters[0] in named
+
+    if wants_browser:
+        # The project's own handle when it has one, the raw Page otherwise --
+        # the same object a step definition would receive, so a helper behaves
+        # here exactly as it does in a real run.
+        call_args.insert(0, browser_handle if browser_handle is not None else page)
+
+    started = time.time()
+    try:
+        value = target(*call_args)
+        record = {
+            "event": "call_result",
+            "target": spec,
+            "passed_browser": wants_browser,
+            "duration_s": round(time.time() - started, 2),
+        }
+        try:
+            json.dumps(value)
+            record["value"] = value
+        except TypeError:
+            # A page object or a Playwright handle is not serialisable; its
+            # repr still answers most questions and is better than failing.
+            record["value_repr"] = repr(value)
+            record["value_type"] = type(value).__name__
+        print(json.dumps(record), flush=True)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "event": "call_error",
+                    "target": spec,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "duration_s": round(time.time() - started, 2),
+                }
+            ),
+            flush=True,
+        )
+        sys.exit(1)
 
 
 def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
@@ -793,6 +954,26 @@ def _script_main() -> None:
         help="Continue even if scenario setup fails (default: stop immediately).",
     )
     parser.add_argument(
+        "--call",
+        default="",
+        help=(
+            "Call 'module:attr' (dotted attrs allowed) with the live browser "
+            "and print the result, instead of running steps."
+        ),
+    )
+    parser.add_argument(
+        "--call-arg",
+        action="append",
+        default=[],
+        help="Positional argument for --call. Repeatable. Parsed as JSON, else str.",
+    )
+    parser.add_argument(
+        "--call-pass-browser",
+        default="auto",
+        choices=("auto", "yes", "no"),
+        help="Pass the project browser handle as the first argument.",
+    )
+    parser.add_argument(
         "--serve",
         default="",
         help=(
@@ -981,6 +1162,17 @@ def _script_main() -> None:
     if args.range:
         start, end = parse_line_range(args.range, len(lines))
         filtered = [(ln, text) for ln, text in filtered if start <= ln <= end]
+
+    if args.call:
+        _run_call(
+            args.call,
+            raw_args=args.call_arg,
+            pass_browser=args.call_pass_browser,
+            browser_handle=browser_handle,
+            page=page,
+            context=context,
+        )
+        sys.exit(0)
 
     if args.serve:
         _serve_forever(

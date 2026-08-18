@@ -40,6 +40,75 @@ class LocatorCheck:
     error: str | None = None
 
 
+def _fingerprint(value: str) -> str:
+    """A value's shape, without the value.
+
+    "which account is this browser signed in as" is answered by a token's
+    *identity*, not its contents, and printing a live session token into a
+    terminal, a log, or an agent transcript is how it ends up somewhere it
+    should not be. Length plus a short digest is enough to tell two sessions
+    apart and to spot the all-zeros identity a rejected token produces.
+    """
+    import hashlib
+
+    if value is None:
+        return "<none>"
+    text = str(value)
+    digest = hashlib.sha256(text.encode()).hexdigest()[:12]
+    return f"<{len(text)} chars, sha256:{digest}>"
+
+
+def collect_storage(context, page, *, reveal: bool = False) -> dict:
+    """Cookies and localStorage for the live page.
+
+    The question a wrong-account failure turns on is *which* account the
+    browser is signed in as, and it lives in a cookie or a localStorage key --
+    neither of which the tool could read, so it was done with hand-written
+    scripts against the same browser.
+
+    Values are fingerprinted rather than printed unless `reveal` is set: a
+    session cookie is a working credential.
+    """
+    def present(value):
+        return value if reveal else _fingerprint(value)
+
+    cookies = []
+    try:
+        for cookie in context.cookies():
+            cookies.append(
+                {
+                    "name": cookie.get("name", ""),
+                    "domain": cookie.get("domain", ""),
+                    "path": cookie.get("path", ""),
+                    "expires": cookie.get("expires"),
+                    "http_only": cookie.get("httpOnly"),
+                    "secure": cookie.get("secure"),
+                    "value": present(cookie.get("value", "")),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001 - a snapshot must not fail the run
+        cookies = [{"error": f"{type(exc).__name__}: {exc}"}]
+
+    local_storage: dict = {}
+    session_storage: dict = {}
+    try:
+        raw = page.evaluate(
+            "() => ({local: Object.assign({}, window.localStorage),"
+            " session: Object.assign({}, window.sessionStorage)})"
+        )
+        local_storage = {k: present(v) for k, v in (raw.get("local") or {}).items()}
+        session_storage = {k: present(v) for k, v in (raw.get("session") or {}).items()}
+    except Exception as exc:  # noqa: BLE001
+        local_storage = {"error": f"{type(exc).__name__}: {exc}"}
+
+    return {
+        "revealed": reveal,
+        "cookies": cookies,
+        "local_storage": local_storage,
+        "session_storage": session_storage,
+    }
+
+
 @dataclass
 class InspectionResult:
     """A snapshot of a live page: URL, viewport and checks."""
@@ -52,12 +121,14 @@ class InspectionResult:
     # Present only when explicitly requested, since it is much larger than
     # the rest of the payload.
     accessibility: dict[str, Any] | None = None
+    storage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable form of this inspection."""
         return {
             "url": self.url,
             "viewport": self.viewport,
+            **({"storage": self.storage} if self.storage is not None else {}),
             "screenshot_path": (
                 str(self.screenshot_path) if self.screenshot_path else None
             ),
@@ -178,6 +249,8 @@ def inspect(
     interesting_only: bool = True,
     a11y_selector: str | None = None,
     a11y_query: str | None = None,
+    storage: bool = False,
+    reveal_values: bool = False,
 ) -> InspectionResult:
     """Attach to a live browser over CDP and report page state + locator checks.
 
@@ -249,6 +322,11 @@ def inspect(
             screenshot_path=saved_path,
             checks=checks,
             accessibility=tree,
+            storage=(
+                collect_storage(context, page, reveal=reveal_values)
+                if storage
+                else None
+            ),
         )
         # Deliberately do NOT close the browser — this attaches to a live
         # session (e.g. one frozen by DEBUG_PAUSE_ON_FAILURE) that the

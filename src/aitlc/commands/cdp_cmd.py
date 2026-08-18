@@ -16,7 +16,15 @@ app = typer.Typer(help="Launch, inspect and stop a live Chromium instance over C
 
 @app.command("inspect")
 def inspect(
-    cdp_url: str = typer.Option(..., "--cdp-url", help="e.g. ws://127.0.0.1:9222/..."),
+    cdp_url: str | None = typer.Option(
+        None, "--cdp-url", help="e.g. http://127.0.0.1:9333. Defaults to --port."
+    ),
+    port: int = typer.Option(
+        chrome_cdp.DEFAULT_PORT,
+        "--port",
+        help="Use the tracked instance on this port. Every other cdp command "
+        "takes --port; requiring a URL here only for inspect is a trap.",
+    ),
     screenshot: Path | None = typer.Option(
         None, "--screenshot", help="Path to save a screenshot."
     ),
@@ -56,8 +64,32 @@ def inspect(
         "--a11y-selector",
         help="Scope the accessibility tree to this selector's subtree.",
     ),
+    storage: bool = typer.Option(
+        False,
+        "--storage",
+        help="Include cookies and localStorage. Values are fingerprinted, not printed.",
+    ),
+    reveal: bool = typer.Option(
+        False,
+        "--reveal",
+        help="Print storage values in full. A session cookie is a working credential.",
+    ),
 ) -> None:
     """Inspect a live page over CDP."""
+    if not cdp_url:
+        instance = chrome_cdp.load_state(AitlcConfig.find_and_load().root_dir, port)
+        if instance is None:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": f"no tracked browser on port {port}",
+                        "hint": "start one with `aitlc cdp launch`, or pass --cdp-url",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        cdp_url = f"http://127.0.0.1:{instance.port}"
     selectors = [s.strip() for s in check.split(",")] if check else []
     result = cdp_inspect(
         cdp_url,
@@ -68,6 +100,8 @@ def inspect(
         interesting_only=not all_nodes,
         a11y_selector=a11y_selector,
         a11y_query=a11y_query,
+        storage=storage,
+        reveal_values=reveal,
     )
     typer.echo(json.dumps(result.to_dict(), indent=2))
 
