@@ -25,7 +25,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, chrome_cdp, debug_session
+from aitlc.core import behave_runner, step_console, chrome_cdp, debug_session
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.step_console import run_console
 
@@ -49,9 +49,38 @@ def _slice_file(root_dir: Path, steps: list[str]) -> Path:
 
 
 def _run_steps(config, session: debug_session.DebugSession, steps: list[str]) -> dict:
-    """Dispatch a list of steps into the session's browser."""
+    """Dispatch a list of steps into the session's browser.
+
+    Prefers a persistent console when one is running: it holds the imported
+    step registry and, crucially, the same run-scoped data every step in the
+    session shares. Falls back to a one-shot process when it is not there, so
+    a missing optimisation never turns into a broken command.
+    """
     if not steps:
         return {"results": []}
+
+    socket_path = step_console.console_socket(config.root_dir, session.test_id)
+    try:
+        reply = step_console.request_steps(socket_path, steps)
+    except step_console.ConsoleUnavailable:
+        pass
+    else:
+        return {
+            "results": [
+                {
+                    "step": r.get("step", ""),
+                    "status": r.get("status", "failed"),
+                    "duration_s": r.get("duration_s", 0.0),
+                    "error": r.get("error"),
+                    "started_at": r.get("started_at", ""),
+                    "ended_at": r.get("ended_at", ""),
+                }
+                for r in reply.get("results", [])
+            ],
+            "stderr_tail": reply.get("error", ""),
+            "unhandled_events": [],
+            "via": "console",
+        }
     slice_path = _slice_file(config.root_dir, steps)
     result = run_console(
         slice_path,
@@ -307,6 +336,55 @@ def stop(test_id: str = typer.Argument(...)) -> None:
     """Stop the session's browser and drop the session."""
     config = AitlcConfig.find_and_load()
     _require(config, test_id)  # refuse politely when there is nothing to stop
+    # Stop the console before the browser: it holds a live connection to it,
+    # and tearing the browser out from under it produces a confusing error
+    # from a process that is about to be shut down anyway.
+    console_stopped = step_console.stop_console(
+        step_console.console_socket(config.root_dir, test_id)
+    )
     stopped = chrome_cdp.stop_all(config.root_dir)
     debug_session.clear(config.root_dir, test_id)
-    typer.echo(json.dumps({"stopped_ports": stopped, "session_cleared": True}))
+    typer.echo(
+        json.dumps(
+            {
+                "stopped_ports": stopped,
+                "console_stopped": console_stopped,
+                "session_cleared": True,
+            }
+        )
+    )
+
+
+@app.command("console")
+def console(
+    test_id: str = typer.Argument(...),
+    stop_it: bool = typer.Option(False, "--stop", help="Shut the console down."),
+) -> None:
+    """Report (or stop) the session's persistent step console.
+
+    The console is what makes `retry`/`next` fast and, more importantly,
+    correct: it holds one set of run-scoped data, where a process per step
+    regenerates it and leaves later steps waiting for names that never
+    existed.
+    """
+    config = AitlcConfig.find_and_load()
+    socket_path = step_console.console_socket(config.root_dir, test_id)
+    if stop_it:
+        typer.echo(
+            json.dumps({"stopped": step_console.stop_console(socket_path)})
+        )
+        return
+    alive = step_console.console_is_alive(socket_path)
+    typer.echo(
+        json.dumps(
+            {
+                "alive": alive,
+                "socket": str(socket_path),
+                "note": (
+                    "steps run in one process, sharing run-scoped data"
+                    if alive
+                    else "no console; retry/next spawn a process per step"
+                ),
+            }
+        )
+    )

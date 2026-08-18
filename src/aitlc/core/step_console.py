@@ -292,6 +292,110 @@ class ConsoleRunResult:
         return self.exit_code == 0
 
 
+class ConsoleUnavailable(RuntimeError):
+    """The persistent console could not be reached; fall back to a one-shot run."""
+
+
+def console_socket(root_dir: Path, test_id: str) -> Path:
+    """Where a session's step-console socket lives.
+
+    Deliberately in the system temp directory rather than under the project.
+    A Unix socket path is capped at roughly 104 bytes by the OS -- not by
+    Python -- and `<project>/reports/.aitlc/console-<test-id>.sock` blows
+    past that inside any deeply nested checkout, failing at bind() with
+    "AF_UNIX path too long". Found by running the tests from a temp
+    directory, which is exactly the kind of path a real project can have.
+
+    The digest keys the socket to this project *and* this test, so two
+    checkouts, or two sessions, never collide on one socket.
+    """
+    import hashlib
+    import tempfile
+
+    digest = hashlib.sha256(
+        f"{Path(root_dir).resolve()}::{test_id}".encode()
+    ).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"aitlc-console-{digest}.sock"
+
+
+def request_steps(socket_path: Path, steps: list[str], *, timeout: float = 900.0) -> dict:
+    """Ask a running console to execute a batch, and return its reply.
+
+    Raises ConsoleUnavailable for anything that means "no server there", so
+    the caller can fall back to spawning a process rather than failing. A
+    debugging tool that stops working because an optimisation is missing is
+    worse than one that is merely slow.
+    """
+    import socket as _socket
+
+    if not socket_path.exists():
+        raise ConsoleUnavailable(f"no console socket at {socket_path}")
+    try:
+        client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+    except OSError as exc:
+        raise ConsoleUnavailable(f"console not answering: {exc}") from exc
+
+    with client:
+        client.sendall((json.dumps({"steps": steps}) + "\n").encode())
+        payload = b""
+        while not payload.endswith(b"\n"):
+            try:
+                chunk = client.recv(65536)
+            except OSError as exc:
+                raise ConsoleUnavailable(f"console went away: {exc}") from exc
+            if not chunk:
+                break
+            payload += chunk
+
+    if not payload.strip():
+        raise ConsoleUnavailable("console returned nothing")
+    try:
+        return json.loads(payload.decode())
+    except json.JSONDecodeError as exc:
+        raise ConsoleUnavailable(f"console returned invalid JSON: {exc}") from exc
+
+
+def console_is_alive(socket_path: Path, *, timeout: float = 2.0) -> bool:
+    """Whether a console is listening and answering on this socket.
+
+    A stale socket file left by a killed process looks identical to a live
+    one on disk, so liveness is a round trip, not an existence check.
+    """
+    import socket as _socket
+
+    if not socket_path.exists():
+        return False
+    try:
+        client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        with client:
+            client.sendall((json.dumps({"cmd": "ping"}) + "\n").encode())
+            return b"alive" in client.recv(4096)
+    except OSError:
+        return False
+
+
+def stop_console(socket_path: Path, *, timeout: float = 5.0) -> bool:
+    """Ask a console to shut down. True if one was there to stop."""
+    import socket as _socket
+
+    if not socket_path.exists():
+        return False
+    try:
+        client = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        with client:
+            client.sendall((json.dumps({"cmd": "stop"}) + "\n").encode())
+            client.recv(4096)
+        return True
+    except OSError:
+        return False
+
+
 def run_console(
     feature_file: Path,
     *,
@@ -400,6 +504,83 @@ def run_console(
 # imports behave/playwright/the target project's own modules — never aitlc
 # itself, since it executes inside the TARGET's environment, not aitlc's.
 # ---------------------------------------------------------------------------
+
+
+def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
+    """Answer step batches over a socket, keeping one live context.
+
+    This is what makes the fast loop both fast and *correct*. Spawning a
+    process per step re-imports the step registry and re-runs scenario setup
+    every time -- slow, but the real damage is that run-scoped data
+    (generated names, ids, emails) is regenerated per process. A step that
+    waits for something an earlier step created then polls forever for a
+    name that never existed, which looks exactly like the application
+    hanging. One process means one set of that data.
+
+    Deliberately a plain newline-delimited JSON protocol over a Unix socket:
+    no dependency, no port to collide, and the socket file doubles as the
+    liveness check.
+    """
+    import socket as _socket
+
+    path = Path(socket_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+
+    server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(1)
+    server.settimeout(idle_timeout)
+    print(json.dumps({"event": "serving", "socket": str(path)}), flush=True)
+
+    try:
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                # Idle timeout: exit rather than sit forever holding a browser.
+                print(json.dumps({"event": "idle_exit"}), flush=True)
+                return
+            with conn:
+                payload = b""
+                while not payload.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    payload += chunk
+                if not payload.strip():
+                    continue
+                try:
+                    request = json.loads(payload.decode())
+                except Exception as exc:
+                    conn.sendall(
+                        (json.dumps({"error": f"bad request: {exc}"}) + "\n").encode()
+                    )
+                    continue
+
+                if request.get("cmd") == "stop":
+                    conn.sendall((json.dumps({"stopped": True}) + "\n").encode())
+                    return
+                if request.get("cmd") == "ping":
+                    conn.sendall((json.dumps({"alive": True}) + "\n").encode())
+                    continue
+
+                steps = request.get("steps") or []
+                try:
+                    results = run_steps(context, "\n".join(steps))
+                    reply = {"results": results}
+                except Exception as exc:  # a bad batch must not kill the server
+                    reply = {
+                        "results": [],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                conn.sendall((json.dumps(reply) + "\n").encode())
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _script_main() -> None:
@@ -611,6 +792,20 @@ def _script_main() -> None:
         action="store_true",
         help="Continue even if scenario setup fails (default: stop immediately).",
     )
+    parser.add_argument(
+        "--serve",
+        default="",
+        help=(
+            "Listen on this socket path and run step batches on request, "
+            "instead of running the feature once and exiting."
+        ),
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=3600.0,
+        help="Exit after this many seconds with no request, so a server cannot leak.",
+    )
     args = parser.parse_args()
 
     loaded = load_step_definitions(args.step_dir)
@@ -786,6 +981,15 @@ def _script_main() -> None:
     if args.range:
         start, end = parse_line_range(args.range, len(lines))
         filtered = [(ln, text) for ln, text in filtered if start <= ln <= end]
+
+    if args.serve:
+        _serve_forever(
+            args.serve,
+            context=context,
+            run_steps=run_steps,
+            idle_timeout=args.idle_timeout,
+        )
+        sys.exit(0)
 
     body = "\n".join(text for _, text in filtered)
     results = run_steps(context, body)
