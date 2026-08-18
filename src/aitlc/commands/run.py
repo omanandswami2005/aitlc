@@ -19,6 +19,7 @@ from aitlc.core.feature_select import split_line_spec
 from aitlc.core.patterns import PatternLibrary
 from aitlc.core.redact import redact_text
 from aitlc.runtime import attach
+from aitlc.core import workspace
 
 
 def _all_failures_are_known_flakes(
@@ -334,7 +335,7 @@ def run(
     status_path = (
         None
         if no_status
-        else config.root_dir / "reports" / ".status" / f"{safe_test_id}.json"
+        else workspace.output_path(config.root_dir, ".status", f"{safe_test_id}.json")
     )
 
     def _run_once() -> behave_runner.RunResult:
@@ -381,13 +382,13 @@ def run(
     def _run_with_local_lock() -> tuple[behave_runner.RunResult, dict]:
         if no_lock:
             return _run_with_retries()
-        lock_dir = config.root_dir / "reports" / ".locks"
+        lock_dir = workspace.output_path(config.root_dir, ".locks")
         with locks.held(test_id, lock_dir):
             return _run_with_retries()
 
     try:
         if remote:
-            slot_dir = config.root_dir / "reports" / ".remote_slots"
+            slot_dir = workspace.output_path(config.root_dir, ".remote_slots")
             pool = remote_queue.RemoteSlotPool(
                 max_concurrent=config.lambdatest.max_concurrent_sessions,
                 slot_dir=slot_dir,

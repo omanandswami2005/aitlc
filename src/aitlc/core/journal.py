@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from aitlc.core.redact import redact_text
+from aitlc.core import workspace
 
 # A payload big enough to be a liability rather than a record. Report bodies and
 # full behave transcripts land well above this; the summary is what has value.
@@ -44,7 +45,7 @@ class JournalEntry:
 
 def journal_dir(root_dir: Path) -> Path:
     """Where entries are stored."""
-    return root_dir / "reports" / ".aitlc" / "runs"
+    return workspace.output_path(root_dir, ".aitlc", "runs")
 
 
 def _entry_id(at: float, command: str) -> str:

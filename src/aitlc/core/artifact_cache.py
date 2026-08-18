@@ -14,6 +14,7 @@ import shutil
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from aitlc.core import workspace
 
 
 @dataclass
@@ -29,7 +30,7 @@ class CacheEntry:
 
 def cache_dir(root_dir: Path) -> Path:
     """Root of the artifact cache."""
-    return root_dir / "reports" / ".aitlc" / "artifacts"
+    return workspace.output_path(root_dir, ".aitlc", "artifacts")
 
 
 def _safe_name(key: str) -> str:

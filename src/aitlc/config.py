@@ -10,6 +10,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from aitlc.core import workspace as workspace_module
 
 try:
     import tomllib  # Python 3.11+
@@ -124,6 +125,9 @@ class AitlcConfig:
     # static keys, because a profile is resolved fresh on every call and
     # static keys in a file go stale without announcing it.
     s3_profile: str = ""
+    # Directory under the project root that every artifact goes into. Empty
+    # keeps the historical `reports/`. See core/workspace.py for precedence.
+    workspace: str = ""
     # Real confirmed key shape for this project's daily HTML report:
     # {s3_report_prefix}/{name}... (S3Utility.upload_file_and_get_presigned_url).
     # Left blank by default since the exact folder naming is project-specific.
@@ -160,6 +164,7 @@ class AitlcConfig:
     def from_dict(cls, data: dict[str, Any], root_dir: Path) -> AitlcConfig:
         """Build a config from already-parsed TOML data."""
         project = data.get("project", {})
+        workspace_module.set_config_default(project.get("workspace", ""))
         env_data = data.get("env", {})
         mobile_data = data.get("mobile", {})
         lt_data = data.get("lambdatest", {})
@@ -183,6 +188,7 @@ class AitlcConfig:
             s3_bucket=s3_data.get("bucket"),
             s3_region=s3_data.get("region", "us-east-2"),
             s3_profile=s3_data.get("profile", ""),
+            workspace=project.get("workspace", ""),
             s3_report_prefix=s3_data.get("report_prefix", ""),
             env=EnvMap(**env_data),
             mobile=MobileConfig(**mobile_data),

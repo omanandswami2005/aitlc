@@ -18,6 +18,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from aitlc.core import workspace
 
 # Continuation keywords cannot open a parsed slice -- Behave rejects a block
 # starting with And/But because there is no preceding step to continue. Roughly
@@ -220,7 +221,7 @@ class DebugSession:
 def session_path(root_dir: Path, test_id: str) -> Path:
     """Where a session for this test is stored."""
     safe = test_id.replace("/", "_").replace(" ", "_")
-    return root_dir / "reports" / ".aitlc" / "debug" / f"{safe}.json"
+    return workspace.output_path(root_dir, ".aitlc", "debug", f"{safe}.json")
 
 
 def save(root_dir: Path, session: DebugSession) -> Path:

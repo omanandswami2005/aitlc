@@ -31,6 +31,7 @@ import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from aitlc.core import workspace
 
 _RUN_DATE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -210,7 +211,7 @@ def matrix(histories: list[TestHistory]) -> dict:
 
 def default_store(root_dir: Path) -> Path:
     """Where the consolidated record lives."""
-    return root_dir / "reports" / ".aitlc" / "test-history.json"
+    return workspace.output_path(root_dir, ".aitlc", "test-history.json")
 
 
 def merge_into_store(path: Path, histories: list[TestHistory]) -> dict:

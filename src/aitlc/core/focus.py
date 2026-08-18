@@ -26,6 +26,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from aitlc.core import workspace
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,7 @@ class Focus:
 
 def focus_path(root_dir: Path) -> Path:
     """Where the saved focus is stored."""
-    return root_dir / "reports" / ".aitlc" / "focus.json"
+    return workspace.output_path(root_dir, ".aitlc", "focus.json")
 
 
 def load(root_dir: Path) -> Focus | None:

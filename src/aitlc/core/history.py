@@ -25,6 +25,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from aitlc.core import workspace
 
 
 @dataclass
@@ -62,7 +63,7 @@ class TestHistory:
 
 def history_path(root_dir: Path) -> Path:
     """Where run history is appended."""
-    return root_dir / "reports" / ".aitlc" / "history.jsonl"
+    return workspace.output_path(root_dir, ".aitlc", "history.jsonl")
 
 
 def record(

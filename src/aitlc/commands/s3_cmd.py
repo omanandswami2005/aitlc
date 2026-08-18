@@ -23,6 +23,7 @@ from aitlc.core import artifact_cache, journal, test_history, test_lookup, triag
 from aitlc.config import AitlcConfig, ConfigError
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.report_summary import parse_html_report
+from aitlc.core import workspace
 
 app = typer.Typer(help="Fetch reports uploaded to S3 (the daily HTML report, etc.).")
 
@@ -337,7 +338,7 @@ def triage_run(
         local = None if refresh else artifact_cache.get(config.root_dir, key)
         if local is None:
             raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
-            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp = workspace.output_path(config.root_dir, ".aitlc", "artifacts", "_tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(raw)
             local = artifact_cache.put(config.root_dir, key, tmp, source="s3")
@@ -490,7 +491,7 @@ def verify_test(
         local = None if refresh else artifact_cache.get(config.root_dir, key)
         if local is None:
             raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
-            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp = workspace.output_path(config.root_dir, ".aitlc", "artifacts", "_tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(raw)
             local = artifact_cache.put(config.root_dir, key, tmp, source="s3")
@@ -585,7 +586,7 @@ def history_compare(
         local = None if refresh else artifact_cache.get(config.root_dir, key)
         if local is None:
             raw = s3_evidence.fetch_object_bytes(client, config.s3_bucket, key)
-            tmp = config.root_dir / "reports" / ".aitlc" / "artifacts" / "_tmp"
+            tmp = workspace.output_path(config.root_dir, ".aitlc", "artifacts", "_tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(raw)
             local = artifact_cache.put(config.root_dir, key, tmp, source="s3")

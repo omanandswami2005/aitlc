@@ -28,6 +28,7 @@ from aitlc.config import AitlcConfig
 from aitlc.core import behave_runner, step_console, chrome_cdp, debug_session
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.step_console import run_console
+from aitlc.core import workspace
 
 app = typer.Typer(help="Interactive debug session over one feature file.")
 
@@ -39,7 +40,7 @@ def _slice_file(root_dir: Path, steps: list[str]) -> Path:
     its steps directory relative to the feature: a slice in /tmp dies with
     "No steps directory", which is a confusing way to learn that.
     """
-    out = root_dir / "reports" / ".aitlc" / "debug" / "_slice.feature"
+    out = workspace.output_path(root_dir, ".aitlc", "debug", "_slice.feature")
     out.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(f"\t{s.strip()}" for s in steps)
     out.write_text(

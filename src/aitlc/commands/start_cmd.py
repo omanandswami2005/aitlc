@@ -24,6 +24,7 @@ from aitlc.core.dotenv import load_dotenv
 from aitlc.core.patterns import PatternLibrary
 from aitlc.core.playbook import PLAYBOOK_MD
 from aitlc.core.trace_evidence import TraceEvidenceError, extract_last_frame
+from aitlc.core import workspace
 
 app = typer.Typer(help="Bootstrap a debugging session folder for one test.")
 
@@ -101,7 +102,7 @@ def _classification_section(config: AitlcConfig, prior_report: Path | None) -> s
 
 
 def _evidence_section(config: AitlcConfig, test_id: str, session_dir: Path) -> str:
-    traces_dir = config.root_dir / "reports" / "traces"
+    traces_dir = workspace.output_path(config.root_dir, "traces")
     if not traces_dir.exists():
         return "*No local reports/traces/ directory found.*"
 

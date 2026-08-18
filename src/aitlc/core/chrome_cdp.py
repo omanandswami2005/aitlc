@@ -41,6 +41,7 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from aitlc.core import workspace
 
 DEFAULT_PORT = 9333
 # Matches the mobile window the debugging cycle for this project standardized
@@ -86,7 +87,7 @@ class CdpInstance:
 
 def state_path(root_dir: Path, port: int = DEFAULT_PORT) -> Path:
     """Where this port's instance state is recorded."""
-    return root_dir / "reports" / ".cdp" / f"chrome-{port}.json"
+    return workspace.output_path(root_dir, ".cdp", f"chrome-{port}.json")
 
 
 def free_port() -> int:
@@ -111,7 +112,7 @@ def list_instances(root_dir: Path) -> list[dict]:
     file is precisely what turns a later attach into an unexplained
     ECONNREFUSED, so it should be visible, not filtered out.
     """
-    state_dir = root_dir / "reports" / ".cdp"
+    state_dir = workspace.output_path(root_dir, ".cdp")
     if not state_dir.exists():
         return []
 
@@ -313,7 +314,7 @@ def launch(
             # A distinct profile per instance — sharing one profile
             # directory across concurrent Chromes corrupts it, and shared
             # cookies would leak session state between parallel tests.
-            user_data_dir = root_dir / "reports" / ".cdp" / f"profile-{port}"
+            user_data_dir = workspace.output_path(root_dir, ".cdp", f"profile-{port}")
 
     existing = probe(port)
     if existing is not None:
@@ -338,7 +339,7 @@ def launch(
         return instance, True
 
     binary = find_chrome(chrome_binary)
-    data_dir = user_data_dir or (root_dir / "reports" / ".cdp" / f"profile-{port}")
+    data_dir = user_data_dir or workspace.output_path(root_dir, ".cdp", f"profile-{port}")
     data_dir.mkdir(parents=True, exist_ok=True)
 
     argv = [
@@ -355,7 +356,7 @@ def launch(
     if window_size:
         argv.append(f"--window-size={window_size}")
 
-    log_path = root_dir / "reports" / ".cdp" / f"chrome-{port}.log"
+    log_path = workspace.output_path(root_dir, ".cdp", f"chrome-{port}.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("ab")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import typer
+from aitlc.core import workspace
 from aitlc.commands import (
     cdp_cmd,
     classify_cmd,
@@ -73,8 +74,25 @@ def _main(
         is_eager=True,
         help="Print the installed version and exit.",
     ),
+    workspace_dir: str = typer.Option(
+        "",
+        "--workspace",
+        "-w",
+        help=(
+            "Directory under the project root for every artifact this command "
+            "produces. Point it at what you are investigating (e.g. -w PROJ-123) "
+            "and traces, cached reports, session state and logs all land in one "
+            "place. Also settable as AITLC_WORKSPACE or [project].workspace."
+        ),
+    ),
 ) -> None:
     """Structured CLI for Behave + Playwright debugging."""
+    if workspace_dir:
+        try:
+            workspace.set_workspace(workspace_dir)
+        except workspace.WorkspaceError as exc:
+            typer.echo(json.dumps({"error": str(exc)}), err=True)
+            raise typer.Exit(code=2) from exc
 
 # `run` and `doctor` are single direct commands (`aitlc run PROJ-123`, not
 # `aitlc run run PROJ-123`) — registered as plain commands, not sub-Typers.
