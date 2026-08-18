@@ -667,6 +667,105 @@ def _run_call(spec, *, raw_args, pass_browser, browser_handle, page, context) ->
         sys.exit(1)
 
 
+def _setup_with_behave_hooks(feature_file, cdp_url, step_dir):
+    """Load the project's own environment and fire its real hooks.
+
+    The shim this replaces called *one* configured function. That is not what
+    a real run does: a suite's `environment.py` defines before_all,
+    before_feature, before_scenario and after_step, and the feature-level
+    hooks are where tag-driven setup lives -- skip_login, plan tiers, and the
+    rest. None of it fired in a debug session, so the session could not be
+    compared with CI, which is the one comparison the tool exists to support.
+
+    Using behave's own Runner instead means the hooks, the tag handling and
+    the Context layers are behave's, not an approximation of them. The browser
+    is handed over through PLAYWRIGHT_CDP_URL, which suites that support CDP
+    attach already read -- so the project attaches to the debug browser rather
+    than launching a second one, and aitlc stops re-implementing setup it does
+    not own.
+
+    Returns (context, record). A None context means the caller should fall
+    back to the older path rather than fail: a session with approximate setup
+    is worth more than no session.
+    """
+    try:
+        from behave.configuration import Configuration
+        from behave.model import Feature
+        from behave.parser import parse_file
+        from behave.runner import Context, Runner
+    except Exception as exc:
+        return None, {"event": "behave_hooks", "status": "failed",
+                      "detail": f"behave API unavailable: {exc}"}
+
+    if cdp_url:
+        # The handover: the suite's own platform layer attaches here instead
+        # of launching a browser aitlc would then have to keep in step.
+        os.environ["PLAYWRIGHT_CDP_URL"] = cdp_url
+
+    try:
+        config = Configuration(command_args=[], load_config=True)
+        config.paths = [str(feature_file)]
+        runner = Runner(config)
+        runner.setup_paths()
+        runner.load_hooks()
+        runner.load_step_definitions()
+    except Exception as exc:
+        return None, {"event": "behave_hooks", "status": "failed",
+                      "detail": f"could not load the project environment: "
+                                f"{type(exc).__name__}: {exc}"}
+
+    # runner.hooks is the exec'd namespace of environment.py, so it also holds
+    # imports and dunders. Only the hook names mean anything to a reader.
+    hooks_found = sorted(
+        name
+        for name in (runner.hooks or {})
+        if name.startswith(("before_", "after_")) and callable(runner.hooks[name])
+    )
+    try:
+        feature = parse_file(str(feature_file))
+    except Exception as exc:
+        return None, {"event": "behave_hooks", "status": "failed",
+                      "detail": f"could not parse the feature: {exc}"}
+
+    scenario = next(iter(feature.scenarios), None) if feature else None
+
+    context = Context(runner)
+    runner.context = context
+    try:
+        context._push("testrun")
+        runner.run_hook("before_all", context)
+        context.feature = feature
+        context._push("feature")
+        runner.run_hook("before_feature", context, feature)
+        if scenario is not None:
+            context.scenario = scenario
+            context._push("scenario")
+            runner.run_hook("before_scenario", context, scenario)
+    except Exception as exc:
+        return None, {"event": "behave_hooks", "status": "failed",
+                      "detail": f"a project hook raised: {type(exc).__name__}: {exc}",
+                      "hooks_found": hooks_found}
+
+    # A suite may legitimately not build a browser in its hooks: the feature
+    # can be skipped by a tag rule, or the platform branch can be gated on
+    # feature-level tags that an export left on the scenario instead. Report
+    # that plainly -- the caller supplies its own handle rather than the
+    # session dying with "Context has no attribute browser" several steps
+    # later, which reads as a broken suite.
+    feature_status = getattr(getattr(feature, "status", None), "name", "")
+    return context, {
+        "event": "behave_hooks",
+        "status": "ok",
+        "hooks_found": hooks_found,
+        "feature_tags": sorted(feature.tags or []) if feature else [],
+        "scenario_tags": sorted(scenario.tags or []) if scenario is not None else [],
+        "scenario": getattr(scenario, "name", ""),
+        "attached_over_cdp": bool(cdp_url),
+        "feature_status": feature_status,
+        "hooks_provided_browser": hasattr(context, "browser"),
+    }
+
+
 def _serve_forever(socket_path, *, context, run_steps, idle_timeout) -> None:
     """Answer step batches over a socket, keeping one live context.
 
@@ -823,6 +922,15 @@ def _script_main() -> None:
         def execute_steps(self, text: str) -> None:
             run_steps(self, text)
 
+    def _step_status(name: str):
+        """behave's Status enum when available; hooks compare against it."""
+        try:
+            from behave.model_core import Status
+
+            return getattr(Status, name)
+        except Exception:
+            return name
+
     def run_steps(context: Any, text: str) -> list[dict]:
         results = []
         try:
@@ -842,11 +950,32 @@ def _script_main() -> None:
 
             context.table = step.table
             context.text = step.text
+
+            # The suite's own per-step hooks. after_step is where a project
+            # captures its evidence -- the failure screenshot, and the GraphQL
+            # query and response that repeatedly settled whether a failure was
+            # the app or the test. A debug session that skips it throws away
+            # exactly the material that makes a failure explicable, and leaves
+            # the person to reproduce it again to get the same information.
+            runner = getattr(context, "_runner", None)
+            step_hook = getattr(runner, "run_hook", None) if runner else None
+            if step_hook:
+                context.step = step
+                try:
+                    step_hook("before_step", context, step)
+                except Exception as exc:  # a hook must not fail the step
+                    print(
+                        json.dumps({"event": "hook_error", "hook": "before_step",
+                                    "error": f"{type(exc).__name__}: {exc}"}),
+                        flush=True,
+                    )
+
             started = time.time()
             record["started_at"] = _stamp(started)
             try:
                 match.run(context)
                 ended = time.time()
+                step.status = _step_status("passed")
                 record.update(
                     {
                         "status": "passed",
@@ -856,6 +985,7 @@ def _script_main() -> None:
                 )
             except Exception as exc:
                 ended = time.time()
+                step.status = _step_status("failed")
                 record.update(
                     {
                         "status": "failed",
@@ -864,6 +994,20 @@ def _script_main() -> None:
                         "error": f"{type(exc).__name__}: {exc}",
                     }
                 )
+
+            if step_hook:
+                # after_step reads step.status to decide whether to capture, so
+                # the status above is set before this runs, exactly as behave
+                # does it.
+                try:
+                    step_hook("after_step", context, step)
+                    record["hooks_ran"] = True
+                except Exception as exc:
+                    print(
+                        json.dumps({"event": "hook_error", "hook": "after_step",
+                                    "error": f"{type(exc).__name__}: {exc}"}),
+                        flush=True,
+                    )
             print(json.dumps(record), flush=True)
             results.append(record)
         return results
@@ -952,6 +1096,19 @@ def _script_main() -> None:
         "--allow-missing-setup",
         action="store_true",
         help="Continue even if scenario setup fails (default: stop immediately).",
+    )
+    parser.add_argument(
+        "--behave-hooks",
+        dest="behave_hooks",
+        action="store_true",
+        default=True,
+        help="Fire the project's own environment.py hooks (default).",
+    )
+    parser.add_argument(
+        "--no-behave-hooks",
+        dest="behave_hooks",
+        action="store_false",
+        help="Use the configured scenario-setup shim instead of real hooks.",
     )
     parser.add_argument(
         "--call",
@@ -1076,13 +1233,39 @@ def _script_main() -> None:
 
         page.on("response", _on_response)
 
-    context = MinimalContext(browser_handle, page)
+    context = None
+    if args.behave_hooks:
+        # Preferred: the project's own hooks, its own tag handling, behave's
+        # own Context. Falls back below rather than failing, because an
+        # approximate session beats no session.
+        context, hook_record = _setup_with_behave_hooks(
+            args.feature_file, args.cdp_url, args.step_dir
+        )
+        print(json.dumps(hook_record), flush=True)
 
-    setup_record = apply_scenario_setup(
-        context,
-        feature_file=args.feature_file,
-        spec=args.scenario_setup,
-    )
+    if context is None:
+        context = MinimalContext(browser_handle, page)
+        setup_record = apply_scenario_setup(
+            context,
+            feature_file=args.feature_file,
+            spec=args.scenario_setup,
+        )
+    else:
+        if not hasattr(context, "browser"):
+            # Hooks ran but built no browser. Hand over the one already
+            # attached here so steps can still run against the same page the
+            # session is parked on.
+            context.browser = browser_handle
+            context.page = page
+        setup_record = {
+            "event": "scenario_setup",
+            "status": "ok",
+            "hook": "project environment.py (behave hooks)",
+            "browser_from": (
+                "project hooks" if hook_record.get("hooks_provided_browser")
+                else "aitlc (hooks built none)"
+            ),
+        }
     print(json.dumps(setup_record), flush=True)
     if setup_record["status"] == "failed" and not args.allow_missing_setup:
         # Hard stop by default. Running on without scenario data is how a
