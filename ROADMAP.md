@@ -1,222 +1,108 @@
 # Roadmap — `aitlc`
 
-What is built, what is deliberately not being built, and what is still open.
+What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-Status: the command surface below is complete and covered by the test suite.
-Version `0.1.0` — the API and the `aitlc.toml` schema may still change.
+**Tracker: 31 of 44 closed, 13 open.** Every row below came
+from a real debugging session that the tool made harder than it needed to be;
+none of them are speculative features.
 
-## Built
+## Open
 
-**Running tests.** `run` with structured JSON or compact TOON output, retry,
-retry-only-when-the-failure-matches-a-known-flake, a local lockfile that makes
-launching the same test twice at once structurally impossible, and a
-concurrency-aware queue for remote grids. `parallel run` and `parallel focus`
-run and pin a selection without editing tags in the suite. Bare test IDs
-resolve recursively; a `FILE:LINE` selects a single Examples row.
+Ordered by how much a real investigation pays for them.
 
-**The debugging cycle (0.2).** `debug start / retry / next / certify / stop`
-holds one isolated browser and a step index, so fixing a step costs a re-run of
-*that step* rather than the scenario, and a scenario with four defects costs one
-setup instead of four. `certify` is a separate verb on a fresh instance,
-defaulting to two consecutive passes, because a CDP-attached browser is never
-proof and one pass does not disprove a race. `s3 triage-run` turns a CI run's
-per-execution Behave JSON into totals plus one row per failure, replacing a
-key listing, a bulk download and a hand-written parser.
+| # | Gap | Notes |
+|---|---|---|
+| G3 | `init` has no merge mode | Re-running it overwrites a hand-edited `aitlc.toml`. Needs `--merge`. |
+| G6 | no `--version` | `aitlc --version` still errors. One callback; trivial and still missing. |
+| G9 | no way to read page state or call a project function | Biggest remaining hole for interactive debugging. |
+| G10 | `parallel run` streams every child's transcript to stdout | Output is summarised but not separable per child. |
+| G15 | the skip-tag pre-filter is narrower than the project's rule |  |
+| G27 | `triage-run` truncates the call log to its least useful line | The `locator resolved to ...` line is the highest-value one and is still dropped. |
+| G31 | no way to use an AWS SSO profile | Static keys in `.env` are still the only path; an expired token has to be exported by hand. |
+| G36 | every `next`/`retry` pays full process startup | **Next up.** See *Persistent step console* below. |
+| G37 | per-step processes regenerate run-scoped data | Same root cause as G36; stateful tails can never pass until it is fixed. |
+| G38 | no wall-clock stamps, and no way to time an app condition | Durations exist; absolute timestamps do not. |
+| G39 | a local run silently differs from the CI run of the same feature | Setup takes a different branch and nothing logs the switch. |
+| G40 | parallel results are not separable; attribution rests on a re-run |  |
+| G42 | the debug cycle cannot survive an expensive scenario | Sessions are not resumable across a restart. |
 
-**Keeping what happened (0.2).** `journal list/show/diff/cache` records each
-invocation and caches fetched artifacts, so a follow-up question is a file read
-rather than another run — and `diff` answers "did my fix work, or was that
-luck". Everything is redacted before it touches disk, size-capped and pruned.
+### Persistent step console (G36 + G37)
 
-**Locator hygiene (0.2).** `locators lint` flags positional selectors, grid
-cells with no `role='cell'` guard, and unanchored xpaths, each with the rewrite
-attached rather than only the diagnosis.
+The single biggest correctness *and* speed problem left, and one root cause for
+both. Every `debug next` / `debug retry` spawns a fresh interpreter that
+re-imports the step registry, re-runs scenario setup, and reconnects to the
+browser. That is slow, and worse, it is **wrong**: run-scoped data (generated
+names, ids, emails) is regenerated per process, so a step that waits for
+something an earlier step created polls forever for a name that never existed.
+It looks exactly like the application hanging.
 
-**Debugging live.** `cdp launch` keeps a detached browser alive across many
-iterations, so setup and login are paid once rather than every cycle.
-`steps run --range` executes a slice of a scenario in that browser, replacing
-the habit of commenting out the steps that already passed. `cdp inspect
---a11y` reads a page as an accessibility tree — assertable text carrying
-nesting, control state and field values that a screenshot cannot express, at a
-fraction of the tokens.
+Planned shape, in the same style as `cdp launch`:
 
-**Suite health.** `steps unused` finds dead step definitions through behave's
-own registry, so the answer agrees with what the runner would dispatch, and
-counts steps invoked via `context.execute_steps(...)`. `history` records every
-run outcome, which is what makes a *new* flake visible rather than only the
-ones already catalogued. `doctor` checks the environment before a run rather
-than after a confusing failure.
+1. `debug start` also launches a **detached, long-lived step console** holding
+   the imported registry, the behave context, and the CDP connection.
+2. `retry` / `next` talk to it over newline-delimited JSON on a local socket,
+   recorded in the session state file next to the browser's.
+3. `debug stop` shuts it down; an idle timeout means it cannot leak.
+4. **If the console is unreachable, fall back to today's per-step subprocess.**
+   No regression: it degrades to correct-but-slow rather than failing.
 
-**Evidence.** `report` captures and replays real terminal output via `pyte`.
-`trace` extracts frames from a Playwright trace. `s3 report-summary` reduces a
-multi-megabyte HTML report to compact JSON, separating summary statistics,
-per-feature breakdown and a capped failure list from the embedded screenshots
-that drive the size — without ever loading them.
+Fixing the process boundary is what makes stateful tails runnable at all, so
+G37 closes with it rather than separately.
 
-**Integrations.** Xray Gherkin read/update/compare, Test↔Execution↔TestRun
-navigation, and a concurrent-paginated step-usage search. Jira task creation.
-Tunnel status and restart. Per-run failure and duration summaries to a Teams
-webhook.
+## Closed
 
-**Escape hatches.** `aitlc behave` and `aitlc pw` run those tools directly
-with the project's `.env` and interpreter already resolved, so adopting aitlc
-never means losing a flag it does not wrap. `--print-command` prints the exact
-invocation without running it.
-
-**Setup.** `aitlc init` inspects a repo and writes a working `aitlc.toml`,
-reporting how each value was found and leaving anything undetected as a
-commented placeholder.
+| # | Gap | Resolution |
+|---|---|---|
+| G1 | `steps run` swallowed the child's stderr | `stderr_tail` is carried on every console result. |
+| G2 | `init` could not detect three needed settings | `init` probes for browser factory / actions / scenario setup. |
+| G4 | no output until `steps run` finishes | `live_status` writes progress continuously. |
+| G5 | `cdp inspect --a11y-query` ignored on the fallback path |  |
+| G7 | failure JSON did not point at the evidence just written | Trace and screenshot paths ride along with the failure. |
+| G8 | `--retry-only-if-known-flake` could not help |  |
+| G11 | outside the project root, commands answered "none" | Now a `ConfigError` instead of a confident wrong answer. |
+| G12 | the `error` field could report a urllib3 warning | `extract_error` strips every captured stream first. |
+| G13 | could not tell a concurrency artifact from a real failure | Browser pool keys on in-use, not task index. |
+| G14 | `--range` could not start on an `And`/`But` | `promote_leading_continuation`. |
+| G16 | `run` and `parallel run` wrote status under different names |  |
+| G17 | no local mobile switch | `--mobile` takes a device key. |
+| G18 | no way to run part of a scenario with the project's hooks | `scenario_setup`. |
+| G19 | `update-gherkin` did not normalize (DATA LOSS) | Normalizes and refuses header lines. |
+| G20 | phantom diff for tab-indented Examples rows |  |
+| G21 | no path from "a CI report failed" to a failure table | `s3 triage-run`. |
+| G22 | nothing fetched was kept, so every question cost a re-run | `journal` + artifact cache. |
+| G23 | the debugging cycle was documented nowhere | `debug start/retry/next/certify/stop`. |
+| G24 | `doctor` did not report versions or the live code path |  |
+| G25 | no locator lint | `locators lint`. |
+| G26 | nothing distinguished a dirty debug browser from a clean one | CDP provenance is recorded. |
+| G28 | expired credentials surfaced as a Rich traceback | Handled as a clean error. |
+| G29 | `find-step-usage` wrote progress to stdout, corrupting its JSON | Progress goes to stderr. |
+| G30 | `--at` filtered *after* truncating to `--limit` | Filter first, truncate second. Cost three guesses at `--limit` before a real run appeared. |
+| G32 | nothing warned that a local run cannot pass its setup |  |
+| G33 | `debug start` shipped broken — crashed on every invocation | Tuple unpack. Now covered by a real-launch test, not a fake. |
+| G34 | Scenario Outline placeholders ran literally | Examples binding plus `--example`; unbound placeholders are refused. |
+| G35 | `debug retry` reported "failed" when the step never ran | `retry`/`next` load env; a step that did not run reports `not_run`. |
+| G41 | no per-test history across runs | `s3 history` — matrix, signatures, verdict, break date, persisted to one file. |
+| G43 | no way to ask "did test X pass in the latest run" | `s3 find-test` / `s3 verify-test`. |
+| G44 | tests mocked the boundary the bugs lived on | `test_fake_fidelity.py`: real-launch integration, contract checks, property guards. |
 
 ## Not planned
 
 - **An MCP server.** A CLI is cheaper in tokens and works in more contexts.
-  Structured output covers what an agent actually needs.
 - **Docker distribution.** An installed mode and a zero-install mode already
-  cover the ground; a container adds packaging surface without closing a gap.
-- **Anything that commits on your behalf.** `propose-fix` proposes. That line
-  does not move.
+  cover the ground.
+- **Anything that commits on your behalf.** `propose-fix` proposes.
 - **Infrastructure orchestration.** Provisioning and grid management belong to
-  whatever runs the grid, not to a debugging CLI.
+  the platform, not to a debugging CLI.
 
-## Behaviour changes in 0.2
+## Working rules
 
-Both are fixes, but they change what a caller sees, so they are called out
-rather than buried:
+Two rules earned the hard way, and both are enforced by the suite:
 
-- **`steps run` exits non-zero when the child ran no steps and failed.** It
-  previously printed `{"results": []}` and exited 0, which is indistinguishable
-  from a successful empty run. Scripts that keyed on exit code 0 will now see
-  the failure they were missing.
-- **`update-gherkin` normalizes its input and refuses header lines.** Passing a
-  full `.feature` used to write tags and a `Feature:` line into the Test; it now
-  writes the step body, as `compare-gherkin` always assumed.
-
-## Known bugs
-
-Found by using the tool for two weeks of real debugging on a large Behave +
-Playwright suite. Each was reproduced; the cause is a specific line.
-
-- **`xray update-gherkin` does not normalize its input.** `compare-gherkin`
-  reduces a local `.feature` through `normalize_local_feature()` because a
-  Test's `gherkin` field stores only the step body. `update-gherkin` sends the
-  file verbatim, so the natural command — passing the same file you just
-  compared — writes `@tags` and the `Feature:` line into the Test and leaves it
-  invalid. The readback error then says the write "did not persist as sent",
-  which reads as *nothing happened* when in fact the Test was modified.
-  **Data loss; fix first.** Normalize, refuse a payload containing a `Feature:`
-  or tag line, and reword the readback failure.
-
-- **`steps run` hides the child process's failures.** `run_console` uses
-  `subprocess.run(..., capture_output=True)` and parses stdout only. A fatal
-  configuration error (for example `--mobile` with `--cdp-url` and no
-  `browser_factory`) is written to stderr and dropped, so the command prints
-  `{"loaded_step_modules": N, "results": []}` and exits 0. A non-zero child
-  exit must surface, and unrecognised `{"event": ...}` records — the child
-  already emits a `parse_error` — must not be silently discarded.
-
-- **`_extract_error_message` does not strip `Captured stderr`.** It truncates
-  at `Captured stdout:` and `Captured logging:` and then takes the *last*
-  non-blank line, so any run that writes to stderr after the assertion reports
-  that instead of the failure. Observed: a step reported `warnings.warn(` while
-  the real error was a locator assertion. This string is also what
-  `classify-failure` matches on, so no pattern library can work around it.
-
-- **`cdp inspect --a11y-query` is ignored on the CDP fallback path.** Only the
-  `aria_snapshot()` branch filters; the `Accessibility.getFullAXTree` fallback
-  builds its node list without reading `query`. `--a11y-all` is honoured on the
-  fallback but not the snapshot branch, so the two disagree in opposite
-  directions. Silently dropping a flag is worse than rejecting it.
-
-- **`steps run --range` cannot start on an `And`/`But` step.** The slice is
-  re-parsed standalone, so a leading continuation keyword has no preceding step
-  and Behave rejects it. Roughly half the lines in a real feature start with
-  `And`, and the failure surfaces as an empty, successful-looking run.
-
-- **`compare-gherkin` reports a phantom diff for tab-indented Examples rows.**
-  Normalization strips tabs from the local side only, so a Test whose Examples
-  table is tab-indented upstream can never match. Compare on whitespace-
-  normalized lines.
-
-- **Commands answer "none" when run outside the project root.** Config is
-  searched upward; above the project there is none, the root falls back to the
-  cwd, and path-derived answers (tracked browsers, reports, status files) come
-  back empty rather than "no config found here".
-
-## Open
-
-- **Windows support** is untested. Nothing is knowingly POSIX-only beyond
-  process-group handling in `core/chrome_cdp.py`, but untested is untested.
-- **A starter pattern library.** `classify-failure` needs a YAML file that
-  every project must currently write from nothing. A documented starter set of
-  vendor-agnostic signatures would make the command usable on day one.
-- **Dependency weight.** `boto3` and `jira` are required at install time but
-  used by two adapters each. Moving them behind optional extras would cut a
-  default install substantially.
-- **Schema stability.** `aitlc.toml` and the JSON output shape are not yet
-  frozen. They should be before 1.0, and changes to either need a deprecation
-  path once anything depends on them.
-
-- **A debug session, rather than a set of commands.** The pieces exist
-  (`cdp launch`, `steps run --cdp-url`, `cdp inspect`, `run`) but nothing models
-  the loop they serve: take a CI failure, drive one kept browser to that point,
-  iterate on the broken step, move forward, then certify in a fresh instance.
-  Left to prose it degrades into re-running whole scenarios — which is slow and,
-  in suites that mutate data, destructive. A `debug start / retry / next /
-  inspect / certify` state machine holding the port and step index in a session
-  file would make the cheap path the default one.
-
-- **Persist artifacts and command output.** Fetched reports are re-downloaded
-  every time, and command output lives only in scrollback, so a follow-up
-  question means re-running something that already computed the answer. An
-  artifact cache keyed by source, plus a journal of every invocation (argv,
-  exit code, duration, payload), would make "did my fix work, or was that luck"
-  a diff. Anything written must go through the existing redaction path, be size-
-  bounded, and be opt-outable.
-
-- **Triage a CI run in one command.** Locating one run's per-execution Behave
-  JSON currently means listing hundreds of object keys and grepping a timestamp,
-  fetching each file singly, then writing a parser. Those JSONs are the better
-  source — a whole run is a few hundred KB against a multi-MB HTML report, and
-  they already carry per-step status, timings and errors. `s3 triage-run`
-  (resolve a run, fetch its JSONs, print totals plus one row per failure), with
-  `--prefix` on `list-reports` and a bulk fetch, replaces all of it.
-
-- **Report which code path is live.** Two capabilities silently fall back
-  depending on the installed Playwright: the accessibility snapshot and CDP
-  emulation. `doctor` should print the resolved versions and, for each such
-  capability, which branch is active and what that disables — one line would
-  have replaced an afternoon of source-reading.
-
-- **Lint locators.** Upstream guidance is explicit that `.first` hides
-  ambiguity rather than resolving it, and that strict mode exists to surface
-  unexpected matches. Suites accumulate the opposite: unanchored `//*` xpaths,
-  positional `aria-rowindex` / `data-rowindex` selectors, and grid selectors
-  with no `role='cell'` guard that silently match the header row. All are
-  mechanically detectable from the configured locators directory, as is a
-  related trap on the step side — `retry_on_failure`-style decorators whose
-  exception tuple omits what the wrapped body actually raises, which turns ten
-  attempts into one.
-
-- **Mock one API operation instead of building data for it.** Playwright's
-  routing can fulfil or abort a matching request, which is how an error path
-  gets tested without contriving backend state -- a suite that can only reach
-  "payment declined" by arranging a declined payment mostly does not test it.
-  A `--mock OPERATION=status[,body]` on a step slice would cover the common
-  case. The counterpart, `add_init_script`, would let a slice pin
-  non-determinism (clock, random) before any page script runs.
-
-- **Subscribe to protocol events, not just send commands.** CDP sessions here
-  only ever `send`; `session.on(...)` exposes console messages, network timing
-  and performance metrics that Playwright's own API does not surface, and
-  sessions that are opened are never `detach()`ed. Worth doing when something
-  concrete needs it rather than speculatively.
-
-- **Distinguish a dirty debug browser from a clean one.** A browser context is
-  the unit of isolation, and a CDP attach necessarily reuses an existing one, so
-  a long-lived debug browser accumulates sessions and eventually fails a run at
-  its own login — which reads as a test bug. `cdp launch` should record
-  provenance, `run --debug` should warn when the target profile was last driven
-  by something else, certification should always use a fresh instance, and
-  `cdp stop --all` should reconcile against real processes instead of reporting
-  zero while browsers are alive.
+- **If a test replaces an aitlc function, there must also be a test that does
+  not.** Stub the OS, the network, the clock — never the thing being verified.
+  A fake written to match the call site rather than the real function let a
+  command ship crashing on every invocation with twelve tests green (G33, G44).
+- **Validate against real data once before calling anything done.** Fixtures
+  agree with whoever wrote them. Real data does not, and it has caught a
+  formatting defect and a day-vs-run scoping error that no fixture would have.
