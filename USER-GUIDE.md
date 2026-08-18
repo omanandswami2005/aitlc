@@ -1,38 +1,58 @@
 # aitlc — Field Guide
 
-A CLI for debugging Behave + Playwright suites and keeping them in sync with
-Xray. Structured JSON output first, so both a person and an agent can read
-every result.
+A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
+never asks you to edit the suite it debugs.
 
-**Design rule that shapes everything here:** aitlc never requires you to edit
-the project it debugs. No hook blocks, no `environment.py` changes, nothing to
-keep in sync. See [How it stays codebase-independent](#how-it-stays-codebase-independent).
+Version 0.3.0.
 
----
+Every rule here came from a real investigation that went wrong. Where something
+is stated firmly, it is because the opposite was tried first.
 
 ## Contents
 
+- [The five-minute version](#the-five-minute-version)
+- [One directory per investigation](#one-directory-per-investigation)
 - [Setup](#setup)
-- [One directory per investigation](#one-directory-per-investigation) — `--workspace`
-- [How it stays codebase-independent](#how-it-stays-codebase-independent)
-- [Running tests](#running-tests) — `run`, `parallel`, `behave`
-- [Debugging live](#debugging-live) — `cdp`, `steps`
-- [Reading a page cheaply](#reading-a-page-cheaply) — `cdp inspect --a11y`
-- [Suite health](#suite-health) — `steps unused`, `history`, `doctor`
-- [Xray sync](#xray-sync) — `xray`
-- [Evidence](#evidence) — `trace`, `s3`, `report`
-- [What happened in CI](#what-happened-in-ci) — `s3 find-test`, `verify-test`, `history`
-- [Escape hatches](#escape-hatches) — `behave`, `pw`
-- [Everything else](#everything-else)
+- [How it attaches to your suite](#how-it-attaches-to-your-suite)
+- [The debug cycle](#the-debug-cycle)
+- [Reading a live page](#reading-a-live-page)
+- [Calling your own code](#calling-your-own-code)
+- [Checkpoints](#checkpoints)
+- [Running tests](#running-tests)
+- [What happened in CI](#what-happened-in-ci)
+- [Before you trust a local run](#before-you-trust-a-local-run)
+- [Suite health](#suite-health)
+- [Xray sync](#xray-sync)
+- [Patterns that pay off](#patterns-that-pay-off)
+- [Traps](#traps)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## The five-minute version
+
+```bash
+aitlc --version
+aitlc init                                  # detect layout, write aitlc.toml
+aitlc preflight PROJ-1234                   # will this run here like it does in CI?
+aitlc -w PROJ-1234 debug start PROJ-1234 --at 12
+aitlc -w PROJ-1234 debug next PROJ-1234     # forward, one step, same browser
+aitlc -w PROJ-1234 debug retry PROJ-1234    # after an edit, re-run just that step
+aitlc -w PROJ-1234 debug certify PROJ-1234  # fresh browser, real feature, twice
+aitlc s3 verify-test PROJ-1234              # did it pass in CI last night?
+```
+
+Nothing above edits your feature files. That is the point: commenting out the
+steps that already passed drifts from the file CI actually runs, and the drift
+is invisible until it costs you a day.
 
 ---
 
 ## One directory per investigation
 
 Every command produces something — traces, cached CI reports, session state,
-browser profiles, logs. Point a workspace at whatever you are working on and
-all of it lands in one place:
+browser profiles, logs. Point a workspace at what you are working on and it all
+lands in one place.
 
 ```bash
 aitlc --workspace PROJ-29019 debug start PROJ-29019
@@ -41,537 +61,433 @@ aitlc -w PROJ-29019 s3 verify-test PROJ-29019
 
 ```
 PROJ-29019/
-  .aitlc/artifacts/    cached CI reports, fetched once
-  .aitlc/debug/        session state
-  .aitlc/runs/         the command journal
-  .cdp/                browser profiles and logs
-  traces/              Playwright traces
+  .aitlc/artifacts/     cached CI reports, fetched once
+  .aitlc/checkpoints/   saved setups
+  .aitlc/debug/         session state + console log
+  .aitlc/runs/          the command journal
+  .parallel/            one full log per feature
+  .cdp/                 browser profiles and logs
+  traces/               Playwright traces
 ```
 
-Switch the name and the previous investigation stays intact beside it, so
-"what did we collect last time" is answered by looking rather than by
-remembering. Delete the directory and everything from that investigation goes
-with it.
-
-Three ways to set it, most specific first:
+Switch the name and the previous investigation stays intact beside it. Delete
+the directory and it all goes together.
 
 | Where | Use it for |
 |---|---|
 | `--workspace` / `-w` | one command |
-| `AITLC_WORKSPACE` | a shell working on one thing for a while |
-| `[project].workspace` in `aitlc.toml` | a project that always wants it |
+| `AITLC_WORKSPACE` | a shell working on one thing |
+| `[project].workspace` | a project that always wants it |
 
-Unset, everything stays under `reports/` exactly as before. The name is
-relative to the project root; an absolute path is refused rather than quietly
-turned into one inside the project.
+Unset, everything stays under `reports/` as before. The name is relative to the
+project root; an absolute path is refused rather than quietly made relative.
 
 ---
 
 ## Setup
 
-### 1. Install
-
 ```bash
-uv tool install aitlc          # or: pipx install aitlc
-aitlc --help
+aitlc init            # writes aitlc.toml
+aitlc init --merge    # re-run later: adds new keys, keeps your edits
+aitlc doctor          # can this environment actually run tests?
 ```
 
-The same tool is published under two distribution names — `aitlc` and
-`dax-aitlc`. They install identical code and both provide the `aitlc` command;
-pick whichever name your organisation's index prefers. Install only one.
+`init` reads your repo: where features and steps live, the issue-key prefix in
+filenames, the per-scenario setup hook, and the *names* of the environment
+variables you use. No secret is read, stored or printed.
 
-aitlc runs *outside* your project's virtualenv and shells into it, so it does
-not need to share dependencies with the suite under test.
+`--merge` matters more than it sounds. Re-running `init` on a configured
+project is normal — the layout drifts, a setting is added — and overwriting
+discards the hand edits that made the file correct.
 
-### 2. Generate `aitlc.toml`
-
-```bash
-cd /path/to/your/project
-aitlc init --dry-run     # see what it detected, write nothing
-aitlc init               # write aitlc.toml
-```
-
-`init` reads the repo and fills the file in: feature and step directories from
-where the `.feature` files and step decorators actually are, the issue-key
-prefix from feature filenames, and `scenario_setup` from the call inside your
-own `before_scenario`. `[env]` is populated from your `.env` — **variable names
-only; no value is ever read, stored or printed**.
-
-Each detection reports how it was found and how confident it is. Anything
-undetected is written as a commented placeholder rather than guessed, because a
-wrong value written confidently fails later and somewhere else.
-
-aitlc searches upward from the current directory, so one file at the repo root
-covers every subdirectory. The generated file looks like this:
+### Credentials
 
 ```toml
-[project]
-name = "myproject"
-issue_key_prefix = "PROJ-"
-feature_dir = "features"
-step_dir = "features/steps"
-locators_dir = "config/web_locators"
-
-# The project's own per-scenario setup, run with behave's (context, scenario)
-# signature. Without this, a step slice gets no before_scenario at all.
-scenario_setup = "features.environment_helpers:populate_scenario_data"
-
-# The class your steps actually talk to. Most suites wrap Playwright's Page in
-# one; name it here and a step slice gets the same context.browser a real run
-# would. Leave unset if your steps use the Page directly.
-browser_actions = "helpers.browser:BrowserActions"
-
-[env]
-# Map aitlc's generic credential names -> your project's actual env var names.
-# aitlc never stores secrets; it only learns which variables to read.
-jira_token = "JIRA_TEST_TOKEN"
-jira_xray_client_id = "JIRA_XRAY_CLIENT_ID"
-jira_xray_client_secret = "JIRA_XRAY_CLIENT_SECRET"
-
-[xray]
-graphql_url = "https://xray.cloud.getxray.app/api/v2/graphql"
+[s3]
+profile = "my-sso-profile"      # resolved fresh on every call
 ```
 
-### What each `[project]` setting controls
-
-| Setting | Detected by `init`? | What it changes |
-|---|---|---|
-| `name` | yes — directory name | Labels output only |
-| `issue_key_prefix` | yes — from feature filenames | Lets you type `1234` instead of `PROJ-1234` |
-| `feature_dir` | yes — where `.feature` files live | Bare-ID resolution searches here, recursively |
-| `step_dir` | yes — where step decorators live | `steps unused`, and the step console's registry |
-| `locators_dir` | yes — common locator layouts | `record --suggest-steps` uses it to tell a newly recorded selector from one you already have |
-| `scenario_setup` | yes — the call inside your `before_scenario` | Makes `steps run` slices work on data-dependent steps |
-| `browser_actions` | no — write it yourself | The class assigned to `context.browser` in a step slice. Without it the raw `Page` is used, and steps written against a wrapper fail on the first call |
-| `browser_factory` | no — write it yourself | A class exposing `launch_local_mobile_browser_via_cdp(playwright, cdp_url, device_name)`. Only needed to combine `--mobile` with `--cdp-url` |
-
-The two undetected settings are undetected on purpose: there is no reliable
-signal for which of a project's many classes is *the* browser wrapper, and
-guessing wrong produces a confusing failure several steps later. `aitlc init`
-writes them as commented placeholders instead.
-
-### 3. Verify
-
-```bash
-aitlc doctor          # environment checks
-aitlc run <TEST-ID> --dry-run   # confirms steps resolve, no browser
-```
-
-`--dry-run` is the cheapest real signal that config, paths and step imports
-are all correct.
+Static keys in a `.env` expire, and when they do `aws sso login` does *not* fix
+it: the stale values in the file take precedence over the refreshed profile. A
+named profile (or `AWS_PROFILE`) avoids that entirely.
 
 ---
 
-## How it stays codebase-independent
+## How it attaches to your suite
 
-A debugging tool that requires editing the suite it debugs cannot be adopted
-incrementally, cannot be uninstalled cleanly, and silently becomes a no-op for
-anyone who installs the tool but not the edit.
+The rule: **never re-implement what the suite already does.**
 
-aitlc attaches instead, in three layers:
-
-**1. behave's own runner option (preferred).** aitlc ships
-`aitlc.runtime.runner:AitlcRunner`, a `Runner` subclass passed via behave's
-documented `--runner-class` / `--runner` flag. It calls `super().run_hook(...)`
-for every hook, so all your project hooks still run, unchanged and in order —
-aitlc only observes, and halts when explicitly asked.
-
-**2. Version detection.** The flag name *and* the class-path format differ by
-behave version, and both fail with the same unhelpful message when wrong:
-
-| behave | flag | path format |
+| Layer | Owner | How aitlc reaches it |
 |---|---|---|
-| 1.2.7.dev | `--runner-class` | `pkg.module.Class` (parsed with `rsplit(".", 1)`) |
-| 1.3+ | `--runner` / `-r` | `pkg.module:Class` |
-| 1.2.6 | neither | — |
+| Browser process | aitlc | detached, isolated profile |
+| Browser attach | your suite | `PLAYWRIGHT_CDP_URL` |
+| `environment.py` hooks | your suite | behave's `Runner.load_hooks()` |
+| Step definitions | your suite | behave's `load_step_definitions()` |
+| Step dispatch | behave | `registry.find_match(...)` |
+| `before_step` / `after_step` | your suite | fired around every step |
+| Evidence | your suite | whatever `after_step` already produces |
 
-aitlc asks `behave --help` what it supports rather than parsing a version
-string, because forks and vendored builds do not follow upstream numbering.
+**Every path loads your real environment.** `run` and `parallel run` invoke
+behave itself, so they always did. The debug console now does too, through
+behave's own `Runner` — so `before_all`, `before_feature`, `before_scenario`,
+`before_step` and `after_step` all fire, with behave's Context layers and
+behave's tag handling.
 
-**3. A universal fallback.** Where no flag exists, aitlc writes a
-`sitecustomize.py` into a temp directory on `PYTHONPATH`. Python imports that
-automatically at interpreter startup, and it patches
-`behave.runner.ModelRunner.run_hook` in place. It no-ops unless
-`AITLC_INSTRUMENT=1`, because that file lands on the path of *every* child
-process, including ones with no behave installed.
+That last one matters: `after_step` is where a suite captures its failure
+screenshot and its API traffic. A session that skipped it threw away exactly
+the material that explains a failure.
 
-Your project is never modified by any of these paths.
+`after_scenario` and `after_all` are deliberately **not** fired between steps —
+they tear down what a debug session exists to keep. They run on `debug stop`.
 
-> **Migrating from a hook block?** If your own hooks already carry a
-> pause-on-failure block, it is now redundant — but harmless. aitlc's runner
-> gates on its own variable (`AITLC_PAUSE_ON_FAILURE`), so the two can never
-> both fire. Delete the block when convenient.
+See [`INTEGRATION.md`](INTEGRATION.md) for the full contract.
+
+---
+
+## The debug cycle
+
+```bash
+aitlc debug start PROJ-1234 --at 12    # isolated browser, driven to step 12
+aitlc debug next PROJ-1234             # run the step under the cursor, then advance
+aitlc debug retry PROJ-1234            # after an edit, re-run that step
+aitlc debug status PROJ-1234           # where am I?
+aitlc debug console PROJ-1234          # is the fast path running?
+aitlc debug certify PROJ-1234 --times 2
+aitlc debug stop PROJ-1234
+```
+
+`--at N` runs steps `0..N-1` and parks **on** N without running it. The first
+`next` therefore runs N; only once a step has been attempted does `next` move
+past it. Advancing first would skip the step you parked on, and everything
+after it would fail for a reason that is not there.
+
+### Why it is fast, and why that matters for correctness
+
+`start` also launches a **persistent step console**: one process holding the
+imported step registry, the behave Context, and the CDP connection. `retry` and
+`next` send a JSON line to it over a Unix socket.
+
+```
+old:  next → new process → import behave + playwright + every step module
+                         → re-run scenario setup → attach browser → 1 step → exit
+new:  next → 0.2 ms socket round-trip → 1 step in a process that is already warm
+```
+
+| | Per step |
+|---|---|
+| Socket round-trip, no step | 0.1–0.2 ms |
+| A one-second step | 1.00 s wall, 1.0 s reported |
+| Same step, process-per-step | **+6 s** |
+
+The speed is the smaller half. A process per step regenerates **run-scoped
+data** — generated names, e-mails, ids — so a step waiting for something an
+earlier step created polls forever for a name that never existed. It looks
+exactly like the application hanging. One process means one set of that data:
+forty values minted once and shared by every later step.
+
+If the console is not running, `retry` and `next` fall back to spawning a
+process. Missing console means slow, never broken. Restart one without
+re-running setup:
+
+```bash
+aitlc debug console PROJ-1234 --start
+```
+
+### Certify is not the debug browser
+
+`certify` launches a fresh instance and runs the real feature, twice by
+default. A CDP-attached browser reuses an existing context — the opposite of
+isolation — so it is never proof. Two consecutive passes are the default
+because one pass does not disprove a race.
+
+---
+
+## Reading a live page
+
+```bash
+aitlc cdp launch                       # detached browser that outlives your shell
+aitlc cdp inspect --port 9333 --a11y   # what a screen reader sees
+aitlc cdp inspect --port 9333 --storage
+aitlc cdp inspect --check '#save,[data-testid="row"]'
+aitlc cdp time-until '#banner' --condition hidden
+aitlc cdp list                         # every tracked instance, alive or dead
+aitlc cdp stop --all
+```
+
+The accessibility tree answers "is the upgrade button on screen" in a fraction
+of a screenshot's size, and it is directly assertable.
+
+`--storage` reports cookies and localStorage. Values are **fingerprinted**
+(length + short digest), not printed: a session cookie is a working credential.
+The fingerprint is still stable and distinguishing, so it answers "same session
+as before?" without leaking anything. `--reveal` opts in.
+
+`time-until` measures how long the app takes to satisfy a condition — for
+tuning a wait against a real backend job. By default the element must first be
+seen in the *opposite* state: without that check, an element already hidden
+(because the page never loaded) reports a confident "cleared in 0.4s" for
+something that never happened.
+
+---
+
+## Calling your own code
+
+```bash
+aitlc call 'pages.login:SignInPage.current_user'
+aitlc call 'pages.audience:AudiencePage.count_rows' --arg 2
+```
+
+The fast loop stops at the Gherkin boundary and real debugging keeps crossing
+it. Asserting on a page object's private helper — "which user does the app
+actually think is signed in" — is not a step and had no expression at all.
+
+Runs in your project's interpreter, where its modules are importable. Whether
+the browser handle is passed is read from the signature; `--pass-browser
+yes|no` overrides.
+
+---
+
+## Checkpoints
+
+A scenario can cost fifteen minutes of setup before the interesting step.
+
+```bash
+aitlc debug checkpoint after-setup --test-id PROJ-1234 \
+    --value random_name=abcxyz --entity user=someone@example.com
+aitlc debug checkpoints                 # what exists, and is it still usable?
+aitlc debug restore after-setup
+```
+
+Three things are captured together, because any one alone is useless: browser
+state, the run-scoped values your suite minted, and the entities the setup
+created on the server.
+
+**Staleness is part of the record.** A session cookie and a fresh user do not
+stay valid indefinitely, so a checkpoint carries when it was taken and refuses
+to restore past its TTL. Silently restoring a dead session produces exactly the
+false failure this exists to prevent.
+
+> Verified: cookies restore byte-identically, attributes intact. Whether the
+> *application* accepts a restored session end to end is not yet proven — treat
+> restore as "session material replayed", not "you are signed in".
 
 ---
 
 ## Running tests
 
-### `aitlc run <TEST-ID>`
-
-Run one feature file and report structured results.
-
 ```bash
-aitlc run PROJ-24026
-aitlc run PROJ-24026 --dry-run          # steps resolve, no browser
-aitlc run PROJ-25466:47                 # one Examples row (see below)
-aitlc run PROJ-24026 --debug            # halt on failure, browser stays open
-aitlc run PROJ-24026 --retry 2 --retry-only-if-known-flake
+aitlc run PROJ-1234                  # structured JSON result
+aitlc run PROJ-1234 --debug          # halt on failure, browser stays open
+aitlc parallel run -j 4              # concurrent, without editing tags
+aitlc parallel run --list            # preview: what runs, what is skipped, why
+aitlc parallel focus PROJ-1234       # pin a selection
 ```
 
-Bare test IDs resolve recursively, so you never need the full path, and you
-never need to tag other features to narrow a run.
+Bare test IDs resolve recursively — no full path, and no tagging other features
+to narrow a run. `FILE:LINE` selects one Examples row.
 
-**`FILE:LINE` selects a scenario, not a resume point.** behave runs *the
-scenario containing that line, from its first step*. For a single-scenario
-file that is the whole file. Where it genuinely pays off is a **Scenario
-Outline** — pointing at one Examples row runs only that row (measured: 37
-passed / 37 untested instead of 74).
+### `parallel run` and `paver run parallel`
 
-*Agent use:* exit code is 0/1; stdout is one JSON object with
-`steps_by_status` and a `failures[]` array carrying `step` and `error`. Add
-`--toon` for a more compact table. Every run is appended to history
-automatically.
+`aitlc parallel run` is a drop-in for `paver run parallel --local`. It does not
+call paver; it runs behave itself with a thread pool and a browser pool, and
+adds what the paver path could not do: `--jobs`, per-feature structured
+results, `FILE:LINE`, and `--list`.
 
-### `aitlc parallel run [IDS...]`
+Two deliberate differences, both fixing real gaps:
 
-Run many features concurrently — the `paver run parallel` workflow without
-editing tags.
+- **Discovery is recursive by default.** `glob("features/*.feature")` is not,
+  so nested suites are invisible to the paver path. `--no-recursive` restores
+  exact parity.
+- **Skipped files are reported, not dropped.** "Skipped by tag" must never look
+  the same as "never discovered".
 
-```bash
-aitlc parallel run                      # everything discovered
-aitlc parallel run PROJ-1 PROJ-2 -j 4
-aitlc parallel run --list               # preview selection, run nothing
-aitlc parallel run --debug --isolated -j 4
-```
+The browser pool gates reuse on *in use*, not on task index — with more
+features than jobs, a pool indexed by task lets two concurrent runs share one
+Chrome. Claimed browsers return in a `finally`, so a failing run cannot shrink
+the pool and deadlock the rest.
 
-Skip tags already in your files are honored, and skipped files are **reported
-with the reason** rather than silently dropped — "skipped by tag" must never
-look identical to "never discovered".
+Each run writes its full console output to `<workspace>/.parallel/<stem>.log`.
+Failures also carry which runs overlapped in wall-clock and whether any drove
+**the same account** — free evidence, where `--verify-failures` costs a re-run
+and stays opt-in.
 
-### `aitlc parallel focus`
-
-Pin what the bare command runs, so you stop typing filenames.
-
-```bash
-aitlc parallel focus PROJ-24026 PROJ-25931   # set once
-aitlc parallel run                            # then just run
-aitlc parallel focus --clear
-```
-
-This replaces the "tag every other file, then revert" habit. The selection
-lives under `reports/`, so nothing in the repo changes and nothing can be
-committed by accident.
+The skip pre-filter matches a skip tag at any placement, and the
+`<tag>_prod` / `_stage` / `_dev` forms, so an environment-tagged file no longer
+costs a spawned process to discover a skip written plainly in the file.
 
 ---
 
-## Debugging live
-
-### `aitlc cdp launch|status|list|stop`
-
-Own a long-lived debug Chrome that outlives the shell that started it.
+## What happened in CI
 
 ```bash
-aitlc cdp launch            # detached, mobile-sized by default
-aitlc cdp status            # is it actually answering?
-aitlc cdp list              # every tracked instance, alive or dead
-aitlc cdp launch --new      # isolated: own port + own profile
-aitlc cdp stop --all
+aitlc s3 find-test PROJ-1            # which plan and run — no download
+aitlc s3 verify-test PROJ-1 PROJ-2   # pass/fail + the failing step and error
+aitlc s3 history PROJ-1 --days 14    # chronic, intermittent, or an outage
+aitlc s3 triage-run --suite <plan>   # one whole run, one table
 ```
 
-Three traps this closes, each of which produced a misleading error before:
+**A test key is usually not an execution key.** A plan runs one feature file
+per execution key, and the tests inside carry their own `@TEST_<KEY>` scenario
+tags. Searching object names finds nothing, which reads exactly like "it did
+not run" — so `find-test` reports `not_named_by_any_object` and points at
+`verify-test`, which reads the documents.
 
-- Backgrounding Chrome from a shell ties it to that shell; when the shell
-  exits, the next attach fails with a bare `ECONNREFUSED`.
-- Liveness is the **port**, not the PID — `list` reports tracked-but-dead
-  instances as `"running": false` instead of hiding them.
-- `stop` verifies the recorded PID is still *our* Chrome before signalling, so
-  a stale state file cannot kill an unrelated process group.
+`verify-test` reads the per-test Behave JSON, not the HTML report: orders of
+magnitude smaller, already structured, and it carries the tags that make a
+nested key findable at all.
 
-Use `--new` when several browsers must run at once (parallel suites, or
-multiple agents). Separate *profiles* matter, not just ports: a shared profile
-directory corrupts under concurrent Chromes and leaks cookies between tests.
-
-### The persistent step console
-
-`debug start` also starts a long-lived step console, and `retry` / `next` use
-it instead of spawning a process each time.
-
-```bash
-aitlc debug console PROJ-1          # is one running?
-aitlc debug console PROJ-1 --stop   # shut it down
+```
+test          08-17  08-18   rate   verdict
+PROJ-1        FAIL   FAIL    3/3    deterministic
+PROJ-2        FAIL   PASS    1/3    intermittent
+PROJ-3        OUT    PASS    0/2    healthy
 ```
 
-This is a correctness feature before it is a speed one. A process per step
-re-imports the step registry and re-runs scenario setup, but the real damage
-is that **run-scoped data is regenerated per process** — generated names, ids,
-emails. A step waiting for something an earlier step created then polls
-forever for a name that never existed, which looks exactly like the
-application hanging.
+- **deterministic** — one signature every time. Reproduce it; a single run will
+  show it.
+- **intermittent** — signatures vary. Establish a base rate before bisecting.
+- **OUT** — an outage run, excluded from the rate rather than inflating it.
 
-If the console is not running, `retry` and `next` fall back to spawning a
-process, so a missing console is slow, never broken.
+Failures are grouped by signature with volatile parts (timings, generated ids)
+masked, so one defect does not look like five. Scoped by **day**, not by run: a
+suite executes many times a day and a run count collapses the matrix to one
+column. Written to `<workspace>/.aitlc/test-history.json` so the next reader
+does not re-download it.
 
-### `aitlc steps run <ID> --range A-B`
-
-Resume a scenario partway through, in an already-open browser. This replaces
-commenting out the steps that already passed.
-
-```bash
-aitlc cdp launch
-# setup + login once (~2 min)
-aitlc steps run PROJ-24026 --range 6-13 --cdp-url http://127.0.0.1:9333 --mobile "Galaxy S8"
-# iterate on later steps in the SAME session — seconds per cycle
-aitlc steps run PROJ-24026 --range 14-19 --cdp-url http://127.0.0.1:9333 \
-                --mobile "Galaxy S8" --scenario-setup none
-```
-
-`--range 31-` (open-ended) means "line 31 to the end".
-
-**Use `--scenario-setup none` on every slice after the first.** Setup mints
-fresh per-scenario data; re-running it on a resume invalidates the session the
-earlier slice established.
-
-**A step slice gets no `before_scenario`.** That is where most suites generate
-per-scenario data. aitlc invokes your real hook via `[project].scenario_setup`
-and **stops immediately** if it fails, rather than running on into a failure
-that surfaces several steps later looking like an app bug.
-
-*Agent use:* emits JSON-lines — one object per step with `status`,
-`duration_s`, `error`, plus a `scenario_setup` record showing what setup
-actually produced.
+Triage keeps the call-log lines that explain a failure — the resolved element
+(`<button disabled ...>` is not a waiting problem), the overlay that
+intercepted the click, and the retry count that separates "never appeared" from
+"appeared but blocked".
 
 ---
 
-## Reading a page cheaply
-
-### `aitlc cdp inspect --a11y`
-
-Read the live page as structured text instead of pixels.
+## Before you trust a local run
 
 ```bash
-aitlc cdp inspect --cdp-url http://127.0.0.1:9333 --a11y
-aitlc cdp inspect --cdp-url ... --a11y --a11y-query "Apply filters"
-aitlc cdp inspect --cdp-url ... --a11y --a11y-selector "#panel"
-aitlc cdp inspect --cdp-url ... --check "#saveBtn,//button[text()='Close']"
+aitlc preflight PROJ-1234
 ```
 
-Measured on one real page:
+Reports how a local run would differ from a full execution, without launching
+anything. Exits non-zero when something would genuinely run differently, so a
+script cannot claim "reproduced locally" over the top of it.
 
-| Form | Size | Assertable? |
-|---|---|---|
-| Screenshot PNG | ~55 KB | needs vision |
-| Full a11y tree | 1,961 chars | yes, text |
-| Targeted query | 20 chars | yes, text |
+Three differences, all invisible in a failure message:
 
-The tree also carries what a screenshot cannot express: nesting, control state
-(`[expanded]`), and field values (`textbox "Search filters": City`).
-
-Built on `page.aria_snapshot()` (YAML). `page.accessibility` was deprecated for
-three years and then removed, so aitlc falls back to the CDP `Accessibility`
-domain only on Playwright versions predating `aria_snapshot`.
-
-*Agent use:* this is the cheapest way to answer "is X on screen". Start with
-`--a11y-query`; the response reports `chars` and `full_chars`, so you can see
-what the query saved and tighten it. Reach for a screenshot only when the
-question is genuinely visual — layout, overlap, styling.
+1. **No session of its own.** In an execution the session comes from a hook or
+   an earlier scenario; alone the file starts signed out and fails for a reason
+   that does not exist in CI. Sometimes the login is literally commented out.
+2. **Hook tags in a position nothing reads.** Hooks read *feature*-level tags,
+   while an export from an issue tracker puts the issue's labels on the
+   *scenario*. The file looks correctly tagged and gets none of that setup.
+3. **Order dependence.** Scenarios in one execution share a browser and each
+   other's data.
 
 ---
 
 ## Suite health
 
-### `aitlc steps unused`
-
-Report step definitions that no feature file uses. behave has no equivalent of
-Cucumber's unused-step report.
-
 ```bash
-aitlc steps unused
-aitlc steps unused --no-include-composite   # reproduce Cucumber's false positives
+aitlc doctor                 # versions, and which code path is live
+aitlc steps unused           # dead step definitions, via behave's own registry
+aitlc locators lint          # positional selectors, grid indexes, `.first`
+aitlc history show           # locally recorded outcomes, flakiest first
+aitlc journal list           # what was run, and what it produced
 ```
-
-Matching goes through behave's **own registry**, so the answer agrees with what
-the runner would dispatch — a regex reimplementation would disagree on exactly
-the tricky cases. Steps invoked via `context.execute_steps(...)` are extracted
-from the AST and counted as used.
-
-> **Check the corpus before believing the number.** The result is only as
-> complete as the feature files it can see. Where canonical Gherkin lives in a
-> test manager rather than the repo, most steps look dead — measured here, 51
-> local feature files reported 83% of definitions as unused. The command warns
-> when the ratio is implausible. Treat that as "incomplete corpus", not
-> "delete these".
-
-### `aitlc history show`
-
-Flake rate from observed outcomes, not hand-written signatures.
-
-```bash
-aitlc history show --flaky-only
-aitlc history show --last 200
-aitlc history clear
-```
-
-`aitlc run` appends every outcome automatically, so a new flake is visible the
-second time it happens.
-
-**Flaky means it has both passed *and* failed.** A test that has only ever
-failed is broken, and retrying it just spends time to reach the same answer —
-the two are reported separately on purpose.
-
-### `aitlc doctor`
-
-Environment checks: credentials, tunnel health, browser availability.
 
 ---
 
 ## Xray sync
 
 ```bash
-aitlc xray get-gherkin PROJ-24026
-aitlc xray compare-gherkin PROJ-24026            # local vs live
-aitlc xray update-gherkin PROJ-24026 --file body.txt
-aitlc xray fetch-features PROJ-29026 --status FAILED
-aitlc xray find-step-usage "click on audience tab"
+aitlc xray get-gherkin PROJ-1234
+aitlc xray compare-gherkin PROJ-1234 --file path/to.feature
+aitlc xray update-gherkin PROJ-1234 --file path/to.feature
+aitlc xray find-step-usage "click on element ID"
 ```
 
-**Xray stores only the step body** — no `Feature:` line, no tags, no
-`Scenario:` header, no comments. `compare-gherkin` normalizes your local file
-before diffing, so it compares like for like. `update-gherkin` re-fetches after
-writing to confirm the write actually persisted; the mutation echoing your
-input back is not proof.
+`update-gherkin` normalizes its input and refuses header lines. Passing a whole
+`.feature` file used to write the `Feature:` line into the Test body, which is
+data loss. `compare-gherkin` normalizes the same way, so a tab-indented
+Examples row no longer shows a permanent phantom diff.
 
-`fetch-features` is the "everything that failed last night" entry point:
-it resolves a whole Test Execution or Plan into runnable `.feature` files.
+**Back up before writing.** `get-gherkin` to a file first; that makes the push
+reversible.
 
 ---
 
-## Evidence
+## Patterns that pay off
 
-```bash
-aitlc trace extract-frame trace.zip      # last frame as an image (cheap tier)
-aitlc trace show trace.zip               # full interactive viewer (expensive tier)
-aitlc s3 report-summary                  # counts + failures, no download
-aitlc report <TEST-ID>                   # run + capture a replayable terminal recording
-```
+**Cheapest evidence first, browser last.** A whole triage can reach a diagnosis
+with no test run: totals from `triage-run`, the full call log from the cached
+JSON, one trace frame, and `find-step-usage` for the established pattern before
+writing any fix.
 
-Escalate in that order — a single frame explains most failures, and the
-interactive viewer costs far more to open and read.
+**Require a positive signal, not the absence of a negative one.** "The page did
+not redirect" does not mean you are logged in — a rejected token leaves the app
+on its own URL rendering nothing. Assert on something that only exists in the
+success state.
 
----
+**Check your check.** A verification that passes before the change is applied
+is worthless. Prove it fails when it should.
 
-## What happened in CI
+**Chronic and intermittent need opposite responses.** Same step and error every
+run: reproduce it. Varying signatures: establish a base rate first. Acting on
+the wrong one wastes hours.
 
-Three questions, three commands, none of which need you to know which suite
-report a test lives in.
+**A disabled button is not a waiting problem.** When a click times out, read
+the `locator resolved to ...` line before touching the timeout.
 
-```bash
-aitlc s3 find-test PROJ-1                 # which plan and run, no download
-aitlc s3 verify-test PROJ-1 PROJ-2        # pass/fail + the failing step
-aitlc s3 history PROJ-1 --days 14         # chronic or intermittent?
-```
+**Run the scenario the way the runner runs it.** If a local reproduction
+behaves strangely *before* reaching the step under test, suspect the harness,
+not the app.
 
-`verify-test` reads the per-test Behave JSON rather than the HTML report:
-orders of magnitude smaller, already structured, and it carries the scenario
-tags that make a nested test key findable at all.
-
-**A test key is usually not an execution key.** A plan runs one feature file
-per execution key, and the tests inside carry their own `@TEST_<KEY>` scenario
-tags. Searching object names for such a key finds nothing, which reads exactly
-like "it did not run" — so `find-test` reports `not_named_by_any_object` and
-points at `verify-test`, which reads the documents.
-
-`history` answers the question that decides what to do next:
-
-```
-test         08-11 08-12 08-14 08-15   rate   verdict
-PROJ-1       FAIL  FAIL  FAIL  FAIL    4/4    deterministic
-PROJ-2       FAIL  PASS  .     FAIL    2/3    intermittent
-```
-
-Deterministic means one signature every time — reproduce it, a single run will
-show it. Intermittent means the signatures vary — establish a base rate before
-bisecting anything. Failures are grouped by signature with volatile parts
-(timings, generated ids) masked, so one defect does not look like five. A run
-where *every* test failed is labelled an outage and excluded from the rates
-rather than inflating them. Everything is written to
-`<workspace>/.aitlc/test-history.json` so the next reader does not re-download
-it.
-
-Scoped by **day**, not by run: a suite executes many times a day, and a run
-count collapses the matrix into a single column.
-
-### Credentials
-
-```toml
-[s3]
-profile = "my-sso-profile"   # resolved fresh on every call
-```
-
-Static keys in a `.env` expire, and when they do `aws sso login` does *not*
-fix it — the stale values in the file take precedence over the refreshed
-profile. A named profile (or `AWS_PROFILE`) avoids that entirely.
-
-## Escape hatches
-
-aitlc's own commands cover the paths worth making easy. These two cover
-everything else, so adopting aitlc never means losing a flag it does not wrap.
-
-```bash
-aitlc behave --aitlc-debug features/x.feature   # any behave args, forwarded
-aitlc behave --print-command <args>             # show the command, run nothing
-aitlc pw show-trace trace.zip
-aitlc pw codegen https://example.com
-aitlc pw install chromium
-```
-
-What they add over typing `behave` directly: your `.env` loaded first, the
-right interpreter and working directory, and aitlc's optional instrumentation.
-aitlc's own flags are prefixed `--aitlc-` so they can never collide with a
-behave flag, now or in a future release.
-
-*Agent use:* `--print-command` prints the exact invocation as JSON. Use it to
-hand a reproduction to someone without aitlc, and to explain what you are about
-to run before running it.
+**If a test replaces one of the tool's own functions, another test must not.**
+A fake written to match the call site rather than the real function let a
+command ship crashing on every invocation with the suite green.
 
 ---
 
-## Everything else
+## Traps
 
-| Command | Purpose |
-|---|---|
-| `aitlc start` | Bootstrap briefing for a fresh agent or engineer |
-| `aitlc classify-failure` | Match a failure against `patterns.yaml` |
-| `aitlc propose-fix` | Assemble the evidence needed to propose a fix |
-| `aitlc record --suggest-steps` | Record a session, diff selectors against existing locators |
-| `aitlc notify-teams` | Post a run summary to a Teams webhook |
-| `aitlc jira create-task` | Create a Jira Task |
-| `aitlc tunnel status\|restart` | LambdaTest tunnel health |
-| `aitlc users validate\|generate` | Pooled test-user maintenance (requires `--yes`) |
+**Feature tags are not scenario tags.** Hooks read `feature.tags`. An export
+from an issue tracker writes the issue's labels on the scenario, so a file can
+look tagged and select nothing. `preflight` catches it.
 
-`aitlc users` commands act on a **shared** pool and refuse to run without
-`--yes`; the underlying scripts have no prompt and no dry run.
+**Accounts switch only via logout.** There is usually no Sign In affordance
+while a session is live.
+
+**Email slots are not interchangeable.** `random_email`, `freemium_email` and
+friends are pre-generated per slot; creating a user against one and signing in
+against another produces a user that exists and cannot be used.
+
+**A skipped feature can look like a passing one.** `passed: true` with no
+passed steps is what a skip looks like. `parallel run` reports `skipped` as its
+own outcome.
+
+**A stale socket file looks alive.** Liveness is a round trip, not an
+`exists()`.
 
 ---
 
 ## Troubleshooting
 
-**`--debug` did nothing.** Check the `instrumentation` line printed to stderr.
-If it says `sitecustomize`, aitlc could not use behave's runner option — the
-`detail` field distinguishes "this build has no such option" from "behave could
-not be probed at all" (usually a missing virtualenv).
+**`aitlc --version` disagrees with what you edited.** You are running an
+installed copy. The version is read from package metadata, so it is telling you
+the truth.
 
-**Instrumentation silently ignored.** Instrumentation flags must precede the
-positional feature path; behave's positional argument ends option parsing, so
-anything after it is treated as another path.
+**Commands answer as if the answer were "none".** You are outside the project
+root and config resolution failed. That is now an error rather than a confident
+wrong answer.
 
-**`No module named 'aitlc.runtime.runner:AitlcRunner'`.** A path-format
-mismatch, not a missing install: behave 1.2.7 needs the dotted form. aitlc picks
-the right shape per detected flag; seeing this means the flag was overridden by
-hand.
+**S3 commands fail after `aws sso login`.** Static keys in `.env` take
+precedence over the refreshed profile. Set `[s3].profile`.
 
-**A step slice fails on data-dependent steps.** `[project].scenario_setup` is
-unset, so no per-scenario data exists. The `scenario_setup` record in the output
-says `skipped` when this happens.
+**`debug console` says it did not begin listening.** Read
+`<workspace>/.aitlc/debug/console.log`. Usually a step module failed to import,
+which means the env file was not found.
 
-**`steps unused` reports most of the suite.** Your feature corpus is
-incomplete — see the warning in the output before deleting anything.
+**A step that never ran reports `not_run`, not `failed`.** Three outcomes, not
+two. Calling it failed sends you to fix code that is fine.
+
+**The debug browser looks like a phone.** It defaults to desktop to match a
+real run; pass `--window-size` for a mobile suite.

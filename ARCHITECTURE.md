@@ -137,6 +137,27 @@ Unix socket lives in the system temp directory, keyed by a digest of project
 root and test id. A socket path is capped near 104 bytes by the kernel, and a
 path under a deeply nested project exceeds it and fails at `bind()`.
 
+## 4b. Attaching through behave, not around it
+
+The console loads the target's own `environment.py` with behave's `Runner` and
+fires its real hooks, rather than calling one configured function as a
+stand-in. Tag handling, Context layers and per-step hooks are behave's.
+
+The browser is handed over through `PLAYWRIGHT_CDP_URL` before the hooks run,
+so a suite that supports CDP attach connects to the debug browser itself. aitlc
+owns the browser *process*; everything above it belongs to the suite.
+
+When a suite's hooks decline to build a browser — the feature was skipped by a
+tag rule, or the platform branch is gated on feature-level tags an export left
+on the scenario — that is reported as `hooks_provided_browser: false` and aitlc
+supplies its own handle, rather than failing several steps later with an error
+about a missing attribute.
+
+`after_scenario` and `after_all` are deliberately not fired between steps: they
+tear down the state a debug session exists to hold. They run on `debug stop`.
+
+See INTEGRATION.md for the layer-by-layer contract.
+
 ## 5. Attaching without editing the target project
 
 A debugging tool that requires editing the suite it debugs cannot be adopted

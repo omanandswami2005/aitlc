@@ -31,6 +31,19 @@ aitlc --workspace PROJ-29019 debug start PROJ-29019
 Switch the name and the previous investigation stays beside it; delete the
 directory and it all goes together. Unset, everything stays under `reports/`.
 
+**Reproduce a CI failure without editing the suite.** Park on any step, walk
+forward one at a time, and never comment a line out to get there.
+
+```bash
+aitlc preflight PROJ-1234              # would this run here like it does in CI?
+aitlc -w PROJ-1234 debug start PROJ-1234 --at 12
+aitlc -w PROJ-1234 debug next PROJ-1234
+```
+
+Steps run in a persistent console holding your suite's real behave Context, so
+`before_scenario`, `before_step` and `after_step` all fire and run-scoped data
+is minted once rather than regenerated per step.
+
 **Run and target tests.** Bare test IDs resolve recursively, so you never need
 a full path, and never need to tag other features to narrow a run. One Examples
 row of a Scenario Outline can be run on its own.
