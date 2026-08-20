@@ -86,3 +86,7 @@ def clear() -> None:
     if existed:
         path.unlink()
     typer.echo(json.dumps({"cleared": existed, "path": str(path)}))
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "history", "attr": "app", "kind": "group", "order": 220}

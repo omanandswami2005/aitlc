@@ -238,3 +238,7 @@ def doctor(
     payload["versions"] = _versions()
     typer.echo(json.dumps(payload, indent=2))
     raise typer.Exit(code=0 if report.all_ok else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "doctor", "attr": "doctor", "order": 20}

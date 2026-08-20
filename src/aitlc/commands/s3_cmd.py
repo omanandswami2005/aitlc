@@ -664,3 +664,7 @@ def history_compare(
         payload={"runs": wanted_runs, "tests": [h.test_key for h in histories]},
         tags=["triage"],
     )
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "s3", "attr": "app", "kind": "group", "order": 190}

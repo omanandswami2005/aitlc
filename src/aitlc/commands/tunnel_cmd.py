@@ -75,3 +75,7 @@ def restart(
     )
     typer.echo(json.dumps({"healthy": result.healthy, "detail": result.detail}))
     raise typer.Exit(code=0 if result.healthy else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "tunnel", "attr": "app", "kind": "group", "order": 150}

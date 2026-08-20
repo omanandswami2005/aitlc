@@ -114,6 +114,20 @@ class AitlcConfig:
     # 'module:Class' exposing launch_local_mobile_browser_via_cdp(...).
     # Only needed to combine --mobile with --cdp-url.
     browser_factory: str | None = None
+    # The env var this project's suite reads to attach Playwright to an
+    # already-open Chrome over CDP instead of launching a fresh browser. When a
+    # live debug Chrome exists (`aitlc cdp launch`, or a prior `run --debug`),
+    # aitlc sets this var for run/paver/behave so the suite REUSES that browser
+    # rather than paying full setup on every run. Named here, not hardcoded, so
+    # a suite that reads a differently-named variable is one config line away.
+    # The default is Playwright's common convention, PLAYWRIGHT_CDP_URL.
+    playwright_cdp_env: str = "PLAYWRIGHT_CDP_URL"
+    # Feature to run when a feature-running command (run / debug / steps /
+    # preflight …) is given no test id or path. An explicit path (relative to
+    # the project root, or absolute) wins; otherwise the first *.feature in
+    # feature_dir is used. Lets a single-feature project just run `aitlc run`,
+    # the way `paver run parallel` defaults to the folder.
+    default_feature: str = ""
     xray_graphql_url: str = "https://xray.cloud.getxray.app/api/v2/graphql"
     # Base URL of the Jira Cloud instance itself (distinct from Xray's own
     # GraphQL endpoint above) — needed for FR-7's plain Jira Task creation,
@@ -181,6 +195,8 @@ class AitlcConfig:
             scenario_setup=project.get("scenario_setup"),
             browser_actions=project.get("browser_actions"),
             browser_factory=project.get("browser_factory"),
+            playwright_cdp_env=project.get("playwright_cdp_env", "PLAYWRIGHT_CDP_URL"),
+            default_feature=project.get("default_feature", ""),
             xray_graphql_url=xray_data.get(
                 "graphql_url", "https://xray.cloud.getxray.app/api/v2/graphql"
             ),
@@ -237,3 +253,35 @@ class AitlcConfig:
             return matches[0]
 
         return None
+
+    def resolve_default_feature(self) -> Path | None:
+        """The feature to use when a command is given no test id / path.
+
+        An explicit `[project].default_feature` (relative to the project root, or
+        absolute) wins. Otherwise the first `*.feature` in `feature_dir` is used
+        — directly-contained files first, then a recursive search — so a
+        single-feature project needs no argument at all.
+        """
+        if self.default_feature:
+            candidate = Path(self.default_feature)
+            if not candidate.is_absolute():
+                candidate = self.root_dir / self.default_feature
+            return candidate if candidate.exists() else None
+
+        feature_root = self.root_dir / self.feature_dir
+        if not feature_root.exists():
+            return None
+        matches = sorted(feature_root.glob("*.feature")) or sorted(
+            feature_root.rglob("*.feature")
+        )
+        return matches[0] if matches else None
+
+    def default_feature_id(self) -> str | None:
+        """The stem of the default feature, usable as a test id, or None.
+
+        Returning the stem (not the path) means every downstream label — the
+        session key, the lock, the workspace, `resolve_feature_path` — keeps
+        working exactly as it does for an explicitly-named test.
+        """
+        feature = self.resolve_default_feature()
+        return feature.stem if feature else None

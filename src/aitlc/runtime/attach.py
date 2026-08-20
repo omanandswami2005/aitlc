@@ -137,13 +137,22 @@ def plan(
     aitlc_src: Path,
     pause_on_failure: bool = False,
     events_path: Path | None = None,
+    gate_env: dict | None = None,
 ) -> AttachPlan:
-    """Build the arguments and environment needed to instrument a run."""
+    """Build the arguments and environment needed to instrument a run.
+
+    gate_env carries the single-stepping gate's variables (AITLC_GATE and its
+    socket/park/progress paths). Like the pause/events vars, its presence is
+    what makes the runner attach at all; unlike them it also drives the gate
+    behaviour in the runner.
+    """
     env: dict[str, str] = {}
     if pause_on_failure:
         env["AITLC_PAUSE_ON_FAILURE"] = "1"
     if events_path is not None:
         env["AITLC_EVENTS"] = str(events_path)
+    if gate_env:
+        env.update({k: str(v) for k, v in gate_env.items()})
 
     if not env:
         return AttachPlan(mechanism="none", detail="no instrumentation requested")

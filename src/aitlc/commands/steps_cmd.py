@@ -15,7 +15,11 @@ app = typer.Typer(help="Run a slice of a feature file's steps against a live bro
 
 @app.command("run")
 def run(
-    feature_file: str = typer.Argument(..., help="Test ID or feature file path."),
+    feature_file: str = typer.Argument(
+        None,
+        help="Test ID or feature file path. Omit to use the project's default "
+        "feature ([project].default_feature, or the sole *.feature in feature_dir).",
+    ),
     range_: str | None = typer.Option(
         None, "--range", help="File line numbers START-END (1-based, inclusive)."
     ),
@@ -77,6 +81,21 @@ def run(
     """Run a slice of a feature's steps."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
+
+    if not feature_file:
+        feature_file = config.default_feature_id()
+        if not feature_file:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "no feature given and none found",
+                        "hint": f"pass a test id/path, or put one *.feature in "
+                        f"'{config.feature_dir}' (or set [project].default_feature)",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
     resolved = config.resolve_feature_path(feature_file)
     if resolved is None:
@@ -197,3 +216,7 @@ def unused(
     payload["composite_steps_considered"] = len(composite)
     typer.echo(json.dumps(payload, indent=2))
     raise typer.Exit(code=0)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "steps", "attr": "app", "kind": "group", "order": 180}

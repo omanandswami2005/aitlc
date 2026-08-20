@@ -107,3 +107,7 @@ Changed files: {', '.join(radius.changed_files) or '(none detected)'}
             }
         )
     )
+
+
+# Mounted by commands/_registry.py. Plain command, preserving `aitlc propose-fix`.
+COMMAND = {"name": "propose-fix", "attr": "propose_fix", "order": 80}

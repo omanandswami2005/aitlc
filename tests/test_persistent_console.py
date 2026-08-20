@@ -15,8 +15,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from aitlc.commands import debug_cmd
-from aitlc.core import debug_session, step_console
+from aitlc.core import step_console
 
 
 def _serve_once(path, handler, ready):
@@ -93,56 +92,3 @@ class TestProtocol:
         # it cannot use rather than raising something unrelated.
         reply = step_console.request_steps(path, ["Given a"])
         assert reply == "not-a-dict-but-valid-json"
-
-
-class TestFallback:
-    """A missing optimisation must never become a broken command."""
-
-    def _session(self, tmp_path):
-        return debug_session.DebugSession(
-            test_id="PROJ-1",
-            feature=str(tmp_path / "f.feature"),
-            cdp_url="http://127.0.0.1:9999",
-            port=9999,
-            steps=["Given open the app"],
-            index=0,
-        )
-
-    def test_without_a_console_it_spawns_a_process_as_before(self, monkeypatch, tmp_path):
-        called = {}
-        def fake_run_console(*_a, **_k):
-            called["spawned"] = True
-            return type(
-                "R", (), {"results": [], "stderr_tail": "", "unhandled_events": []}
-            )()
-
-        monkeypatch.setattr(debug_cmd, "run_console", fake_run_console)
-        monkeypatch.setattr(debug_cmd.behave_runner, "resolve_poetry", lambda: ["poetry"])
-        cfg = type("C", (), {
-            "root_dir": tmp_path, "scenario_setup": None, "step_dir": "features/steps",
-            "browser_actions": None, "browser_factory": None,
-        })()
-
-        debug_cmd._run_steps(cfg, self._session(tmp_path), ["Given open the app"])
-
-        assert called.get("spawned") is True
-
-    def test_with_a_console_it_does_not_spawn_a_process(self, monkeypatch, tmp_path, console):
-        path, start = console
-        start(lambda _req: {"results": [{"step": "Given open the app", "status": "passed"}]})
-        monkeypatch.setattr(
-            step_console, "console_socket", lambda _root, _test: path
-        )
-        monkeypatch.setattr(
-            debug_cmd, "run_console",
-            lambda *a, **k: pytest.fail("spawned a process while a console was running"),
-        )
-        cfg = type("C", (), {
-            "root_dir": tmp_path, "scenario_setup": None, "step_dir": "features/steps",
-            "browser_actions": None, "browser_factory": None,
-        })()
-
-        out = debug_cmd._run_steps(cfg, self._session(tmp_path), ["Given open the app"])
-
-        assert out["via"] == "console"
-        assert out["results"][0]["status"] == "passed"

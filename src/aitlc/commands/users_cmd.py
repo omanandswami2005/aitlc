@@ -89,3 +89,7 @@ def generate(
 ) -> None:
     """Create the pooled users currently listed in the DynamoDB table."""
     _run("scripts/multi_threaded_user_generator.py", env_file, yes, "user generation")
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "users", "attr": "app", "kind": "group", "order": 210}

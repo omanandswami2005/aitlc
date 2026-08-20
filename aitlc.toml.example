@@ -11,6 +11,14 @@ issue_key_prefix = "PROJ-"
 feature_dir = "features"
 step_dir = "features/steps"
 
+# The feature to use when a feature-running command (run / debug / steps /
+# preflight) is given NO test id or path. An explicit path (relative to the
+# project root, or absolute) wins; otherwise the first *.feature in feature_dir
+# is used. Lets a single-feature project just run `aitlc run` with no argument,
+# the way `paver run parallel` defaults to the folder. Leave unset to require an
+# explicit id/path.
+# default_feature = "features/only.feature"
+
 # Where the project defines its locators. Used by `aitlc record
 # --suggest-steps` to tell recorded selectors apart from ones you already have.
 locators_dir = "config/web_locators"
@@ -30,6 +38,16 @@ locators_dir = "config/web_locators"
 # A class exposing launch_local_mobile_browser_via_cdp(playwright, cdp_url,
 # device_name). Only needed to combine --mobile with --cdp-url.
 # browser_factory = "helpers.browser:BrowserFactory"
+
+# The env var your suite reads to attach Playwright to an already-open Chrome
+# over CDP instead of launching a fresh browser. When a live debug Chrome
+# exists (`aitlc cdp launch`, or a prior `run --debug`), aitlc sets this var for
+# `run`, `paver` and `behave` so the suite REUSES that browser instead of
+# paying full setup on every run — the fix for repeated full runs. Defaults to
+# the common Playwright convention below; change it only if your suite reads a
+# different name. Pass --no-cdp (run) / --aitlc-no-cdp (paver, behave) to force
+# a fresh browser.
+# playwright_cdp_env = "PLAYWRIGHT_CDP_URL"
 
 [env]
 # Maps aitlc's generic credential names to the env var names THIS project uses.

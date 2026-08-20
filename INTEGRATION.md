@@ -27,13 +27,17 @@ belongs to the suite, and aitlc's job is to reach it, not to replace it.
 
 ## What changed, and why it mattered
 
-**Hooks were not fired at all.** The console called one configured function —
-a shim standing in for `environment.py`. A suite's `before_feature` is where
-tag-driven setup lives, and none of it ran, so a debug session could not be
-compared with a CI run. That is the one comparison the tool exists to support.
-Now behave's own `Runner` loads the suite's environment and the real
-`before_all` / `before_feature` / `before_scenario` fire, with behave's Context
-layers and behave's tag handling rather than an approximation of them.
+**The debug engine is a paused real behave run, not a reconstruction.** An
+earlier version stepped a hand-built console that called one configured function
+as a stand-in for `environment.py`, and every gap it hit (Examples placeholders
+run literally, run-scoped data regenerated per step, data tables dropped) was a
+place where the reconstruction diverged from behave. That whole approach was
+removed. `debug` now drives behave's own `Runner`: it runs `before_all` /
+`before_feature` / `before_scenario` and the setup steps for real, parks at the
+target step, and advances/re-runs the actual behave `Step` objects. Context
+layers, tag handling, Examples binding, data tables and per-step hooks are
+behave's, because it *is* behave — merely paused. There is nothing left to
+diverge, and no fallback engine to keep in step.
 
 **The browser is handed over, not duplicated.** Setting `PLAYWRIGHT_CDP_URL`
 before the hooks run means a suite that supports CDP attach connects to the
@@ -78,6 +82,8 @@ locally".
 | A one-second step | 1.00 s wall, 1.0 s reported |
 | Same step, process-per-step (old) | +6 s |
 
-The console adds no measurable dispatch cost. What remains is the CLI's own
-start (~0.6 s per invocation) and the step's real work. A step that fails
-spends its own timeout, which no architecture can shorten.
+The gate adds no measurable dispatch cost: `next`/`retry` are a socket
+round-trip into a process that is already warm and holds the live Context and
+browser. What remains is the CLI's own start (~0.6 s per invocation) and the
+step's real work. A step that fails spends its own timeout, which no
+architecture can shorten.

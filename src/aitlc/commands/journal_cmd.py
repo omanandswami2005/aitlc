@@ -88,3 +88,7 @@ def cache(
         typer.echo(json.dumps({"cleared": removed}))
         return
     typer.echo(json.dumps(artifact_cache.stats(config.root_dir), indent=2))
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "journal", "attr": "app", "kind": "group", "order": 230}

@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.3.0.
+Version 0.6.0.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -13,6 +13,7 @@ is stated firmly, it is because the opposite was tried first.
 - [The five-minute version](#the-five-minute-version)
 - [One directory per investigation](#one-directory-per-investigation)
 - [Setup](#setup)
+- [Environment and .env](#environment-and-env)
 - [How it attaches to your suite](#how-it-attaches-to-your-suite)
 - [The debug cycle](#the-debug-cycle)
 - [Reading a live page](#reading-a-live-page)
@@ -63,7 +64,7 @@ aitlc -w PROJ-29019 s3 verify-test PROJ-29019
 PROJ-29019/
   .aitlc/artifacts/     cached CI reports, fetched once
   .aitlc/checkpoints/   saved setups
-  .aitlc/debug/         session state + console log
+  .aitlc/debug/         session state + gate log
   .aitlc/runs/          the command journal
   .parallel/            one full log per feature
   .cdp/                 browser profiles and logs
@@ -113,6 +114,40 @@ named profile (or `AWS_PROFILE`) avoids that entirely.
 
 ---
 
+## Environment and `.env`
+
+Every `aitlc` command loads a `.env` before it does anything, and every tool it
+launches — behave, `paver`, Playwright, the debug gate — inherits it. You do
+**not** `export` a wall of variables first. That was only necessary when running
+`poetry run paver …` (or behave) *directly*, outside aitlc.
+
+```bash
+aitlc paver run parallel --local     # loads ./.env, then runs paver with it inherited
+aitlc run PROJ-1234                  # same — .env reaches behave
+poetry run paver run parallel        # NOT through aitlc: nothing loads .env here
+```
+
+- **Which file.** `./.env` at the project root (where `aitlc.toml` lives).
+  Override per command with `--env-file` (`run`, `debug`, …) or
+  `--aitlc-env-file` (the `paver` / `behave` / `pw` pass-throughs).
+- **Your shell always wins.** A variable already set in the environment is
+  never overwritten, so `export FOO=x` or `FOO=x aitlc …` still overrides
+  `.env`. Precedence, most-wins first: the shell, then `.env`.
+- **Plain `KEY=value` only.** `#` comments and surrounding quotes are handled.
+  There is no shell interpolation (`${VAR}`) and no `export ` prefix — write
+  `LT_USERNAME=abc`, not `export LT_USERNAME=abc` (the latter would create a
+  bogus key `export LT_USERNAME`).
+- **No placeholder resolution.** aitlc reads literal values. If your `.env`
+  still holds `AWS_SECRET:…`-style placeholders, resolve them into a real file
+  first — e.g. `poetry run fetch-secrets --profile … --template .env.tmpl
+  --output .env` — then the value is picked up.
+
+So the manual `export` block is gone: put resolved `KEY=value` pairs in `./.env`
+and run through `aitlc`. Anything you want to override for one run, prefix it
+inline (`DEVICE_NAME=MOBILE_DEVICE aitlc paver run parallel --local`).
+
+---
+
 ## How it attaches to your suite
 
 The rule: **never re-implement what the suite already does.**
@@ -128,10 +163,10 @@ The rule: **never re-implement what the suite already does.**
 | Evidence | your suite | whatever `after_step` already produces |
 
 **Every path loads your real environment.** `run` and `parallel run` invoke
-behave itself, so they always did. The debug console now does too, through
-behave's own `Runner` — so `before_all`, `before_feature`, `before_scenario`,
-`before_step` and `after_step` all fire, with behave's Context layers and
-behave's tag handling.
+behave itself, so they always did. `debug` now does too: it drives a real,
+paused behave `Runner` and single-steps it — so `before_all`, `before_feature`,
+`before_scenario`, `before_step` and `after_step` all fire, with behave's
+Context layers, tag handling and Examples binding, not an approximation of them.
 
 That last one matters: `after_step` is where a suite captures its failure
 screenshot and its API traffic. A session that skipped it threw away exactly
@@ -151,7 +186,6 @@ aitlc debug start PROJ-1234 --at 12    # isolated browser, driven to step 12
 aitlc debug next PROJ-1234             # run the step under the cursor, then advance
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug status PROJ-1234           # where am I?
-aitlc debug console PROJ-1234          # is the fast path running?
 aitlc debug certify PROJ-1234 --times 2
 aitlc debug stop PROJ-1234
 ```
@@ -163,68 +197,59 @@ after it would fail for a reason that is not there.
 
 ### Why it is fast, and why that matters for correctness
 
-`start` also launches a **persistent step console**: one process holding the
-imported step registry, the behave Context, and the CDP connection. `retry` and
-`next` send a JSON line to it over a Unix socket.
+`start` drives a **real, paused behave run**: behave runs `before_all`,
+`before_scenario` and the setup steps `0..N-1` through its own loop, then parks
+at step N holding the live Context, the run-scoped data it minted, and the
+browser. `retry` and `next` send a JSON line over a Unix socket and the paused
+process advances or re-runs the actual behave `Step` object.
 
 ```
 old:  next → new process → import behave + playwright + every step module
                          → re-run scenario setup → attach browser → 1 step → exit
-new:  next → 0.2 ms socket round-trip → 1 step in a process that is already warm
+new:  next → 0.2 ms socket round-trip → 1 real behave step in the paused process
 ```
 
 | | Per step |
 |---|---|
 | Socket round-trip, no step | 0.1–0.2 ms |
 | A one-second step | 1.00 s wall, 1.0 s reported |
-| Same step, process-per-step | **+6 s** |
+| Same step, process-per-step (the old way) | **+6 s** |
 
 The speed is the smaller half. A process per step regenerates **run-scoped
 data** — generated names, e-mails, ids — so a step waiting for something an
 earlier step created polls forever for a name that never existed. It looks
-exactly like the application hanging. One process means one set of that data:
-forty values minted once and shared by every later step.
+exactly like the application hanging. One paused process means one set of that
+data: minted once, shared by every later step, exactly as in a real run.
 
-If the console is not running, `retry` and `next` fall back to spawning a
-process. Missing console means slow, never broken. Restart one without
-re-running setup:
-
-```bash
-aitlc debug console PROJ-1234 --start
-```
+There is no separate engine and no fallback to fall out of sync with — `debug`
+is the gated behave runner, one path. (`steps run` and `call` still run a slice
+against a live browser; they are separate features, not a debug mode.)
 
 ### What happens when you edit something
 
-Both kinds of edit are picked up automatically, before the next step runs.
+**Python — a step definition, a page object, a locator.** Picked up
+automatically: before it runs a step, `retry`/`next` reload your project's step
+modules, so the paused behave process dispatches against your edit rather than
+code imported minutes ago. You pay the reload once; the browser, the Context and
+the run-scoped data stay live across it.
 
-**Python — a step definition, a page object, a locator.** The console
-re-imports what changed. Page objects and locators reload first, then the step
-modules are re-executed: step definitions bind page objects with `from ...
-import` at import time, so reloading a page alone updates the module and leaves
-the step holding the object it imported before. Anything holding live state —
-the driver wrapper, resolved config, the behave hooks — is deliberately never
-reloaded, because replacing those detaches the console from the browser it is
-driving.
-
-```
-no edit                → 1.4 s
-first call after edit  → 5.7 s   (modules rebound once)
-next call              → 1.5 s   (back to baseline)
-```
-
-You pay the rebind once, not per step.
-
-**Gherkin — the feature file itself.** The session re-reads it and the cursor
-follows the step it was on **by text, not by index**: inserting a step above
-the cursor shifts every index below it, so keeping the number would silently
-move you onto a different step. If the step you were on is gone, the index is
-clamped and that is reported rather than guessed at. The same Examples row is
-bound again, and an edit that cannot be bound is refused rather than
-half-applied.
+**Gherkin — the feature file itself.** Picked up automatically, no restart.
+Before each `next`/`retry` the gate re-parses the feature with behave's own
+parser and swaps in the freshly-bound steps (behave binds the Examples row, so
+the new steps keep their real tables, docstrings and substituted text). The
+cursor follows the step it was on **by text, not index**: inserting a step above
+it shifts every index below, so keeping the number would silently move you onto
+a different step. If the step you were on is gone (you edited it), the index is
+clamped and reported.
 
 ```json
 "feature": {"steps_before": 57, "steps_after": 58, "cursor": "followed", "index": 13}
 ```
+
+The re-parse is gated on the file's mtime, so a step with no edit pays only a
+`stat` (nothing). The one step after an edit pays the parse — single-digit ms
+for a normal feature, ~90 ms for a very large Scenario Outline, both negligible
+next to the step's own work.
 
 ### Certify is not the debug browser
 
@@ -319,6 +344,14 @@ aitlc parallel focus PROJ-1234       # pin a selection
 Bare test IDs resolve recursively — no full path, and no tagging other features
 to narrow a run. `FILE:LINE` selects one Examples row.
 
+**Omit the id entirely and aitlc uses the project's default feature** — the sole
+`*.feature` in `feature_dir`, or an explicit `[project].default_feature`. So a
+single-feature project can just run `aitlc run`, `aitlc debug start`, `aitlc
+steps run` or `aitlc preflight` with no argument (and `debug next`/`retry`/
+`status`/`stop` default to that same session). Skips and Xray tags are respected
+exactly as with a named run — it still goes through real behave. A path or id is
+always accepted and wins.
+
 ### `parallel run` and `paver run parallel`
 
 `aitlc parallel run` is a drop-in for `paver run parallel --local`. It does not
@@ -347,6 +380,38 @@ and stays opt-in.
 The skip pre-filter matches a skip tag at any placement, and the
 `<tag>_prod` / `_stage` / `_dev` forms, so an environment-tagged file no longer
 costs a spawned process to discover a skip written plainly in the file.
+
+### Reuse a live browser instead of a fresh one every run
+
+The most common waste is running full scenarios back to back, each launching a
+browser and logging in. Launch one debug Chrome and let every behave-based
+command attach to it:
+
+```bash
+aitlc cdp launch                     # detached CDP browser, survives the shell
+aitlc run PROJ-1234                  # attaches automatically if one is live
+aitlc paver run parallel --local     # so does the paver pass-through
+```
+
+aitlc sets your suite's CDP env var — default `PLAYWRIGHT_CDP_URL`, named in
+`[project].playwright_cdp_env` — so the suite connects to the open browser
+instead of launching its own. It never overrides a value already in the
+environment. Force a fresh browser with `--no-cdp` (run) or `--aitlc-no-cdp`
+(paver/behave); point at a specific endpoint with `--cdp-url` /
+`--aitlc-cdp-url`.
+
+### Run the project's own tools, with its environment set up
+
+```bash
+aitlc paver run parallel --local     # your suite's real paver task
+aitlc behave features/foo.feature    # real behave, with .env + interpreter resolved
+aitlc pw show-trace trace.zip        # the project's Playwright CLI
+```
+
+These are pass-throughs: aitlc loads your `.env`, resolves the project
+interpreter, and hands every remaining argument straight to the tool, so
+adopting aitlc never means losing a flag it does not wrap. `--print-command`
+shows the exact invocation without running it.
 
 ---
 
@@ -450,6 +515,14 @@ reversible.
 
 ## Patterns that pay off
 
+**Edit and step, don't restart.** This is the whole point of the loop: when a
+step fails, edit it — the Gherkin line and its params, or the Python behind it —
+and run `debug retry`. Before every `retry`/`next` the gate re-parses the
+feature and reloads your step modules, so the edit runs against the browser,
+login and setup you already have. Editing Gherkin is now as cheap as editing
+Python; reserve `debug start` for a change to a setup step *before* your park
+point.
+
 **Cheapest evidence first, browser last.** A whole triage can reach a diagnosis
 with no test run: totals from `triage-run`, the full call log from the cached
 JSON, one trace frame, and `find-step-usage` for the established pattern before
@@ -515,9 +588,11 @@ wrong answer.
 **S3 commands fail after `aws sso login`.** Static keys in `.env` take
 precedence over the refreshed profile. Set `[s3].profile`.
 
-**`debug console` says it did not begin listening.** Read
-`<workspace>/.aitlc/debug/console.log`. Usually a step module failed to import,
-which means the env file was not found.
+**`debug start` says the run did not reach the park point.** A setup step
+failed, so behave (`--stop`) aborted before parking — the session is not left on
+a broken precondition. Read `<workspace>/.aitlc/debug/gate.log` for the failing
+step; a common cause is a step module failing to import because the env file was
+not found.
 
 **A step that never ran reports `not_run`, not `failed`.** Three outcomes, not
 two. Calling it failed sends you to fix code that is fine.

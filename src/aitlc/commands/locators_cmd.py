@@ -112,3 +112,7 @@ def rules() -> None:
             indent=2,
         )
     )
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "locators", "attr": "app", "kind": "group", "order": 240}

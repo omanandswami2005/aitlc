@@ -269,3 +269,7 @@ def time_until(
     )
     typer.echo(json.dumps(timing.to_dict(), indent=2))
     raise typer.Exit(code=0 if timing.met else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "cdp", "attr": "app", "kind": "group", "order": 110}

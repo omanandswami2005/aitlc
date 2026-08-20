@@ -56,3 +56,7 @@ def classify_failure(
     # match any known pattern" signal FR-1.7's retry wrapper depends on
     # (SRS FR-6.2: report "no match" distinctly from a match).
     raise typer.Exit(code=1 if any_unmatched else 0)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "classify-failure", "attr": "classify_failure", "order": 40}

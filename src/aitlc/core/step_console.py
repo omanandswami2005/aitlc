@@ -471,6 +471,7 @@ def run_console(
     browser_factory: str | None = None,
     trace: str | None = None,
     capture_network: bool = False,
+    progress_file: str | None = None,
 ) -> ConsoleRunResult:
     """Run a slice of a feature file's steps, parsing the JSON-lines output.
 
@@ -503,6 +504,8 @@ def run_console(
         cmd += ["--trace", trace]
     if capture_network:
         cmd.append("--capture-network")
+    if progress_file:
+        cmd += ["--progress-file", str(progress_file)]
 
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
@@ -1090,6 +1093,31 @@ def _script_main() -> None:
             print(json.dumps({"event": "parse_error", "error": str(exc)}), flush=True)
             return results
 
+        def _emit_progress() -> None:
+            # Overwrite a small progress file after each step so `debug status`
+            # can read where the setup is while `debug start` is still running,
+            # rather than the whole run being a silent multi-minute wait (G48).
+            progress_file = getattr(args, "progress_file", "")
+            if not progress_file:
+                return
+            try:
+                Path(progress_file).parent.mkdir(parents=True, exist_ok=True)
+                Path(progress_file).write_text(
+                    json.dumps(
+                        {
+                            "state": "running",
+                            "done": len(results),
+                            "total": len(steps),
+                            "current_step": results[-1]["step"] if results else "",
+                            "passed": sum(1 for r in results if r.get("status") == "passed"),
+                            "failed": sum(1 for r in results if r.get("status") == "failed"),
+                            "updated_at": time.time(),
+                        }
+                    )
+                )
+            except OSError:
+                pass
+
         for step in steps:
             match = registry.find_match(step)
             record: dict = {"step": f"{step.keyword} {step.name}".strip()}
@@ -1097,6 +1125,7 @@ def _script_main() -> None:
                 record.update({"status": "undefined", "duration_s": 0.0})
                 print(json.dumps(record), flush=True)
                 results.append(record)
+                _emit_progress()
                 continue
 
             context.table = step.table
@@ -1161,6 +1190,7 @@ def _script_main() -> None:
                     )
             print(json.dumps(record), flush=True)
             results.append(record)
+            _emit_progress()
         return results
 
     def parse_line_range(spec: str, max_line: int) -> tuple[int, int]:
@@ -1294,6 +1324,15 @@ def _script_main() -> None:
         type=float,
         default=3600.0,
         help="Exit after this many seconds with no request, so a server cannot leak.",
+    )
+    parser.add_argument(
+        "--progress-file",
+        default="",
+        help=(
+            "Write {done,total,current_step,passed,failed} here after each step. "
+            "Lets `aitlc debug status` report progress while `debug start` is "
+            "still running its setup, instead of the run being a silent wait."
+        ),
     )
     args = parser.parse_args()
 

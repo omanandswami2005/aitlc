@@ -30,7 +30,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner
+from aitlc.core import behave_runner, chrome_cdp
 from aitlc.core.dotenv import load_dotenv
 from aitlc.runtime import attach
 
@@ -61,6 +61,28 @@ def _run(cmd: list[str], cwd: Path, env: dict[str, str], print_only: bool) -> No
     raise typer.Exit(code=proc.returncode)
 
 
+def _cdp_overrides(
+    config: AitlcConfig, *, enable: bool, explicit_url: str | None
+) -> tuple[dict[str, str], dict | None]:
+    """Env that attaches the suite to a live CDP browser, plus a note to log.
+
+    An explicit URL wins; otherwise, unless disabled, a running aitlc debug
+    Chrome (`aitlc cdp launch`) is reused so the suite attaches instead of
+    launching a fresh browser. A value already in the environment is left
+    untouched -- the caller asked for that one on purpose. Returns ({}, None)
+    when there is nothing to attach to, so a plain passthrough is unchanged.
+    """
+    env_name = config.playwright_cdp_env
+    if os.environ.get(env_name):
+        return {}, None
+    url = explicit_url
+    if url is None and enable:
+        url = chrome_cdp.resolve_live_cdp_url(config.root_dir)
+    if not url:
+        return {}, None
+    return {env_name: url}, {"cdp_attach": url, "via": env_name}
+
+
 @app.command(
     "behave",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
@@ -75,6 +97,18 @@ def behave_passthrough(
     ),
     events: Path | None = typer.Option(
         None, "--aitlc-events", help="Append a JSON-lines event per step to this file."
+    ),
+    cdp: bool = typer.Option(
+        True,
+        "--aitlc-cdp/--aitlc-no-cdp",
+        help=(
+            "Attach to a live CDP debug browser if one is running "
+            "(`aitlc cdp launch`), so behave reuses that Chrome instead of "
+            "launching a fresh one. On by default; a no-op when nothing runs."
+        ),
+    ),
+    cdp_url: str | None = typer.Option(
+        None, "--aitlc-cdp-url", help="Explicit CDP URL to attach to (overrides auto)."
     ),
     print_command: bool = typer.Option(
         False, "--print-command", help="Show the command instead of running it."
@@ -112,8 +146,12 @@ def behave_passthrough(
             err=True,
         )
 
+    cdp_over, cdp_note = _cdp_overrides(config, enable=cdp, explicit_url=cdp_url)
+    if cdp_note is not None:
+        typer.echo(json.dumps(cdp_note), err=True)
+
     cmd = [*base, *attach_plan.extra_args, *ctx.args]
-    _run(cmd, config.root_dir, attach_plan.env, print_command)
+    _run(cmd, config.root_dir, {**attach_plan.env, **cdp_over}, print_command)
 
 
 @app.command(
@@ -159,3 +197,66 @@ def playwright_passthrough(
         cmd = ["playwright", *ctx.args]
 
     _run(cmd, config.root_dir, {}, print_command)
+
+
+@app.command(
+    "paver", context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
+def paver_passthrough(
+    ctx: typer.Context,
+    env_file: str = typer.Option(".env", "--aitlc-env-file", help="Env file to load."),
+    cdp: bool = typer.Option(
+        True,
+        "--aitlc-cdp/--aitlc-no-cdp",
+        help=(
+            "Attach the suite to a live CDP debug browser if one is running "
+            "(`aitlc cdp launch`), so it reuses that Chrome instead of launching "
+            "a fresh one. On by default and a no-op when nothing is running."
+        ),
+    ),
+    cdp_url: str | None = typer.Option(
+        None, "--aitlc-cdp-url", help="Explicit CDP URL to attach to (overrides auto)."
+    ),
+    print_command: bool = typer.Option(
+        False, "--print-command", help="Show the command instead of running it."
+    ),
+) -> None:
+    """Run the project's `paver` tasks inside the project's environment.
+
+    `aitlc paver run parallel --local`, `aitlc paver build_hybrid_yaml` — the
+    project's own paver tasks, with `.env` loaded and the project interpreter
+    (`poetry run`) resolved, so they run the same way they do for the team.
+    Every argument is forwarded to paver untouched. Unless `--aitlc-no-cdp`, a
+    live debug Chrome is reused via the project's CDP env var, so a local sweep
+    attaches to the open browser instead of launching a fresh one per feature.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+
+    if not ctx.args:
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "no paver arguments given",
+                    "examples": [
+                        "aitlc paver run parallel --local",
+                        "aitlc paver build_hybrid_yaml",
+                        "aitlc paver <task>",
+                    ],
+                }
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    overrides, note = _cdp_overrides(config, enable=cdp, explicit_url=cdp_url)
+    if note is not None:
+        typer.echo(json.dumps(note), err=True)
+
+    cmd = [*behave_runner.resolve_poetry(), "run", "paver", *ctx.args]
+    _run(cmd, config.root_dir, overrides, print_command)
+
+
+# Mounted by commands/_registry.py. Empty name mounts these at the root as the
+# escape hatch (`aitlc behave ...`, `aitlc pw ...`). Ordered last.
+COMMAND = {"name": "", "attr": "app", "kind": "group", "order": 1000}

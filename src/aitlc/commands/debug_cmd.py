@@ -1,114 +1,110 @@
 """`aitlc debug ...` — an interactive session over one feature file.
 
-The pieces this drives already existed (`cdp launch`, `steps run --cdp-url`,
-`cdp inspect`, `run`). What did not exist was anything holding the *position*,
-so the natural thing to type after an edit was `aitlc run` again — a full
-scenario, minutes long, and on a suite that creates users and moves credits,
-destructive. This keeps one browser and one step index so `retry` is cheap and
-`certify` is the only thing that pays for a clean run.
+The engine is a real, paused behave run (`aitlc.runtime.runner:AitlcRunner` in
+gate mode). behave itself runs before_all/before_scenario and the setup steps,
+then parks at the target step holding the live Context and browser; `next` and
+`retry` advance/re-run REAL behave Step objects over a control socket. There is
+no reconstruction of behave's loop, so there is nothing to diverge from it:
+Examples binding, data tables, docstrings, run-scoped data and the project's
+own hooks are all behave's, because it IS behave.
 
 Verbs:
 
-    start <TEST-ID> [--at N]   launch an isolated browser, drive to step N
-    status                     where the session is, and its attempt history
-    retry                      re-run the current step in that browser
-    next                       advance one step and run it
-    inspect [--check ...]      read the live page
+    start <TEST-ID> [--at N]   launch an isolated browser, drive real behave to step N
+    status                     where the paused run is
+    retry                      re-run the current step (picks up an edit first)
+    next                       advance one real step
     certify [--times 2]        fresh instance, real feature, N passes required
     stop                       stop the browser and drop the session
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 import time
 import subprocess
 from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, step_console
+from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client
 from aitlc.core.dotenv import load_dotenv
-from aitlc.core.step_console import run_console
 from aitlc.core import workspace
+from aitlc.runtime import attach
 
 app = typer.Typer(help="Interactive debug session over one feature file.")
 
 
-def _slice_file(root_dir: Path, steps: list[str]) -> Path:
-    """Materialise steps as a parseable feature under the project's tree.
+def _gate_socket(root_dir: Path, test_id: str) -> Path:
+    """A short, collision-free socket path for this project + test.
 
-    Written inside the project rather than a temp dir because Behave resolves
-    its steps directory relative to the feature: a slice in /tmp dies with
-    "No steps directory", which is a confusing way to learn that.
+    A Unix socket path is capped near 104 bytes by the OS, so it goes in the
+    system temp dir with a hashed name rather than under a deeply nested
+    checkout (which fails at bind()).
     """
-    out = workspace.output_path(root_dir, ".aitlc", "debug", "_slice.feature")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    body = "\n".join(f"\t{s.strip()}" for s in steps)
-    out.write_text(
-        "Feature: aitlc debug slice\n\n\t@skip_login\n\tScenario: slice\n" + body + "\n"
-    )
-    return out
+    digest = hashlib.sha256(f"{Path(root_dir).resolve()}::{test_id}".encode()).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / f"aitlc-gate-{digest}.sock"
 
 
-def _run_steps(config, session: debug_session.DebugSession, steps: list[str]) -> dict:
-    """Dispatch a list of steps into the session's browser.
+def _aitlc_src() -> Path:
+    """The directory to put on PYTHONPATH so behave can import the runner."""
+    return Path(attach.__file__).resolve().parent.parent.parent
 
-    Prefers a persistent console when one is running: it holds the imported
-    step registry and, crucially, the same run-scoped data every step in the
-    session shares. Falls back to a one-shot process when it is not there, so
-    a missing optimisation never turns into a broken command.
+
+def _example_line(feature_text: str, example: int) -> int | None:
+    """1-based line of the Nth Examples data row, or None when there is none.
+
+    behave selects a single Scenario Outline row by FILE:LINE, so this is how a
+    debug session targets exactly the row it is meant to — the binding itself
+    is then behave's, which is the whole point (no placeholder guessing).
     """
-    if not steps:
-        return {"results": []}
+    lines = feature_text.splitlines()
+    ex = next((i for i, l in enumerate(lines) if l.strip().startswith("Examples")), None)
+    if ex is None:
+        return None
+    header_seen = False
+    seen = 0
+    for i in range(ex + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("|"):
+            break
+        if not header_seen:
+            header_seen = True
+            continue
+        if seen == example:
+            return i + 1
+        seen += 1
+    return None
 
-    socket_path = step_console.console_socket(config.root_dir, session.test_id)
-    try:
-        reply = step_console.request_steps(socket_path, steps)
-    except step_console.ConsoleUnavailable:
-        pass
-    else:
-        return {
-            **({"reloaded": reply["reloaded"]} if reply.get("reloaded") else {}),
-            "results": [
+
+def _default_id(config, test_id: str | None) -> str:
+    """Return test_id, or the project's default feature stem when none was given.
+
+    Lets every debug verb run with no argument in a single-feature project:
+    `debug start` defaults to the sole feature, and `next`/`retry`/`status`/
+    `stop` default to that same session key.
+    """
+    if test_id:
+        return test_id
+    resolved = config.default_feature_id()
+    if not resolved:
+        typer.echo(
+            json.dumps(
                 {
-                    "step": r.get("step", ""),
-                    "status": r.get("status", "failed"),
-                    "duration_s": r.get("duration_s", 0.0),
-                    "error": r.get("error"),
-                    "started_at": r.get("started_at", ""),
-                    "ended_at": r.get("ended_at", ""),
+                    "error": "no test id given and no feature found",
+                    "hint": f"pass a test id/path, or put one *.feature in "
+                    f"'{config.feature_dir}' (or set [project].default_feature)",
                 }
-                for r in reply.get("results", [])
-            ],
-            "stderr_tail": reply.get("error", ""),
-            "unhandled_events": [],
-            "via": "console",
-        }
-    slice_path = _slice_file(config.root_dir, steps)
-    result = run_console(
-        slice_path,
-        cwd=config.root_dir,
-        poetry_cmd=behave_runner.resolve_poetry(),
-        cdp_url=session.cdp_url,
-        scenario_setup=config.scenario_setup,
-        step_dir=config.step_dir,
-        browser_actions=config.browser_actions,
-        browser_factory=config.browser_factory,
-    )
-    return {
-        "results": [
-            {
-                "step": r.step,
-                "status": r.status,
-                "duration_s": r.duration_s,
-                "error": r.error,
-            }
-            for r in result.results
-        ],
-        "stderr_tail": result.stderr_tail,
-        "unhandled_events": result.unhandled_events,
-    }
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return resolved
 
 
 def _require(config, test_id: str) -> debug_session.DebugSession:
@@ -124,136 +120,213 @@ def _require(config, test_id: str) -> debug_session.DebugSession:
     return session
 
 
-def _launch_console(config, session) -> dict:
-    """Start the persistent step console for this session, detached.
-
-    Without this the console is unreachable code: `_run_steps` looks for a
-    socket, never finds one, and silently falls back to spawning a process per
-    step -- which is the slow *and* incorrect path the console exists to
-    replace. Nothing failed, which is exactly why it went unnoticed.
-
-    Detached and non-fatal: a session whose console will not start is still a
-    working session, just a slower one.
-    """
-    socket_path = step_console.console_socket(config.root_dir, session.test_id)
-    if step_console.console_is_alive(socket_path):
-        return {"started": False, "reason": "already running", "socket": str(socket_path)}
-
-    script = Path(step_console.__file__).resolve()
-    cmd = behave_runner.resolve_poetry() + [
-        "run",
-        "python3",
-        str(script),
-        str(session.feature),
-        "--serve",
-        str(socket_path),
-        "--step-dir",
-        config.step_dir,
-        "--cdp-url",
-        session.cdp_url,
-    ]
-    if config.scenario_setup:
-        cmd += ["--scenario-setup", config.scenario_setup]
-    else:
-        cmd.append("--allow-missing-setup")
-    if config.browser_actions:
-        cmd += ["--browser-actions", config.browser_actions]
-
-    log_path = workspace.ensure(config.root_dir, ".aitlc", "debug", "console.log")
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
     try:
-        with log_path.open("ab") as handle:
-            subprocess.Popen(
-                cmd,
-                cwd=config.root_dir,
-                stdout=handle,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-    except OSError as exc:
-        return {"started": False, "reason": f"{type(exc).__name__}: {exc}"}
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
-    # Wait briefly for it to bind; a console that is not listening yet would
-    # send the first retry down the fallback path for no reason.
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        if step_console.console_is_alive(socket_path):
-            return {"started": True, "socket": str(socket_path)}
-        time.sleep(0.5)
-    return {
-        "started": False,
-        "reason": "console did not begin listening in time",
-        "log": str(log_path),
+
+def _launch_gate(
+    config,
+    *,
+    feature: Path,
+    line: int | None,
+    at: int,
+    example: int,
+    cdp_url: str,
+    socket_path: Path,
+    progress_path: Path,
+    env_file: str,
+) -> int:
+    """Launch a detached, gated behave process; return its pid."""
+    behave_cmd = behave_runner.resolve_poetry() + ["run", "behave"]
+    work_dir = workspace.output_path(config.root_dir, ".aitlc", "debug", "_gate_site")
+    gate_env = {
+        "AITLC_GATE": "1",
+        "AITLC_GATE_SOCKET": str(socket_path),
+        "AITLC_GATE_AT": str(at),
+        "AITLC_GATE_EXAMPLE": str(example),
+        "AITLC_GATE_PROGRESS": str(progress_path),
+        # The suite attaches to the persistent debug Chrome via its own CDP env
+        # var, so the browser survives the gate's hard exit for inspection.
+        config.playwright_cdp_env: cdp_url,
     }
+    plan = attach.plan(
+        behave_cmd, config.root_dir, work_dir, aitlc_src=_aitlc_src(), gate_env=gate_env
+    )
+    target = f"{feature}:{line}" if line else str(feature)
+    cmd = [*behave_cmd, *plan.extra_args, "--no-capture", "--stop", target]
+
+    if socket_path.exists():
+        socket_path.unlink()
+    log_path = workspace.ensure(config.root_dir, ".aitlc", "debug", "gate.log")
+    with log_path.open("ab") as handle:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=config.root_dir,
+            env={**os.environ, **plan.env},
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    return proc.pid
+
+
+def _await_park(socket_path: Path, pid: int, timeout_s: float) -> dict | str:
+    """Wait for the gate to park. Returns the status dict, or a reason string."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _pid_alive(pid):
+            return "exited"  # behave stopped before parking (setup failed / crash)
+        try:
+            return gate_client.request(socket_path, "status")
+        except (gate_client.GateUnavailable, OSError):
+            time.sleep(0.25)
+    return "timeout"
 
 
 @app.command("start")
 def start(
-    test_id: str = typer.Argument(..., help="Test ID or feature file path."),
+    test_id: str = typer.Argument(
+        None,
+        help="Test ID or feature file path. Omit to use the project's default "
+        "feature ([project].default_feature, or the sole *.feature in feature_dir).",
+    ),
     at: int = typer.Option(
         0, "--at", help="Step index to park on (0-based). Steps before it are run."
     ),
     example: int = typer.Option(
-        0,
-        "--example",
-        help="Examples row to bind, 0-based. Scenario Outlines only.",
+        0, "--example", help="Examples row to run, 0-based. Scenario Outlines only."
     ),
     env_file: str = typer.Option(".env", "--env-file"),
     window_size: str = typer.Option(
         chrome_cdp.DESKTOP_WINDOW_SIZE,
         "--window-size",
-        help="Browser window as WIDTH,HEIGHT. Desktop by default, to match a "
-        "real run; pass a phone size for a mobile suite.",
+        help="Browser window as WIDTH,HEIGHT. Desktop by default; a phone size "
+        "for a mobile suite.",
+    ),
+    summary: bool = typer.Option(
+        False, "--summary", help="Emit a compact {parked_at, total_steps, ...} summary."
+    ),
+    background: bool = typer.Option(
+        False,
+        "--background",
+        help="Return immediately; the setup runs detached. Poll `debug status`.",
+    ),
+    timeout: float = typer.Option(
+        300.0, "--timeout", help="Seconds to wait for the run to park (foreground)."
     ),
 ) -> None:
-    """Launch an isolated browser and drive the feature to a step."""
+    """Launch an isolated browser and drive REAL behave to a step, then park."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
+    test_id = _default_id(config, test_id)
     feature = config.resolve_feature_path(test_id)
-    try:
-        steps = debug_session.feature_steps(
-            Path(feature).read_text(), example=example
-        )
-    except debug_session.ExampleBindingError as exc:
-        typer.echo(
-            json.dumps({"error": str(exc), "feature": str(feature)}), err=True
-        )
+    if feature is None:
+        typer.echo(json.dumps({"error": f"could not resolve feature for {test_id!r}"}), err=True)
         raise typer.Exit(code=2)
-    if not steps:
-        typer.echo(json.dumps({"error": f"no steps found in {feature}"}), err=True)
-        raise typer.Exit(code=2)
+    feature = Path(feature)
+    line = _example_line(feature.read_text(), example)
 
-    # Always a fresh, isolated browser: a long-lived shared profile accumulates
-    # sessions and eventually fails a run at the framework's own login, which
-    # reads as a test bug rather than a dirty profile.
-    instance, _reused = chrome_cdp.launch(
-        config.root_dir, port=None, window_size=window_size
+    socket_path = _gate_socket(config.root_dir, test_id)
+    progress_path = debug_session.progress_path(config.root_dir, test_id)
+
+    # A fresh, isolated debug Chrome the suite will attach to; it survives the
+    # gate's hard exit, so `stop` owns its teardown.
+    instance, _reused = chrome_cdp.launch(config.root_dir, port=None, window_size=window_size)
+
+    debug_session.write_progress(
+        config.root_dir, test_id,
+        {"state": "running", "test_id": test_id, "target": at, "done": 0,
+         "started_at": time.time()},
+    )
+    pid = _launch_gate(
+        config, feature=feature, line=line, at=at, example=example,
+        cdp_url=instance.cdp_url, socket_path=socket_path,
+        progress_path=progress_path, env_file=env_file,
     )
     session = debug_session.DebugSession(
-        test_id=test_id,
-        feature=str(feature),
-        cdp_url=instance.cdp_url,
-        port=instance.port,
-        steps=steps,
-        index=max(0, min(at, len(steps))),
-        example=example,
+        test_id=test_id, feature=str(feature), cdp_url=instance.cdp_url,
+        port=instance.port, example=example, socket=str(socket_path), pid=pid, park=at,
+        index=at,
     )
-    ran = _run_steps(config, session, session.slice_through(session.index))
     debug_session.save(config.root_dir, session)
-    # Start the console only once the browser is at the parked step: it
-    # attaches to that same browser and holds one set of run-scoped data from
-    # here on, which is what makes retry/next both fast and correct.
-    console_state = _launch_console(config, session)
+
+    if background:
+        typer.echo(
+            json.dumps(
+                {
+                    "background": True,
+                    "test_id": test_id,
+                    "cdp_url": instance.cdp_url,
+                    "poll": f"aitlc debug status {test_id}",
+                    "progress_file": str(progress_path),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    outcome = _await_park(socket_path, pid, timeout)
+    if outcome == "exited":
+        # behave --stop aborts on a failed setup step: the gate never parked.
+        # This is the faithful "parked on a broken precondition" signal (G46).
+        log = workspace.output_path(config.root_dir, ".aitlc", "debug", "gate.log")
+        tail = ""
+        try:
+            tail = "\n".join(log.read_text().splitlines()[-15:])
+        except OSError:
+            pass
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "setup did not reach the park point",
+                    "reason": "a setup step failed (behave --stop aborted) or the run crashed",
+                    "test_id": test_id,
+                    "log_tail": tail,
+                },
+                indent=2,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if outcome == "timeout":
+        typer.echo(
+            json.dumps({"error": f"run did not park within {timeout}s", "test_id": test_id}),
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    status_reply = outcome
+    if summary:
+        typer.echo(
+            json.dumps(
+                {
+                    "test_id": test_id,
+                    "cdp_url": instance.cdp_url,
+                    "parked_at": status_reply.get("index"),
+                    "total_steps": status_reply.get("total"),
+                    "setup_passed": status_reply.get("index"),
+                    "setup_failed": 0,
+                },
+                indent=2,
+            )
+        )
+        return
     typer.echo(
         json.dumps(
             {
                 "test_id": test_id,
-                "cdp_url": session.cdp_url,
-                "total_steps": len(steps),
-                "parked_at": session.index,
-                "console": console_state,
-                "current_step": (session.current or "").strip(),
-                "setup": ran["results"],
+                "cdp_url": instance.cdp_url,
+                "engine": "behave-gate",
+                "parked_at": status_reply.get("index"),
+                "total_steps": status_reply.get("total"),
+                "current_step": status_reply.get("current_step"),
             },
             indent=2,
         )
@@ -261,125 +334,127 @@ def start(
 
 
 @app.command("status")
-def status(test_id: str = typer.Argument(...)) -> None:
-    """Show where the session is and every attempt so far."""
+def status(test_id: str = typer.Argument(None)) -> None:
+    """Show where the paused run is."""
     config = AitlcConfig.find_and_load()
-    session = _require(config, test_id)
-    typer.echo(
-        json.dumps(
-            {
-                "test_id": session.test_id,
-                "cdp_url": session.cdp_url,
-                "parked_at": session.index,
-                "total_steps": len(session.steps),
-                "current_step": (session.current or "").strip(),
-                "finished": session.finished,
-                "attempts_here": [
-                    {"status": a.status, "step": a.step}
-                    for a in session.attempts_for_current()
-                ],
-            },
-            indent=2,
-        )
-    )
-
-
-def _run_current(config, session, advance: bool) -> None:
-    # Pick up an edit to the Gherkin before deciding which step to run. The
-    # session held the list parsed when it started, so without this `retry`
-    # re-runs text that may no longer be in the file.
-    resynced: dict = {}
-    try:
-        resynced = debug_session.resync(session, Path(session.feature).read_text())
-    except OSError:
-        resynced = {}
-    if resynced.get("feature_reloaded"):
-        debug_session.save(config.root_dir, session)
-
-    if session.finished:
-        typer.echo(json.dumps({"done": True, "message": "no steps left"}))
-        return
-    # `start --at N` parks *on* step N without running it, so the first `next`
-    # used to advance to N+1 and silently skip N entirely. Every later step
-    # that depended on it then failed, and the session looked like the app was
-    # broken -- confirmed live: parking at "Open Admin Panel" and stepping
-    # forward left the panel closed, so three admin steps failed in a row.
-    #
-    # "next" means move forward through the scenario. If the step under the
-    # cursor has never been attempted, running it *is* moving forward.
-    if advance and session.attempts_for_current():
-        session.advance()
-        if session.finished:
-            debug_session.save(config.root_dir, session)
-            typer.echo(json.dumps({"done": True, "message": "reached the end"}))
+    test_id = _default_id(config, test_id)
+    session = debug_session.load(config.root_dir, test_id)
+    if session is not None and session.socket:
+        try:
+            reply = gate_client.request(session.socket, "status")
+            typer.echo(
+                json.dumps(
+                    {
+                        "test_id": test_id,
+                        "cdp_url": session.cdp_url,
+                        "parked_at": reply.get("index"),
+                        "total_steps": reply.get("total"),
+                        "current_step": reply.get("current_step"),
+                        "finished": reply.get("finished"),
+                    },
+                    indent=2,
+                )
+            )
             return
-    step = session.current or ""
-    # A lone And/But cannot open a parsed block, exactly as in slice_through.
-    # Without this the console silently returns nothing and the step reads as
-    # failed -- roughly half of real feature lines start with a continuation.
-    runnable = debug_session.promote_leading_continuation([step])
-    out = _run_steps(config, session, runnable)
-    results = out.get("results") or []
+        except (gate_client.GateUnavailable, OSError):
+            pass  # gate not up yet, or already gone -- fall through to progress
 
-    # Three outcomes, not two. An empty result list means the console never ran
-    # the step; reporting that as "failed" sends the user to fix working code.
-    if results:
-        status_ = results[0]["status"]
-    else:
-        status_ = "not_run"
+    progress = debug_session.read_progress(config.root_dir, test_id)
+    if progress is not None:
+        out = {"test_id": test_id, "in_progress": True, **progress}
+        if "started_at" in progress:
+            out["elapsed_s"] = round(time.time() - progress["started_at"], 1)
+        typer.echo(json.dumps(out, indent=2))
+        return
+    typer.echo(
+        json.dumps({"error": f"no debug session for {test_id}; run `debug start` first"}),
+        err=True,
+    )
+    raise typer.Exit(code=2)
 
-    session.record(status_)
-    debug_session.save(config.root_dir, session)
-    payload = {
-        "step": step.strip(),
-        "index": session.index,
-        "status": status_,
-        "attempts_here": len(session.attempts_for_current()),
-    }
-    if results:
-        payload["error"] = results[0]["error"]
-    else:
-        payload["message"] = (
-            "the step console produced no result -- the step did not run. "
-            "This is not a step failure."
+
+def _drive(config, test_id: str, cmd: str) -> None:
+    """Send one stepping command to the gate and report the reply."""
+    session = _require(config, test_id)
+    if not session.socket:
+        typer.echo(json.dumps({"error": "session has no gate socket"}), err=True)
+        raise typer.Exit(code=2)
+    try:
+        # Pick up an edited step definition AND a Gherkin edit before running:
+        # `retry`/`next` must mean "run this again with my change" — for both
+        # Python and the feature file — not against a stale parse.
+        reload_reply = gate_client.request(session.socket, "reload", step_dir=config.step_dir)
+        reply = gate_client.request(session.socket, cmd)
+    except (gate_client.GateUnavailable, OSError):
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "the paused run is no longer reachable",
+                    "hint": "it may have been stopped or have exited; run `debug start` again",
+                }
+            ),
+            err=True,
         )
-    if out.get("stderr_tail"):
-        payload["stderr_tail"] = out["stderr_tail"]
-    if out.get("unhandled_events"):
-        payload["unhandled_events"] = out["unhandled_events"]
-    typer.echo(json.dumps(payload, indent=2))
-    raise typer.Exit(code=0 if status_ == "passed" else 1)
+        raise typer.Exit(code=3)
+
+    if isinstance(reload_reply, dict) and reload_reply.get("feature"):
+        # A Gherkin edit was picked up: report how the cursor moved.
+        reply["feature"] = reload_reply["feature"]
+    if reply.get("index") is not None:
+        session.index = reply["index"]
+        debug_session.save(config.root_dir, session)
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
 
 
 @app.command("retry")
 def retry(
-    test_id: str = typer.Argument(...),
+    test_id: str = typer.Argument(None),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
-    """Re-run the current step after an edit, without restarting the scenario."""
+    """Re-run the current step (picking up an edit), without advancing."""
     config = AitlcConfig.find_and_load()
-    # Without this the step modules fail to import for want of config, every
-    # step resolves as "undefined", and the run reports a failure that never
-    # happened. `start` loaded it; `retry`/`next` did not, so a session worked
-    # until the first re-run and then reported nonsense.
     load_dotenv(config.root_dir / env_file)
-    _run_current(config, _require(config, test_id), advance=False)
+    _drive(config, _default_id(config, test_id), "retry")
 
 
 @app.command("next")
 def next_step(
-    test_id: str = typer.Argument(...),
+    test_id: str = typer.Argument(None),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
-    """Advance one step and run it, keeping the state you already have."""
+    """Advance one real behave step and run it, keeping the live state."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
-    _run_current(config, _require(config, test_id), advance=True)
+    _drive(config, _default_id(config, test_id), "next")
+
+
+@app.command("stop")
+def stop(test_id: str = typer.Argument(None)) -> None:
+    """Stop the paused run and its browser, and drop the session."""
+    config = AitlcConfig.find_and_load()
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    gate_stopped = False
+    if session.socket:
+        try:
+            gate_client.request(session.socket, "stop")
+            gate_stopped = True
+        except (gate_client.GateUnavailable, OSError):
+            pass
+    stopped = chrome_cdp.stop_all(config.root_dir)
+    debug_session.clear(config.root_dir, test_id)
+    debug_session.clear_progress(config.root_dir, test_id)
+    typer.echo(
+        json.dumps(
+            {"gate_stopped": gate_stopped, "stopped_ports": stopped, "session_cleared": True}
+        )
+    )
 
 
 @app.command("certify")
 def certify(
-    test_id: str = typer.Argument(...),
+    test_id: str = typer.Argument(None),
     times: int = typer.Option(
         2,
         "--times",
@@ -396,6 +471,7 @@ def certify(
     """
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
+    test_id = _default_id(config, test_id)
     session = debug_session.load(config.root_dir, test_id)
     feature = session.feature if session else str(config.resolve_feature_path(test_id))
 
@@ -429,86 +505,6 @@ def certify(
         )
     )
     raise typer.Exit(code=0 if certified else 1)
-
-
-@app.command("stop")
-def stop(test_id: str = typer.Argument(...)) -> None:
-    """Stop the session's browser and drop the session."""
-    config = AitlcConfig.find_and_load()
-    _require(config, test_id)  # refuse politely when there is nothing to stop
-    # Stop the console before the browser: it holds a live connection to it,
-    # and tearing the browser out from under it produces a confusing error
-    # from a process that is about to be shut down anyway.
-    console_stopped = step_console.stop_console(
-        step_console.console_socket(config.root_dir, test_id)
-    )
-    stopped = chrome_cdp.stop_all(config.root_dir)
-    debug_session.clear(config.root_dir, test_id)
-    typer.echo(
-        json.dumps(
-            {
-                "stopped_ports": stopped,
-                "console_stopped": console_stopped,
-                "session_cleared": True,
-            }
-        )
-    )
-
-
-@app.command("console")
-def console(
-    test_id: str = typer.Argument(...),
-    stop_it: bool = typer.Option(False, "--stop", help="Shut the console down."),
-    start_it: bool = typer.Option(
-        False,
-        "--start",
-        help="Start one for an existing session, without re-running its setup.",
-    ),
-    env_file: str = typer.Option(".env", "--env-file"),
-) -> None:
-    """Report (or stop) the session's persistent step console.
-
-    The console is what makes `retry`/`next` fast and, more importantly,
-    correct: it holds one set of run-scoped data, where a process per step
-    regenerates it and leaves later steps waiting for names that never
-    existed.
-    """
-    config = AitlcConfig.find_and_load()
-    socket_path = step_console.console_socket(config.root_dir, test_id)
-    if start_it:
-        # Without this, a console that died left no way back except `start`,
-        # which re-runs every setup step -- the exact cost the console exists
-        # to avoid paying twice.
-        #
-        # The env file has to be loaded here for the same reason retry/next
-        # need it: the console is a child process that inherits this
-        # environment, and without it every step module fails to import, the
-        # scenario setup that mints the run-scoped values raises, and the
-        # console dies before it ever listens. `start` loaded it and this
-        # path did not, which is exactly the shape of the earlier bug.
-        load_dotenv(config.root_dir / env_file)
-        session = _require(config, test_id)
-        typer.echo(json.dumps(_launch_console(config, session), indent=2))
-        return
-    if stop_it:
-        typer.echo(
-            json.dumps({"stopped": step_console.stop_console(socket_path)})
-        )
-        return
-    alive = step_console.console_is_alive(socket_path)
-    typer.echo(
-        json.dumps(
-            {
-                "alive": alive,
-                "socket": str(socket_path),
-                "note": (
-                    "steps run in one process, sharing run-scoped data"
-                    if alive
-                    else "no console; retry/next spawn a process per step"
-                ),
-            }
-        )
-    )
 
 
 @app.command("checkpoint")
@@ -663,3 +659,7 @@ def checkpoints_cmd(
         row["usable"] = not record.is_stale(ttl)
         rows.append(row)
     typer.echo(json.dumps({"count": len(rows), "checkpoints": rows}, indent=2))
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "debug", "attr": "app", "kind": "group", "order": 140}

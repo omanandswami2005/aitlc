@@ -154,3 +154,7 @@ def show(trace_zip: Path = typer.Argument(..., exists=True)) -> None:
         raise typer.Exit(code=2)
     proc = subprocess.run([playwright_bin, "show-trace", str(trace_zip)])
     raise typer.Exit(code=proc.returncode)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "trace", "attr": "app", "kind": "group", "order": 170}

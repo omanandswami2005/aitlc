@@ -314,3 +314,7 @@ def fetch_features(
     )
     typer.echo(json.dumps(result.to_dict(), indent=2))
     raise typer.Exit(code=0 if result.passed else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "xray", "attr": "app", "kind": "group", "order": 100}

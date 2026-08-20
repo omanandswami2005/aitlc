@@ -99,3 +99,7 @@ def record(
             indent=2,
         )
     )
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "record", "attr": "record", "order": 60}

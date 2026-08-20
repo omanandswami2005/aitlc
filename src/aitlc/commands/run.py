@@ -107,7 +107,11 @@ def _resolve_platform_environment(
 
 
 def run(
-    test_id: str = typer.Argument(..., help="Test ID or feature file path."),
+    test_id: str = typer.Argument(
+        None,
+        help="Test ID or feature file path. Omit to use the project's default "
+        "feature ([project].default_feature, or the sole *.feature in feature_dir).",
+    ),
     tags: str | None = typer.Option(None, help="Run only scenarios with this tag."),
     name: str | None = typer.Option(
         None, help="Run only scenarios matching this name."
@@ -191,10 +195,55 @@ def run(
     cdp_port: int = typer.Option(
         chrome_cdp.DEFAULT_PORT, "--cdp-port", help="Port for --debug's Chrome."
     ),
+    window_size: str = typer.Option(
+        "",
+        "--window-size",
+        help=(
+            "Debug Chrome window as WIDTH,HEIGHT (with --debug). Mirrors "
+            "`debug start`: desktop by default, so a desktop scenario is not "
+            "silently driven at a phone viewport; pass a phone size, or use "
+            "--mobile, for a mobile suite."
+        ),
+    ),
+    cdp: bool = typer.Option(
+        True,
+        "--cdp/--no-cdp",
+        help=(
+            "Reuse a live CDP debug browser if one is running (from "
+            "`aitlc cdp launch` or a prior `run --debug`), so the suite ATTACHES "
+            "to the already-open Chrome instead of launching a fresh browser "
+            "every run. On by default and a no-op when nothing is running; "
+            "--no-cdp forces a fresh browser. Ignored with --remote/--debug."
+        ),
+    ),
+    cdp_url: str | None = typer.Option(
+        None,
+        "--cdp-url",
+        help=(
+            "Attach the suite to this explicit CDP URL (e.g. "
+            "http://127.0.0.1:9222), overriding auto-detection. Ignored with "
+            "--remote/--debug."
+        ),
+    ),
 ) -> None:
     """Run one feature file and report structured results."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
+
+    if not test_id:
+        test_id = config.default_feature_id()
+        if not test_id:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "no test id given and no feature found",
+                        "hint": f"pass a test id/path, or put one *.feature in '{config.feature_dir}' "
+                        "(or set [project].default_feature)",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
     # Split behave's `FILE:LINE` BEFORE resolution — resolve_feature_path()
     # runs the id through Path(...).stem, which silently swallows a
@@ -302,11 +351,20 @@ def run(
             )
             raise typer.Exit(code=2)
         try:
-            instance, _reused = chrome_cdp.launch(config.root_dir, port=cdp_port)
+            # Resolve the debug window: an explicit --window-size wins;
+            # otherwise a mobile run gets the phone default and everything else
+            # gets desktop -- so `run --debug` no longer forces a 375x812
+            # viewport on a desktop scenario with no way to opt out (G45).
+            resolved_window = window_size or (
+                chrome_cdp.DEFAULT_WINDOW_SIZE if mobile else chrome_cdp.DESKTOP_WINDOW_SIZE
+            )
+            instance, _reused = chrome_cdp.launch(
+                config.root_dir, port=cdp_port, window_size=resolved_window
+            )
         except chrome_cdp.ChromeCdpError as exc:
             typer.echo(json.dumps({"error": str(exc)}), err=True)
             raise typer.Exit(code=2) from exc
-        remote_env["PLAYWRIGHT_CDP_URL"] = instance.cdp_url
+        remote_env[config.playwright_cdp_env] = instance.cdp_url
         # Claim the profile, so the next run against it can say who was here.
         chrome_cdp.mark_driven(config.root_dir, instance.port, base_test_id)
 
@@ -330,6 +388,26 @@ def run(
             ),
             err=True,
         )
+
+    # Reuse a live CDP browser for a normal run, so a plain `aitlc run` attaches
+    # to the already-open Chrome instead of launching a fresh one every time —
+    # the single biggest source of repeated full-setup cost. --debug (above) and
+    # --remote own the browser themselves, so this only applies to a plain run.
+    # An explicit --cdp-url always wins; otherwise, unless --no-cdp, a running
+    # tracked instance is reused. A value already in the environment is never
+    # overridden (the caller set that one on purpose).
+    if not debug and not remote:
+        env_name = config.playwright_cdp_env
+        chosen: str | None = None
+        if cdp_url:
+            chosen = cdp_url
+        elif cdp and not os.environ.get(env_name):
+            chosen = chrome_cdp.resolve_live_cdp_url(config.root_dir)
+        if chosen:
+            remote_env[env_name] = chosen
+            typer.echo(
+                json.dumps({"cdp_attach": chosen, "via": env_name}), err=True
+            )
 
     safe_test_id = test_id.replace("/", "_").replace(":", "_")
     status_path = (
@@ -444,3 +522,7 @@ def run(
     )
 
     raise typer.Exit(code=0 if result.passed else 1)
+
+
+# Mounted by commands/_registry.py (see that module for the convention).
+COMMAND = {"name": "run", "attr": "run", "order": 10}

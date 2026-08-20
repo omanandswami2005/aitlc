@@ -444,3 +444,7 @@ def run(
     ]
     typer.echo(redact_text(json.dumps(summary, indent=2), secret_values))
     raise typer.Exit(code=0 if not failed else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "parallel", "attr": "app", "kind": "group", "order": 200}

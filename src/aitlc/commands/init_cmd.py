@@ -117,3 +117,8 @@ def init(
             ),
             err=True,
         )
+
+
+# Mounted by commands/_registry.py. Mounted as a plain command (not its own
+# `app` group), preserving `aitlc init` rather than `aitlc init init`.
+COMMAND = {"name": "init", "attr": "init", "order": 30}

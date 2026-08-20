@@ -145,6 +145,24 @@ def list_instances(root_dir: Path) -> list[dict]:
     return instances
 
 
+def resolve_live_cdp_url(root_dir: Path) -> str | None:
+    """Return the CDP URL of a tracked instance that is actually running, or None.
+
+    Lets a command reuse a browser that `aitlc cdp launch` (or a prior
+    `run --debug`) already started, instead of launching a fresh one. Only
+    instances that answer a live CDP probe are considered -- a stale state file
+    is not a running browser, and returning its URL would produce exactly the
+    unexplained ECONNREFUSED this module exists to prevent. When more than one
+    is live, the highest port wins (fresh ports come from `free_port`, so that
+    is the most recently launched).
+    """
+    running = [i for i in list_instances(root_dir) if i.get("running")]
+    if not running:
+        return None
+    newest = max(running, key=lambda i: int(i.get("port", 0)))
+    return newest["cdp_url"]
+
+
 def _looks_like_our_chrome(instance: CdpInstance) -> bool:
     """Check whether `instance.pid` is still our Chrome for this port.
 

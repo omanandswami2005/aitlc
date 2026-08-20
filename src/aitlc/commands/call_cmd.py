@@ -58,3 +58,7 @@ def call(
     )
     typer.echo(json.dumps(record, indent=2))
     raise typer.Exit(code=0 if record.get("event") == "call_result" else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "call", "attr": "app", "kind": "group", "order": 120}

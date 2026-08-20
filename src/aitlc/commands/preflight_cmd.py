@@ -25,7 +25,11 @@ DEFAULT_HOOK_TAGS = ["skip_login", "freemium_user", "trial_user", "subscription_
 @app.callback(invoke_without_command=True)
 def preflight(
     ctx: typer.Context,
-    test_id: str = typer.Argument(..., help="Test ID or path to a .feature file."),
+    test_id: str = typer.Argument(
+        None,
+        help="Test ID or path to a .feature file. Omit to use the project's "
+        "default feature ([project].default_feature, or the sole *.feature in feature_dir).",
+    ),
     hook_tag: list[str] = typer.Option(
         [],
         "--hook-tag",
@@ -36,6 +40,20 @@ def preflight(
     if ctx.invoked_subcommand:
         return
     config = AitlcConfig.find_and_load()
+    if not test_id:
+        test_id = config.default_feature_id()
+        if not test_id:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "no test id given and no feature found",
+                        "hint": f"pass a test id/path, or put one *.feature in "
+                        f"'{config.feature_dir}' (or set [project].default_feature)",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
     candidate = Path(test_id)
     path = candidate if candidate.suffix == ".feature" else config.resolve_feature_path(test_id)
@@ -52,3 +70,7 @@ def preflight(
     # Non-zero when something would genuinely run differently, so this can gate
     # a script that is about to claim "reproduced locally".
     raise typer.Exit(code=0 if report.faithful else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "preflight", "attr": "app", "kind": "group", "order": 130}

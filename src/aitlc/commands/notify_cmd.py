@@ -79,3 +79,7 @@ def notify_teams(
         )
 
     raise typer.Exit(code=0 if passed_count == len(runs) else 1)
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "notify-teams", "attr": "notify_teams", "order": 90}

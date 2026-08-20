@@ -3,9 +3,62 @@
 What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-**Tracker: 44 of 44 closed.** Every row below came
-from a real debugging session that the tool made harder than it needed to be;
-none of them are speculative features.
+**Tracker: 48 of 48 gaps closed.** v0.5.0 closed the four gaps (G45–G48) raised
+against 0.4.0. v0.6.0 is an architecture release, below. Every row came from a
+real debugging session that the tool made harder than it needed to be; none of
+them are speculative features.
+
+## v0.6.0 — the fast loop is real behave (architecture)
+
+The debug fast-loop no longer reconstructs behave's run loop; it drives a real,
+paused behave process and single-steps it. The gaps that were divergences of a
+reimplementation (G34 Examples binding, G37 run-scoped data, G46 tables /
+docstrings, G18 hooks / collectors, G39 provenance) cannot recur, because there
+is nothing left to reconstruct: behave binds the example row, mints run-scoped
+data once, parses the tables, and fires the project's own hooks.
+
+- **Gated runner.** `aitlc.runtime.runner:AitlcRunner` gained a gate mode:
+  behave runs `before_all`/`before_scenario` and the setup steps, then parks at
+  the target step holding the live Context and browser, and advances / re-runs
+  REAL behave `Step` objects over a control socket. Attached through behave's
+  own `--runner` option (version-probed, with the sitecustomize fallback).
+- **`debug` is gate-only.** `start`/`next`/`retry`/`status`/`stop` drive the
+  paused process (`core/gate_client.py`). One engine, one path.
+- **Deleted, not kept as a fallback.** The step-console reconstruction that
+  `debug` used (`_slice_file`, `_run_steps`, `_launch_console`, the `console`
+  command) and the superseded parsing/arithmetic in `core/debug_session.py`
+  (`feature_steps`, Examples binding, slice/resync/attempt bookkeeping) are
+  gone. `core/step_console.py` remains only as the backend for `steps run` and
+  `call`, which are separate features, not a debug fallback.
+- **Verified against real behave**, not mocks: `test_gate_runner.py` drives a
+  genuine behave process (park/next/retry/failed/stop) and proves pause-on-
+  failure halts before teardown; `test_debug_gate.py` drives the same through
+  the `aitlc debug` commands end to end. This differential-style check is the
+  one test that mechanically catches the whole class of divergence.
+- **Suite guidance for the target suite:** aitlc supplies pause-on-failure via
+  its runner (`AITLC_PAUSE_ON_FAILURE`), so a project needs no `after.py` edit
+  to keep the browser on a failed step.
+
+## v0.5.0 — delivered
+
+Four gaps found while running the shipped 0.4.0, all in the `debug` session
+path — the workflow 0.3.0/0.4.0 built out, now exercised hard enough to show
+where it still diverged from a real behave run or hid what it was doing. Theme
+of the release: **debug-session fidelity and progress visibility.** Sourced from
+`aitlc-gaps.md` (the entries tagged `aitlc 0.4.0`). All four are **done** — see
+Closed below.
+
+| # | Item | Shipped |
+|---|---|---|
+| G46 | data table lost in a debug slice; a failed setup step did not stop/flag the batch | `feature_steps` keeps each step's table/docstring; slice + console reattach it (verified against real behave); `debug start` flags `setup_failed`, `debug status` surfaces it. |
+| G45 | `run --debug` forced a mobile viewport with no opt-out | `run --window-size` (desktop default, phone with `--mobile`), threaded to `chrome_cdp.launch`. |
+| G47 | `debug start` had no `--failures-only` / `--summary` | Both added as filters over the already-computed setup output. |
+| G48 | `debug start` blocked with zero progress visibility | Per-step progress file; `debug status` reads it mid-flight; `--background` returns a poll handle immediately. |
+
+Every one landed with a test that exercises the real boundary — the data table
+actually crossing into the slice via real `parse_steps`/`parse_file` (G46), the
+real `chrome_cdp.launch` window size (G45) — not a fake asserting itself.
+G33/G44 are why.
 
 ## Open
 
@@ -20,6 +73,10 @@ that one of them fully delivers:
 
 | # | Gap | Resolution |
 |---|---|---|
+| G45 | `run --debug` forced a mobile viewport with no opt-out | `run --window-size`; the debug launch defaults to desktop, or a phone size under `--mobile`. |
+| G47 | `debug start` had no `--failures-only` / `--summary` | Both are filters over the already-computed setup output; full output stays the default. |
+| G48 | `debug start` blocked with no progress visibility | Per-step progress file written by the step console; `debug status` reads it while a start is still running; `--background` returns a poll handle immediately. |
+| G46 | a step's data table was lost in a debug slice, and a failed setup step did not stop/flag the batch | `feature_steps` keeps each step's table/docstring as a multi-line block; the console (`parse_steps`) and one-shot slice (`parse_file`) reattach it, verified against real behave. `debug start` records `setup_failures` and flags `setup_failed` + a warning; `debug status` surfaces them. |
 | G1 | `steps run` swallowed the child's stderr | `stderr_tail` is carried on every console result. |
 | G2 | `init` could not detect three needed settings | `init` probes for browser factory / actions / scenario setup. |
 | G4 | no output until `steps run` finishes | `live_status` writes progress continuously. |

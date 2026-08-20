@@ -134,3 +134,7 @@ def report(
 
     out.write_text(_render_page(entries))
     typer.echo(f"Wrote {out}")
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "report", "attr": "report", "order": 50}

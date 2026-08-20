@@ -273,6 +273,7 @@
     <h2>Contents</h2>
     <ol>
       <li><a href="#setup">Setup</a></li>
+      <li><a href="#env">Environment &amp; .env</a></li>
       <li><a href="#independent">Codebase independence</a></li>
       <li><a href="#running">Running tests</a></li>
       <li><a href="#running" class="sub">run · parallel · focus</a></li>
@@ -345,7 +346,8 @@ jira_xray_client_secret = "JIRA_XRAY_CLIENT_SECRET"</code></pre>
                 <tr><td><code>name</code></td><td class="yes">auto</td><td>Labels output only.</td></tr>
                 <tr><td><code>issue_key_prefix</code></td><td class="yes">auto</td><td>Lets you type <code>1234</code> instead of <code>PROJ-1234</code>.</td></tr>
                 <tr><td><code>feature_dir</code></td><td class="yes">auto</td><td>Bare-ID resolution searches here, recursively.</td></tr>
-                <tr><td><code>step_dir</code></td><td class="yes">auto</td><td>Feeds <code>steps unused</code> and the step console's registry.</td></tr>
+                <tr><td><code>default_feature</code></td><td class="no">manual</td><td>Feature to use when a command is given no id/path. Unset &rarr; the sole <code>*.feature</code> in <code>feature_dir</code>.</td></tr>
+                <tr><td><code>step_dir</code></td><td class="yes">auto</td><td>Feeds <code>steps unused</code> and behave's step registry (used by <code>debug</code> and <code>steps run</code>).</td></tr>
                 <tr><td><code>locators_dir</code></td><td class="yes">auto</td><td><code>record --suggest-steps</code> uses it to tell a newly recorded selector from one you already have.</td></tr>
                 <tr><td><code>scenario_setup</code></td><td class="yes">auto</td><td>Makes <code>steps run</code> slices work on data-dependent steps.</td></tr>
                 <tr><td><code>browser_actions</code></td><td class="no">manual</td><td>The class assigned to <code>context.browser</code> in a step slice. Without it the raw <code>Page</code> is used, and steps written against a wrapper fail on their first call.</td></tr>
@@ -362,6 +364,25 @@ jira_xray_client_secret = "JIRA_XRAY_CLIENT_SECRET"</code></pre>
 aitlc run &lt;TEST-ID&gt; --dry-run   <span class="c"># steps resolve, no browser</span></code></pre>
           <p><code>--dry-run</code> is the cheapest real signal that config, paths and step imports are all correct.</p>
         </div>
+      </div>
+    </section>
+
+    <section id="env">
+      <h2 class="sec">Environment &amp; <code>.env</code></h2>
+      <p class="sec-note">Every <code>aitlc</code> command loads a <code>.env</code> before it does anything, and every tool it launches &mdash; behave, <code>paver</code>, Playwright, the debug gate &mdash; inherits it. You do <strong>not</strong> <code>export</code> a wall of variables first; that was only necessary when running <code>poetry run paver …</code> (or behave) <em>directly</em>, outside aitlc.</p>
+
+      <div class="cmd">
+        <span class="cmd-name mono">.env is loaded for you, then inherited by the child process</span>
+<pre><code>aitlc paver run parallel --local     <span class="c"># loads ./.env, then runs paver with it inherited</span>
+aitlc run PROJ-1234                  <span class="c"># same — .env reaches behave</span>
+poetry run paver run parallel        <span class="c"># NOT through aitlc: nothing loads .env here</span></code></pre>
+        <ul class="tight">
+          <li><strong>Which file.</strong> <code>./.env</code> at the project root (where <code>aitlc.toml</code> lives). Override per command with <code>--env-file</code> (<code>run</code>, <code>debug</code>, …) or <code>--aitlc-env-file</code> (the <code>paver</code> / <code>behave</code> / <code>pw</code> pass-throughs).</li>
+          <li><strong>Your shell always wins.</strong> A variable already set in the environment is never overwritten, so <code>export FOO=x</code> or <code>FOO=x aitlc …</code> still overrides <code>.env</code>. Precedence, most-wins first: the shell, then <code>.env</code>.</li>
+          <li><strong>Plain <code>KEY=value</code> only.</strong> <code>#</code> comments and surrounding quotes are handled; there is no shell interpolation (<code>${VAR}</code>) and no <code>export&nbsp;</code> prefix &mdash; write <code>LT_USERNAME=abc</code>, not <code>export LT_USERNAME=abc</code>.</li>
+          <li><strong>No placeholder resolution.</strong> aitlc reads literal values. If your <code>.env</code> still holds <code>AWS_SECRET:…</code>-style placeholders, resolve them into a real file first (e.g. <code>fetch-secrets --template .env.tmpl --output .env</code>), then the value is picked up.</li>
+        </ul>
+        <div class="callout"><p>The manual <code>export</code> block is gone: put resolved <code>KEY=value</code> pairs in <code>./.env</code> and run through <code>aitlc</code>. Override one run inline &mdash; <code>DEVICE_NAME=MOBILE_DEVICE aitlc paver run parallel --local</code>.</p></div>
       </div>
     </section>
 
@@ -392,7 +413,7 @@ aitlc run &lt;TEST-ID&gt; --dry-run   <span class="c"># steps resolve, no browse
 
     <section id="running">
       <h2 class="sec">Running tests</h2>
-      <p class="sec-note">Bare test IDs resolve recursively, so you never need a full path — and never need to tag other features to narrow a run.</p>
+      <p class="sec-note">Bare test IDs resolve recursively, so you never need a full path — and never need to tag other features to narrow a run. <strong>Omit the id entirely</strong> and aitlc uses the project's default feature (the sole <code>*.feature</code> in <code>feature_dir</code>, or <code>[project].default_feature</code>): a single-feature project just runs <code>aitlc run</code> / <code>debug start</code> / <code>steps run</code> / <code>preflight</code> with no argument (and <code>debug next</code>/<code>retry</code>/<code>status</code>/<code>stop</code> default to that session). It still goes through real behave, so skips and Xray tags are respected; a path or id always wins.</p>
 
       <div class="cmd">
         <span class="cmd-name mono">aitlc run &lt;TEST-ID&gt;</span>
@@ -450,6 +471,7 @@ aitlc debug certify PROJ-7449 --times 2   <span class="c"># 5. fresh instance, r
           <li><strong><code>debug start</code> always launches an isolated browser.</strong> A CDP attach reuses an existing browser context, so a long-lived profile keeps its sessions and eventually fails a run at your project's own login — a failure that reads as a test bug.</li>
           <li><strong><code>retry</code> re-runs one step, not the scenario.</strong> After a fix, the state you already have is worth more than a clean start.</li>
           <li><strong><code>certify</code> is separate and defaults to two passes.</strong> One pass does not disprove a race.</li>
+          <li><strong><code>debug</code> is a real, paused behave run.</strong> behave runs the setup and parks; <code>next</code>/<code>retry</code> advance and re-run the actual behave <code>Step</code> objects over a socket, so Examples binding, data tables and your hooks are behave's own, not a re-implementation. One engine, no fallback. <strong>Edit and step, don't restart:</strong> before every <code>next</code>/<code>retry</code> the gate re-parses the feature (mtime-gated) and reloads your step modules, so an edit to the Gherkin line or the Python behind it runs against the browser and setup you already have. Point it (and <code>run</code>/<code>paver</code>) at an already-open <code>aitlc cdp launch</code> browser via <code>PLAYWRIGHT_CDP_URL</code> (config <code>[project].playwright_cdp_env</code>) to skip a fresh launch each time.</li>
         </ul>
         <div class="callout"><p><strong>When the DOM and an assertion disagree, instrument rather than theorise.</strong> One <code>log.info("%r", text)</code> at the read site, for one run, beats another round of inspection — it shows what the code actually read, which is not always what the page shows.</p></div>
       </div>

@@ -40,9 +40,11 @@ aitlc -w PROJ-1234 debug start PROJ-1234 --at 12
 aitlc -w PROJ-1234 debug next PROJ-1234
 ```
 
-Steps run in a persistent console holding your suite's real behave Context, so
-`before_scenario`, `before_step` and `after_step` all fire and run-scoped data
-is minted once rather than regenerated per step.
+Steps run inside a real, paused behave process holding your suite's real
+Context, so `before_scenario`, `before_step` and `after_step` all fire,
+Examples rows and data tables are behave's own, and run-scoped data is minted
+once rather than regenerated per step. The debug engine does not re-implement
+behave's loop — it single-steps the real one.
 
 **Run and target tests.** Bare test IDs resolve recursively, so you never need
 a full path, and never need to tag other features to narrow a run. One Examples
@@ -68,12 +70,21 @@ aitlc debug next PROJ-1234               # forward, from the state you have
 aitlc debug certify PROJ-1234 --times 2  # fresh instance, real feature, twice
 ```
 
-`retry` and `next` run in a persistent step console rather than a new process
-each time. That is a correctness feature first: a process per step regenerates
-run-scoped data — generated names, ids, emails — so a step waiting on
-something an earlier step created polls forever for a name that never existed,
-which looks exactly like the application hanging. Without a console they fall
-back to spawning a process, so it is slow, never broken.
+`retry` and `next` drive one paused behave process rather than spawning a new
+one each time. That is a correctness feature first: a process per step
+regenerates run-scoped data — generated names, ids, emails — so a step waiting
+on something an earlier step created polls forever for a name that never
+existed, which looks exactly like the application hanging. One paused process
+means one set of that data, and `retry` re-runs the real behave step (its
+table, docstring and Examples binding intact) after reloading your edit.
+
+**Edit and step, don't restart.** When a step fails, edit it — the Gherkin line
+and its params, or the Python behind it — and just run `retry`. Before every
+`retry`/`next` the gate re-parses the feature (mtime-gated, so an unedited step
+pays nothing) and reloads your step modules, so the edit runs against the
+browser, login and setup you already paid for. Editing Gherkin is now as cheap
+as editing Python; you only need a fresh `debug start` for a change to a setup
+step *before* your park point.
 
 **Find out what CI did, without guessing which report to open.**
 
@@ -144,10 +155,25 @@ same answer.
 **Sync with Xray.** Read, compare and write a Test's Gherkin; pull every
 feature from a Test Execution or Plan; find where a step is really used.
 
-**Escape hatches.** `aitlc behave` and `aitlc pw` run those tools directly with
-your project's `.env` and interpreter already set up, so adopting aitlc never
-means losing a flag it does not wrap. `--print-command` shows the exact
-invocation without running it.
+**Escape hatches.** `aitlc behave`, `aitlc pw` and `aitlc paver` run those tools
+directly with your project's `.env` and interpreter already set up, so adopting
+aitlc never means losing a flag it does not wrap — `aitlc paver run parallel
+--local` is your suite's own paver task, unchanged. `--print-command` shows the
+exact invocation without running it.
+
+**Reuse a live browser instead of paying setup every run.** Launch one debug
+Chrome and every behave-based command attaches to it instead of starting fresh:
+
+```bash
+aitlc cdp launch                    # detached CDP browser, survives the shell
+aitlc run PROJ-1234                 # attaches automatically if one is live (--no-cdp to force fresh)
+aitlc paver run parallel --local    # reuses the same browser
+```
+
+aitlc sets the suite's CDP env var (default `PLAYWRIGHT_CDP_URL`, configurable
+via `[project].playwright_cdp_env`) so the suite connects to the open browser.
+Pass `--cdp-url` (run) or `--aitlc-cdp-url` (paver/behave) to point at a
+specific endpoint.
 
 ## Documentation
 

@@ -61,3 +61,7 @@ def create_task_cmd(
         raise typer.Exit(code=1) from exc
 
     typer.echo(json.dumps({"key": task.key, "url": task.url}))
+
+
+# Mounted by commands/_registry.py.
+COMMAND = {"name": "jira", "attr": "app", "kind": "group", "order": 160}
