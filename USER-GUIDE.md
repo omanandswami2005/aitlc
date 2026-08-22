@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.6.0.
+Version 0.7.0.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
