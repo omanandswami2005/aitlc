@@ -18,7 +18,7 @@ from aitlc.core import workspace
 
 app = typer.Typer(
     name="aitlc",
-    help="Structured, JSON/TOON-first CLI for Behave+Playwright debugging and Xray verification.",
+    help="Structured, JSON-first CLI for Behave+Playwright debugging and Xray verification.",
     no_args_is_help=True,
 )
 
