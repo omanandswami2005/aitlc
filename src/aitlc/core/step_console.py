@@ -122,42 +122,12 @@ def apply_scenario_setup(context: Any, *, feature_file: str, spec: str | None) -
     Never silently returns success when setup did not happen: silence is
     exactly what made the original failure so expensive to diagnose.
     """
-    if spec in (None, "", "none"):
-        return {
-            "event": "scenario_setup",
-            "status": "skipped",
-            "detail": "no scenario setup configured; per-scenario data will be absent",
-        }
-
-    module_path, _, func_name = spec.partition(":")
-    if not module_path or not func_name:
-        return {
-            "event": "scenario_setup",
-            "status": "failed",
-            "detail": f"invalid spec {spec!r}; expected 'module.path:function'",
-        }
-
-    try:
-        import importlib
-
-        module = importlib.import_module(module_path)
-        setup_func = getattr(module, func_name)
-    except Exception as exc:
-        return {
-            "event": "scenario_setup",
-            "status": "failed",
-            "detail": f"could not import {spec}: {exc}",
-        }
-
-    scenario = _parse_scenario(feature_file)
-    if scenario is None:
-        return {
-            "event": "scenario_setup",
-            "status": "failed",
-            "detail": f"could not parse a Scenario from {feature_file}",
-        }
-
-    # Attributes real hooks expect to already exist on the context.
+    # Attributes real hooks expect to already exist on the context. Applied
+    # unconditionally, before any return below: a slice gets no before_all /
+    # before_feature / before_scenario regardless of whether scenario_setup
+    # is even configured, so these must exist whether we hit "skipped",
+    # "failed", or "ok" below.
+    context_defaults_applied: list[str] = []
     if not hasattr(context, "scenario_variables") or context.scenario_variables is None:
         context.scenario_variables = {}
     if not hasattr(context, "config"):
@@ -168,6 +138,69 @@ def apply_scenario_setup(context: Any, *, feature_file: str, spec: str | None) -
         context.graphql_request_map = {}
     if not hasattr(context, "_finalizers"):
         context._finalizers = []
+    # A project's before_feature commonly derives these from a configured
+    # viewport. Missing here (no before_feature runs for a slice) surfaced
+    # live as `AttributeError: 'Context' object has no attribute
+    # 'screen_width'` from steps that read it (e.g. `select database`,
+    # `click on audience tab`) — a crash that looks like the step itself is
+    # broken when the step never got a chance to run. Default to a common
+    # desktop viewport instead of leaving these unset; surfaced via
+    # context_defaults_applied below so this never reads as a normal run
+    # that simply needed no defaults.
+    if not hasattr(context, "screen_width"):
+        context.screen_width = 1280
+        context_defaults_applied.append("screen_width=1280")
+    if not hasattr(context, "screen_height"):
+        context.screen_height = 720
+        context_defaults_applied.append("screen_height=720")
+
+    def _with_defaults(record: dict) -> dict:
+        if context_defaults_applied:
+            record["context_defaults_applied"] = context_defaults_applied
+        return record
+
+    if spec in (None, "", "none"):
+        return _with_defaults(
+            {
+                "event": "scenario_setup",
+                "status": "skipped",
+                "detail": "no scenario setup configured; per-scenario data will be absent",
+            }
+        )
+
+    module_path, _, func_name = spec.partition(":")
+    if not module_path or not func_name:
+        return _with_defaults(
+            {
+                "event": "scenario_setup",
+                "status": "failed",
+                "detail": f"invalid spec {spec!r}; expected 'module.path:function'",
+            }
+        )
+
+    try:
+        import importlib
+
+        module = importlib.import_module(module_path)
+        setup_func = getattr(module, func_name)
+    except Exception as exc:
+        return _with_defaults(
+            {
+                "event": "scenario_setup",
+                "status": "failed",
+                "detail": f"could not import {spec}: {exc}",
+            }
+        )
+
+    scenario = _parse_scenario(feature_file)
+    if scenario is None:
+        return _with_defaults(
+            {
+                "event": "scenario_setup",
+                "status": "failed",
+                "detail": f"could not parse a Scenario from {feature_file}",
+            }
+        )
 
     # Snapshot the environment so the report can show what the hook actually
     # produced. Diffing beats naming expected keys: which variables a setup
@@ -178,26 +211,30 @@ def apply_scenario_setup(context: Any, *, feature_file: str, spec: str | None) -
     try:
         setup_func(context, scenario)
     except Exception as exc:
-        return {
-            "event": "scenario_setup",
-            "status": "failed",
-            "detail": f"{spec} raised: {type(exc).__name__}: {exc}",
-        }
+        return _with_defaults(
+            {
+                "event": "scenario_setup",
+                "status": "failed",
+                "detail": f"{spec} raised: {type(exc).__name__}: {exc}",
+            }
+        )
 
     changed = sorted(k for k, v in os.environ.items() if before.get(k) != v)
 
-    return {
-        "event": "scenario_setup",
-        "status": "ok",
-        "hook": spec,
-        "scenario": getattr(scenario, "name", None),
-        # Surfaced so a caller can see the data really landed rather than
-        # inferring it from a later step's success. Values are omitted:
-        # per-scenario data routinely includes addresses and account
-        # identifiers, and this record is printed to stdout.
-        "env_vars_set": changed,
-        "env_vars_set_count": len(changed),
-    }
+    return _with_defaults(
+        {
+            "event": "scenario_setup",
+            "status": "ok",
+            "hook": spec,
+            "scenario": getattr(scenario, "name", None),
+            # Surfaced so a caller can see the data really landed rather than
+            # inferring it from a later step's success. Values are omitted:
+            # per-scenario data routinely includes addresses and account
+            # identifiers, and this record is printed to stdout.
+            "env_vars_set": changed,
+            "env_vars_set_count": len(changed),
+        }
+    )
 
 
 def _mobile_context_options(playwright: Any, device_name: str) -> dict:

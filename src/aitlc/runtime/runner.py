@@ -5,13 +5,15 @@ target project keeps its `environment.py` exactly as it is: this class
 calls `super().run_hook(...)`, meaning every project hook still runs,
 unchanged and in order.
 
-Two modes, both opt-in via environment variables. A project that sets none
+Three modes, all opt-in via environment variables. A project that sets none
 of them gets a runner behaviourally identical to behave's own.
 
 1. Observe / halt (AITLC_PAUSE_ON_FAILURE, AITLC_EVENTS)
    Emits a JSON-lines event per step and, on a failed step, halts before
-   teardown so the browser stays on the failure. This is what `aitlc run
-   --debug` uses.
+   teardown so the browser stays on the failure. A dead end by design: the
+   process exits, so the browser can only be inspected, never resumed. Kept
+   for callers that want a plain, foreground, uninstrumented-feeling pause
+   (`aitlc behave --debug`); superseded by mode 3 for `aitlc run --debug`.
 
 2. Gate (AITLC_GATE=1, AITLC_GATE_SOCKET, AITLC_GATE_AT, AITLC_GATE_PROGRESS)
    Turns a real behave run into a paused, single-steppable session. behave's
@@ -25,6 +27,21 @@ of them gets a runner behaviourally identical to behave's own.
    The point of mode 2 is that there is nothing to reconstruct and therefore
    nothing to diverge: the fast loop IS behave, merely paused. See
    ROADMAP/`aitlc-gaps.md` for the class of bug this removes.
+
+3. Gate-on-failure (AITLC_GATE_ON_FAILURE=1, AITLC_GATE_SOCKET,
+   AITLC_GATE_PROGRESS)
+   Mode 2's engine, entered reactively instead of at a chosen index: every
+   step runs completely normally (nothing is auto-run or counted -- a
+   passing scenario behaves exactly like an uninstrumented run) until one
+   fails, and at that exact point this runner takes over the SAME socket
+   loop mode 2 uses, parked on the step that just failed. `retry` re-runs
+   it after a fix; `next` re-runs it and advances. This is what `aitlc run
+   --debug` uses: unlike mode 1, the failure is not a dead end -- there is
+   nothing to restart, because the paused process IS the fix-and-retry
+   session. Real, in-scenario data found this necessary: a scenario can fail
+   at any step, and mode 1 threw away exactly the state (auth, run-scoped
+   data, whatever the browser was mid-way through) that made the failure
+   expensive to reach in the first place.
 
 This module is imported inside the TARGET project's interpreter, not
 aitlc's, so it imports nothing from aitlc and relies only on the stdlib
@@ -116,6 +133,10 @@ class AitlcRunner(_BaseRunner):
             self._gate_run_hook(name, context, *payload)
             return result
 
+        if self._gate_on_failure_active():
+            self._gate_on_failure_run_hook(name, context, *payload)
+            return result
+
         self._observe_run_hook(name, context, *payload)
         return result
 
@@ -179,6 +200,36 @@ class AitlcRunner(_BaseRunner):
         except (OSError, ValueError):
             pass
         os._exit(1)
+
+    # ------------------------------------------------------- gate-on-failure
+    def _gate_on_failure_active(self) -> bool:
+        return os.environ.get("AITLC_GATE_ON_FAILURE") == "1"
+
+    def _gate_on_failure_run_hook(self, name: str, context: Any, *args: Any) -> None:
+        """Watch every real step; on the first failure, take over via `_serve`.
+
+        Nothing is auto-run or counted here (contrast `_gate_run_hook`'s
+        before_step counter) -- behave's own loop drives every step
+        completely normally until this fires, so a passing scenario is
+        indistinguishable from an uninstrumented run.
+        """
+        if name != "after_step" or not args:
+            return
+        step = args[0]
+        if _status_name(step) != "failed":
+            return
+
+        scenario = getattr(context, "scenario", None)
+        steps = self._collect_steps(scenario)
+        try:
+            cursor = steps.index(step)
+        except ValueError:
+            # Should not happen (the step came from this same scenario's own
+            # list) -- park at the end rather than crash the whole run over
+            # a bookkeeping mismatch.
+            cursor = len(steps)
+        self._aitlc_steps = steps
+        self._serve(context, start_cursor=cursor)
 
     # --------------------------------------------------------------- gate mode
     def _gate_active(self) -> bool:
@@ -386,26 +437,108 @@ class AitlcRunner(_BaseRunner):
         }
 
     def _reload_steps(self, step_dir: str) -> list:
-        """Re-import the project's step modules so an edit is picked up.
+        """Re-execute the project's step files so an edit is picked up.
 
-        `retry` means "run this again with my change"; that cannot mean against
-        code imported minutes ago. Reloading re-populates behave's global step
-        registry, which `Step.run` consults on every call.
+        `retry` means "run this again with my change"; that cannot mean
+        against code loaded minutes ago. Two distinct bugs made that true
+        until now, both found live, both reproducing identically under a
+        plain `debug start` session (so neither was specific to
+        gate-on-failure):
+
+        1. The first version of this used `importlib.reload()` keyed off
+           `sys.modules` -- which silently did nothing for real
+           step-definition files, because behave never loads them through
+           the import system at all. `load_step_modules()`
+           (behave/runner_util.py) `exec_file()`s each `.py` file in
+           step_dir directly into a throwaway globals dict; they never get
+           a `sys.modules` entry of their own.
+
+        2. Fixed that by mirroring behave's own loading mechanism instead
+           (re-`exec_file()` every `.py` under step_dir, evicting each
+           file's stale registry entries first so a re-registration at the
+           same (pattern, file:line) isn't silently discarded as a
+           duplicate) -- and STILL got the stale function back. Root cause:
+           this suite calls `behave.runner_util.reset_runtime()` somewhere
+           (worker/scenario isolation), which reassigns the MODULE-LEVEL
+           `behave.step_registry.registry` to a brand-new, empty
+           `StepRegistry()` -- but `self.step_registry` (bound once when
+           this Runner was constructed) and the `given`/`when`/`then`
+           decorators (bound once at `behave/__init__.py`'s own import,
+           `from .step_registry import *`) both still correctly reference
+           the ORIGINAL registry. Importing `behave.step_registry.registry`
+           fresh, as the eviction code did, silently operated on the wrong
+           (new, unrelated, empty) instance every time -- eviction always
+           "succeeded" against a registry nothing was ever looked up from.
+
+        Fixed by evicting from `self.step_registry` directly -- the one
+        instance actually consulted by `Step.run()` -- instead of ever
+        re-importing the module attribute, which may have been swapped out
+        from under it at any point.
         """
-        import importlib
+        if not step_dir or not os.path.isdir(step_dir):
+            return []
+        try:
+            from behave import matchers
+            from behave.runner_util import exec_file, PathManager
+            from behave.step_registry import setup_step_decorators
+        except Exception:  # noqa: BLE001 - behave absent/renamed must not kill the session
+            return []
+
+        step_globals_base = {
+            "use_step_matcher": matchers.use_step_matcher,
+            "step_matcher": matchers.step_matcher,  # -- deprecating, same as load_step_modules
+        }
+        setup_step_decorators(step_globals_base, registry=self.step_registry)
+        default_matcher = matchers.current_matcher
 
         reloaded: list[str] = []
-        if not step_dir:
-            return reloaded
-        package = str(step_dir).replace("/", ".").replace("\\", ".")
-        for mod_name in list(sys.modules):
-            if mod_name == package or mod_name.startswith(package + "."):
+        with PathManager([step_dir]):
+            for name in sorted(os.listdir(step_dir)):
+                if not name.endswith(".py"):
+                    continue
+                file_path = os.path.join(step_dir, name)
+                self._evict_step_registrations_for_file(file_path)
                 try:
-                    importlib.reload(sys.modules[mod_name])
-                    reloaded.append(mod_name)
-                except Exception:  # noqa: BLE001 - a bad reload must not kill the session
+                    exec_file(file_path, step_globals_base.copy())
+                    reloaded.append(file_path)
+                except Exception:  # noqa: BLE001 - a bad edit must not kill the session
                     pass
+                matchers.current_matcher = default_matcher
         return reloaded
+
+    def _evict_step_registrations_for_file(self, file_path: str) -> None:
+        """Remove one file's step definitions from the live step registry.
+
+        Must run BEFORE re-`exec_file()`-ing that file: behave's own
+        `StepRegistry.add_step_definition` (behave/step_registry.py) treats
+        a re-registration at the same (pattern, file:line) as "already
+        registered" and silently discards it -- so re-executing a step file
+        whose edit only changed a function BODY (not its line position)
+        would run the decorators for nothing, leaving the stale, pre-edit
+        function bound in the registry forever, with no error raised
+        anywhere to say so. Evicting first means the re-exec's
+        re-registration is never seen as a duplicate.
+
+        Operates on `self.step_registry` -- the instance `Step.run()`
+        actually consults -- never on `behave.step_registry.registry`
+        freshly imported, which a project's own `reset_runtime()` call can
+        silently replace with an unrelated new instance (see
+        `_reload_steps`'s docstring for how this was found).
+        """
+        step_registry = getattr(self, "step_registry", None)
+        if step_registry is None:
+            return
+        try:
+            target = os.path.abspath(file_path)
+        except (OSError, ValueError):
+            return
+        for step_type, definitions in step_registry.steps.items():
+            step_registry.steps[step_type] = [
+                defn
+                for defn in definitions
+                if os.path.abspath(getattr(defn.location, "filename", "") or "")
+                != target
+            ]
 
     def _status(self, cursor: int, steps: list) -> dict:
         return {
@@ -429,15 +562,65 @@ class AitlcRunner(_BaseRunner):
         except OSError:
             pass
 
-    def _serve(self, context: Any) -> None:
+    def _run_cleanup_hooks(self, context: Any) -> dict:
+        """Fire the project's real after_scenario/after_feature hooks before exit.
+
+        Opt-in ONLY, via `stop`'s `cleanup` flag -- never automatic. These
+        hooks do real, sometimes slow work (this suite's own
+        `cleanup_registration_func` logs out), and a debug session's whole
+        value is a persistent, already-authenticated browser; running this
+        unconditionally on every `stop` would silently reintroduce the exact
+        repeated-login cost the gate exists to avoid. Call it only when you
+        deliberately want a clean handoff.
+
+        Calls the two hooks directly with the real live context/scenario/
+        feature, the same (context, entity) shape `Scenario.run()`/
+        `Feature.run()` themselves use -- not through those methods, since
+        their tag dispatch, formatter callbacks and context push/pop
+        bookkeeping serve a full run this doesn't need (the process exits
+        right after). Never silently claims success: each hook's outcome is
+        reported, including a failure, rather than assumed.
+        """
+        self._aitlc_suspended = True
+        result: dict = {"after_scenario": None, "after_feature": None}
+        try:
+            scenario = getattr(context, "scenario", None)
+            if scenario is not None:
+                try:
+                    self.run_hook("after_scenario", context, scenario)
+                    result["after_scenario"] = "ok"
+                except Exception as exc:  # noqa: BLE001 - report, don't crash the teardown
+                    result["after_scenario"] = f"{type(exc).__name__}: {exc}"
+            else:
+                result["after_scenario"] = "skipped: no context.scenario"
+
+            feature = getattr(context, "feature", None)
+            if feature is not None:
+                try:
+                    self.run_hook("after_feature", context, feature)
+                    result["after_feature"] = "ok"
+                except Exception as exc:  # noqa: BLE001
+                    result["after_feature"] = f"{type(exc).__name__}: {exc}"
+            else:
+                result["after_feature"] = "skipped: no context.feature"
+        finally:
+            self._aitlc_suspended = False
+        return result
+
+    def _serve(self, context: Any, *, start_cursor: int | None = None) -> None:
         """Own the scenario at the park point and advance it on request.
 
         A newline-delimited JSON protocol over a Unix socket, the same shape
         the step console used, so the client side is unchanged in spirit: one
         connection per command, the reply carries the outcome.
+
+        `start_cursor` lets a reactive caller (gate-on-failure, parked on
+        whichever step just failed) pick the park point at call time;
+        omitted, this falls back to `_gate_at()` -- mode 2's pre-chosen
+        index -- so `debug start`'s behaviour is unchanged.
         """
         steps = getattr(self, "_aitlc_steps", [])
-        cursor = self._gate_at()
+        cursor = start_cursor if start_cursor is not None else self._gate_at()
         socket_path = os.environ.get("AITLC_GATE_SOCKET", "")
 
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -513,7 +696,10 @@ class AitlcRunner(_BaseRunner):
                         cursor = feature_info["index"]
                     self._send(conn, {"reloaded": reloaded, "feature": feature_info})
                 elif cmd == "stop":
-                    self._send(conn, {"stopped": True})
+                    reply = {"stopped": True}
+                    if request.get("cleanup"):
+                        reply["cleanup"] = self._run_cleanup_hooks(context)
+                    self._send(conn, reply)
                     break
                 else:
                     self._send(conn, {"error": f"unknown command {cmd!r}"})

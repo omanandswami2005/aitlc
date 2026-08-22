@@ -146,6 +146,24 @@ So the manual `export` block is gone: put resolved `KEY=value` pairs in `./.env`
 and run through `aitlc`. Anything you want to override for one run, prefix it
 inline (`DEVICE_NAME=MOBILE_DEVICE aitlc paver run parallel --local`).
 
+### Getting the same values into your own shell
+
+Everything above is about aitlc's own subprocesses. Sometimes you need `.env`
+in the shell itself — `step_repl.py`, a raw `poetry run behave`, a `curl`/`psql`
+check against a value in there:
+
+```bash
+source "$(aitlc env)"
+```
+
+One command: activates the project's venv, sets `PYTHONPATH`, and exports every
+`.env` key. Nothing sensitive touches stdout — `aitlc env` writes the real
+`export …` lines (secret values included) to an owner-only file under the
+workspace and prints only that file's path, so the command itself is safe to
+run through a logged shell or a tool that captures output. `--no-activate`
+skips the venv `source` line if you only want the exports; `--env-file` picks
+a different file than `./.env`.
+
 ---
 
 ## How it attaches to your suite
@@ -172,8 +190,14 @@ That last one matters: `after_step` is where a suite captures its failure
 screenshot and its API traffic. A session that skipped it threw away exactly
 the material that explains a failure.
 
-`after_scenario` and `after_all` are deliberately **not** fired between steps —
-they tear down what a debug session exists to keep. They run on `debug stop`.
+`after_scenario` and `after_feature` are deliberately **not** fired between
+steps — they tear down what a debug session exists to keep. They never run
+automatically on `debug stop` either — a debug/CDP browser is often reused
+across invocations, and this suite's own cleanup can include a logout; running
+it by default would silently reintroduce the repeated-login cost the whole
+engine exists to avoid. Pass `debug stop --cleanup` to fire them for real,
+in-process, when you deliberately want a clean handoff (see "The debug cycle"
+below).
 
 See [`INTEGRATION.md`](INTEGRATION.md) for the full contract.
 
@@ -187,8 +211,19 @@ aitlc debug next PROJ-1234             # run the step under the cursor, then adv
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug status PROJ-1234           # where am I?
 aitlc debug certify PROJ-1234 --times 2
-aitlc debug stop PROJ-1234
+aitlc debug stop PROJ-1234              # browser down; no cleanup hooks fired
+aitlc debug stop PROJ-1234 --cleanup    # + fires the suite's real after_scenario/after_feature first
 ```
+
+`stop --cleanup` calls `after_scenario`/`after_feature` directly, in the live
+paused process, with the real context/scenario/feature — not reconstructed
+from outside. Opt-in only: `debug start` always launches a fresh, disposable
+browser, so cleanup-then-kill there is free, but `run --debug` commonly reuses
+a *persistent* CDP browser across invocations, and this suite's own cleanup
+can include a tag-driven logout — defaulting cleanup to on would silently
+force a real login on the next `run --debug`. Reach for it only when you
+deliberately want to end a session clean (a handoff, or the next investigation
+needs a logged-out start).
 
 `--at N` runs steps `0..N-1` and parks **on** N without running it. The first
 `next` therefore runs N; only once a step has been attempted does `next` move
@@ -224,6 +259,17 @@ data: minted once, shared by every later step, exactly as in a real run.
 There is no separate engine and no fallback to fall out of sync with — `debug`
 is the gated behave runner, one path. (`steps run` and `call` still run a slice
 against a live browser; they are separate features, not a debug mode.)
+
+A slice gets no `before_all`/`before_feature`/`before_scenario` — that is what
+makes it fast, and it is the tradeoff for skipping `debug start`. Whatever
+those hooks set on `context` is simply absent. `steps run` defaults
+`context.screen_width`/`screen_height` to 1280x720 so a project whose
+`before_feature` derives a viewport from them does not crash outright — a
+missing attribute otherwise looks like the step itself is broken when it never
+got to run. The result's `context_defaults_applied` says when this happened,
+so it is never silently indistinguishable from a real hook having run. Anything
+a hook sets beyond that is still absent; reach for `debug start` once a step
+needs more than a viewport default.
 
 ### What happens when you edit something
 
@@ -335,7 +381,7 @@ false failure this exists to prevent.
 
 ```bash
 aitlc run PROJ-1234                  # structured JSON result
-aitlc run PROJ-1234 --debug          # halt on failure, browser stays open
+aitlc run PROJ-1234 --debug          # on failure, parks into a live session (debug retry continues it)
 aitlc parallel run -j 4              # concurrent, without editing tags
 aitlc parallel run --list            # preview: what runs, what is skipped, why
 aitlc parallel focus PROJ-1234       # pin a selection
@@ -573,6 +619,19 @@ own outcome.
 **A stale socket file looks alive.** Liveness is a round trip, not an
 `exists()`.
 
+**Calling plain `run` again after every fix is the expensive habit this
+engine exists to break.** A plain `run` (no `--debug`) is a brand-new process
+that pays full setup — including a real login — from scratch every time, so
+repeating it after every fix compounds that cost across the whole debugging
+session and looks exactly like "the suite is stuck, failing the same way
+forever." `run --debug` already avoids this on its own: the first real
+failure parks into a live, resumable session instead of exiting (see
+Troubleshooting, "`paused_on_failure`"), so `aitlc debug retry <test_id>`
+continues it with zero new setup — no separate `debug start` needed, even for
+the very first failure. Reach for `debug start --at N` instead only when you
+already know which step you want to park before, or need a fresh isolated
+browser for some other reason.
+
 ---
 
 ## Troubleshooting
@@ -593,6 +652,30 @@ failed, so behave (`--stop`) aborted before parking — the session is not left 
 a broken precondition. Read `<workspace>/.aitlc/debug/gate.log` for the failing
 step; a common cause is a step module failing to import because the env file was
 not found.
+
+**A `run` result is completely empty (`steps_by_status: {}`, no failures) but
+exit code is nonzero.** behave died before writing any report at all — most
+often a `SyntaxError`/`ImportError` in a hooks or steps module (an edit that
+did not actually save cleanly, a stray character pasted into a file) — not a
+step failure, so re-running reproduces the identical empty result every time
+and looks like the suite is stuck. Check `crash_traceback` in the same JSON
+output first; it holds the real traceback. With `--debug` the same
+distinction applies, correctly: `crashed: true` (with `crash_traceback`)
+means behave crashed before running anything real; `paused_on_failure: true,
+resumable: true` means a real step failed and the process is now a live
+session — not frozen, not exited, waiting for `aitlc debug retry <test_id>`
+(or `next`). The two used to be indistinguishable, and `paused_on_failure`
+used to mean "inspect-only, then restart"; it doesn't anymore.
+
+**Edited a step's body and `retry`/`next` still ran the old code.** Fixed —
+this used to be a real bug, not you misreading the reload. behave doesn't
+load step files through Python's import system at all (`exec_file()`s each
+one into a throwaway namespace), and its own step registry can get silently
+replaced out from under a long-lived process by a project's own
+`reset_runtime()` call (used for worker/scenario isolation in some suites).
+Both are now accounted for in the reload path. If you ever see it again on a
+current build, it's a real regression worth reporting, not an edit you
+mistyped.
 
 **A step that never ran reports `not_run`, not `failed`.** Three outcomes, not
 two. Calling it failed sends you to fix code that is fine.

@@ -20,38 +20,17 @@ Verbs:
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import tempfile
 import time
-import subprocess
 from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client
+from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core import workspace
-from aitlc.runtime import attach
 
 app = typer.Typer(help="Interactive debug session over one feature file.")
-
-
-def _gate_socket(root_dir: Path, test_id: str) -> Path:
-    """A short, collision-free socket path for this project + test.
-
-    A Unix socket path is capped near 104 bytes by the OS, so it goes in the
-    system temp dir with a hashed name rather than under a deeply nested
-    checkout (which fails at bind()).
-    """
-    digest = hashlib.sha256(f"{Path(root_dir).resolve()}::{test_id}".encode()).hexdigest()[:16]
-    return Path(tempfile.gettempdir()) / f"aitlc-gate-{digest}.sock"
-
-
-def _aitlc_src() -> Path:
-    """The directory to put on PYTHONPATH so behave can import the runner."""
-    return Path(attach.__file__).resolve().parent.parent.parent
 
 
 def _example_line(feature_text: str, example: int) -> int | None:
@@ -120,74 +99,6 @@ def _require(config, test_id: str) -> debug_session.DebugSession:
     return session
 
 
-def _pid_alive(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _launch_gate(
-    config,
-    *,
-    feature: Path,
-    line: int | None,
-    at: int,
-    example: int,
-    cdp_url: str,
-    socket_path: Path,
-    progress_path: Path,
-    env_file: str,
-) -> int:
-    """Launch a detached, gated behave process; return its pid."""
-    behave_cmd = behave_runner.resolve_poetry() + ["run", "behave"]
-    work_dir = workspace.output_path(config.root_dir, ".aitlc", "debug", "_gate_site")
-    gate_env = {
-        "AITLC_GATE": "1",
-        "AITLC_GATE_SOCKET": str(socket_path),
-        "AITLC_GATE_AT": str(at),
-        "AITLC_GATE_EXAMPLE": str(example),
-        "AITLC_GATE_PROGRESS": str(progress_path),
-        # The suite attaches to the persistent debug Chrome via its own CDP env
-        # var, so the browser survives the gate's hard exit for inspection.
-        config.playwright_cdp_env: cdp_url,
-    }
-    plan = attach.plan(
-        behave_cmd, config.root_dir, work_dir, aitlc_src=_aitlc_src(), gate_env=gate_env
-    )
-    target = f"{feature}:{line}" if line else str(feature)
-    cmd = [*behave_cmd, *plan.extra_args, "--no-capture", "--stop", target]
-
-    if socket_path.exists():
-        socket_path.unlink()
-    log_path = workspace.ensure(config.root_dir, ".aitlc", "debug", "gate.log")
-    with log_path.open("ab") as handle:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=config.root_dir,
-            env={**os.environ, **plan.env},
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    return proc.pid
-
-
-def _await_park(socket_path: Path, pid: int, timeout_s: float) -> dict | str:
-    """Wait for the gate to park. Returns the status dict, or a reason string."""
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if not _pid_alive(pid):
-            return "exited"  # behave stopped before parking (setup failed / crash)
-        try:
-            return gate_client.request(socket_path, "status")
-        except (gate_client.GateUnavailable, OSError):
-            time.sleep(0.25)
-    return "timeout"
 
 
 @app.command("start")
@@ -233,7 +144,7 @@ def start(
     feature = Path(feature)
     line = _example_line(feature.read_text(), example)
 
-    socket_path = _gate_socket(config.root_dir, test_id)
+    socket_path = gate_launch.socket_path(config.root_dir, test_id)
     progress_path = debug_session.progress_path(config.root_dir, test_id)
 
     # A fresh, isolated debug Chrome the suite will attach to; it survives the
@@ -245,11 +156,13 @@ def start(
         {"state": "running", "test_id": test_id, "target": at, "done": 0,
          "started_at": time.time()},
     )
-    pid = _launch_gate(
-        config, feature=feature, line=line, at=at, example=example,
-        cdp_url=instance.cdp_url, socket_path=socket_path,
-        progress_path=progress_path, env_file=env_file,
-    )
+    pid = gate_launch.launch(
+        config, feature=feature, line=line,
+        cdp_url=instance.cdp_url, socket_path_=socket_path,
+        progress_path=progress_path,
+        gate_env={"AITLC_GATE": "1", "AITLC_GATE_AT": str(at), "AITLC_GATE_EXAMPLE": str(example)},
+        log_name="gate.log",
+    ).pid
     session = debug_session.DebugSession(
         test_id=test_id, feature=str(feature), cdp_url=instance.cdp_url,
         port=instance.port, example=example, socket=str(socket_path), pid=pid, park=at,
@@ -272,7 +185,7 @@ def start(
         )
         return
 
-    outcome = _await_park(socket_path, pid, timeout)
+    outcome = gate_launch.await_park_or_exit(socket_path, pid, timeout)
     if outcome == "exited":
         # behave --stop aborts on a failed setup step: the gate never parked.
         # This is the faithful "parked on a broken precondition" signal (G46).
@@ -430,26 +343,46 @@ def next_step(
 
 
 @app.command("stop")
-def stop(test_id: str = typer.Argument(None)) -> None:
+def stop(
+    test_id: str = typer.Argument(None),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help=(
+            "Fire the project's real after_scenario/after_feature hooks "
+            "(e.g. a tag-driven logout) before exiting. Off by default: "
+            "the debug browser is often the persistent one `run --debug` "
+            "reuses across invocations, and this suite's own cleanup can "
+            "log it out -- opt in only for a deliberate clean handoff, "
+            "never as routine teardown."
+        ),
+    ),
+) -> None:
     """Stop the paused run and its browser, and drop the session."""
     config = AitlcConfig.find_and_load()
     test_id = _default_id(config, test_id)
     session = _require(config, test_id)
     gate_stopped = False
+    cleanup_result = None
     if session.socket:
         try:
-            gate_client.request(session.socket, "stop")
+            reply = gate_client.request(session.socket, "stop", cleanup=cleanup)
             gate_stopped = True
+            cleanup_result = reply.get("cleanup")
         except (gate_client.GateUnavailable, OSError):
             pass
     stopped = chrome_cdp.stop_all(config.root_dir)
     debug_session.clear(config.root_dir, test_id)
     debug_session.clear_progress(config.root_dir, test_id)
-    typer.echo(
-        json.dumps(
-            {"gate_stopped": gate_stopped, "stopped_ports": stopped, "session_cleared": True}
-        )
-    )
+    payload = {"gate_stopped": gate_stopped, "stopped_ports": stopped, "session_cleared": True}
+    if cleanup:
+        # Never silently claim success: if cleanup was asked for but the
+        # gate was unreachable to run it, say so rather than staying quiet.
+        payload["cleanup"] = cleanup_result or {
+            "after_scenario": "skipped: gate unreachable, cleanup did not run",
+            "after_feature": "skipped: gate unreachable, cleanup did not run",
+        }
+    typer.echo(json.dumps(payload))
 
 
 @app.command("certify")

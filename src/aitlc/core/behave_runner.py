@@ -73,6 +73,10 @@ class RunResult:
     scenarios: list[ScenarioResult] = field(default_factory=list)
     exit_code: int = 0
     raw_report_path: Path | None = None
+    # Set only when behave died before writing report_path at all (an
+    # import-time SyntaxError/ImportError in a hooks/steps module, e.g.) --
+    # see run()'s docstring note. Empty string means no such crash happened.
+    crash_traceback: str = ""
 
     @property
     def passed(self) -> bool:
@@ -81,13 +85,16 @@ class RunResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable form of this result."""
-        return {
+        result: dict[str, Any] = {
             "steps_by_status": self.steps_by_status,
             "failures": [
                 {"scenario": f.scenario, "step": f.step, "error": f.error}
                 for f in self.failures
             ],
         }
+        if self.crash_traceback:
+            result["crash_traceback"] = self.crash_traceback
+        return result
 
 
 def _extract_error_message(step: dict[str, Any]) -> str:
@@ -131,8 +138,16 @@ def parse_report(report_path: Path) -> RunResult:
     if not report_path.exists():
         return result
 
-    with open(report_path) as f:
-        features = json.load(f)
+    try:
+        text = report_path.read_text().strip()
+        if not text:
+            return result
+        features = json.loads(text)
+    except (json.JSONDecodeError, OSError):
+        # A paused run (os._exit before behave writes its report) leaves an
+        # empty or truncated file. That is not an error — the pause itself is
+        # the outcome, and run.py reports it from stderr.
+        return result
 
     for feature in features:
         feature_name = feature.get("name", "")
@@ -169,13 +184,14 @@ def parse_report(report_path: Path) -> RunResult:
 
 def build_command(
     feature_path: Path,
-    report_path: Path,
+    report_path: Path | None,
     *,
     tags: str | None = None,
     name_pattern: str | None = None,
     dry_run: bool = False,
     no_capture: bool = False,
     live_status: bool = False,
+    stop: bool = False,
     line: int | None = None,
     extra_args: list[str] | None = None,
 ) -> list[str]:
@@ -187,6 +203,13 @@ def build_command(
     behave's native `FILE:LINE` form to run just the scenario at that line. It is passed
     as the positional path argument (not a flag) because that is behave's own documented
     syntax: `behave --help` -> `[DIR|FILE|FILE:LINE]`.
+
+    `report_path=None` skips the json.pretty formatter entirely -- for a
+    gated session (`gate_launch.launch`) that has no use for a report file,
+    since its result comes from the live socket protocol instead. `stop`
+    adds behave's own `--stop`, wanted by every gated invocation (a fixed
+    park index or gate-on-failure) so one failed setup step halts the whole
+    run rather than behave trying the next scenario.
     """
     cmd = resolve_poetry() + ["run", "behave", "--color=always"]
     if dry_run:
@@ -197,7 +220,10 @@ def build_command(
         cmd += ["--name", name_pattern]
     if no_capture:
         cmd.append("--no-capture")
-    cmd += ["-f", "pretty", "-o", "-", "-f", "json.pretty", "-o", str(report_path)]
+    if stop:
+        cmd.append("--stop")
+    if report_path is not None:
+        cmd += ["-f", "pretty", "-o", "-", "-f", "json.pretty", "-o", str(report_path)]
     if live_status:
         cmd += [
             "-f",
@@ -286,9 +312,52 @@ def run(
             proc = subprocess.run(
                 cmd, cwd=cwd, env=proc_env, stdout=handle, stderr=subprocess.STDOUT
             )
+        crash_source = log_file
     else:
-        proc = subprocess.run(cmd, cwd=cwd, env=proc_env)
+        # stderr always goes to a file even without an explicit log_file:
+        # behave can die before writing report_path at all -- an import-time
+        # SyntaxError/ImportError in a hooks/steps module, hit live on a real
+        # suite (a stray character pasted into a hooks file broke every run).
+        # parse_report then returns an all-empty RunResult, indistinguishable
+        # from "nothing ran" -- there is no failing step to react to, so the
+        # only visible move is to re-run, which reproduces the identical
+        # empty crash forever. stdout is left inherited so `--no-capture`-style
+        # live progress still streams to the terminal as before.
+        crash_source = report_dir / "stderr.log"
+        with crash_source.open("wb") as stderr_handle:
+            proc = subprocess.run(cmd, cwd=cwd, env=proc_env, stderr=stderr_handle)
 
     result = parse_report(report_path)
     result.exit_code = proc.returncode
+
+    if result.exit_code != 0 and not result.steps_by_status and not result.failures:
+        try:
+            captured = crash_source.read_text(errors="replace")
+        except OSError:
+            captured = ""
+        result.crash_traceback = detect_crash_traceback(captured)
+
     return result
+
+
+def detect_crash_traceback(captured_output: str) -> str:
+    """Pull a real Python crash out of captured stdout/stderr, or "".
+
+    Gated on an actual traceback marker, not just "the text is non-empty":
+    a legitimate `--debug` pause ALSO writes plenty of output before it takes
+    over (the suite's own INFO/WARNING logging, then aitlc's own "paused on
+    failure"/"gate parked" marker) -- none of that is a crash. Caught live:
+    the first version of this flagged a real pause as `crashed: true` because
+    its stderr happened to be non-empty, which is always true. A genuine
+    collection-time crash is the one case that prints Python's own
+    "Traceback (most recent call last):" -- nothing else does. Shared by the
+    plain-run crash path above and `run --debug`'s gated path (`gate_launch`
+    has no subprocess.run() of its own to attach this to, so it calls this
+    directly against its own log file).
+    """
+    marker = "Traceback (most recent call last):"
+    idx = captured_output.rfind(marker)
+    if idx == -1:
+        return ""
+    tail = captured_output[idx:].strip()
+    return "\n".join(tail.splitlines()[-40:])

@@ -11,15 +11,29 @@ from pathlib import Path
 import typer
 from aitlc.adapters.lambdatest import queue as remote_queue
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, journal, chrome_cdp
+from aitlc.core import behave_runner, journal, chrome_cdp, debug_session, gate_launch
 from aitlc.core import history as history_core
 from aitlc.core import locks, toon
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core.feature_select import split_line_spec
 from aitlc.core.patterns import PatternLibrary
 from aitlc.core.redact import redact_text
-from aitlc.runtime import attach
 from aitlc.core import workspace
+
+
+class _GateParked(Exception):
+    """A `--debug` run's step failure produced a live, resumable session.
+
+    Raised instead of returning a RunResult: there is no finished result to
+    report, and unwinding as an exception means the normal retry loop and
+    lock-release machinery (`with locks.held(...)`) do the right thing for
+    free -- a parked session must never be auto-retried (that would mean
+    starting a whole new browser, the exact cost this exists to avoid).
+    """
+
+    def __init__(self, session: debug_session.DebugSession, status_reply: dict) -> None:
+        self.session = session
+        self.status_reply = status_reply
 
 
 def _all_failures_are_known_flakes(
@@ -186,10 +200,11 @@ def run(
         False,
         "--debug",
         help=(
-            "Reuse (or start) the persistent CDP debug Chrome and freeze the "
-            "browser on failure for live inspection. Sets PLAYWRIGHT_CDP_URL "
-            "and the suite's own pause flag together — such hooks need BOTH, and "
-            "setting only one silently tears the failed page down."
+            "Reuse (or start) the persistent CDP debug Chrome. Every step runs "
+            "normally; the first real failure parks the run into a live, "
+            "resumable session — same engine as `debug start`, entered "
+            "reactively — instead of exiting, so `aitlc debug retry/next` "
+            "continue it with zero new setup cost."
         ),
     ),
     cdp_port: int = typer.Option(
@@ -223,6 +238,15 @@ def run(
             "Attach the suite to this explicit CDP URL (e.g. "
             "http://127.0.0.1:9222), overriding auto-detection. Ignored with "
             "--remote/--debug."
+        ),
+    ),
+    debug_timeout: float = typer.Option(
+        1800.0,
+        "--debug-timeout",
+        help=(
+            "With --debug: max seconds to wait for the scenario to finish or "
+            "hit a real failure before giving up on it (the process keeps "
+            "running either way; this only bounds how long `run` itself waits)."
         ),
     ),
 ) -> None:
@@ -290,7 +314,6 @@ def run(
         library = PatternLibrary.load(resolved_patterns_path)
 
     remote_env: dict[str, str] = {}
-    debug_extra_args: list[str] = []
     if remote:
         if not config.lambdatest.tunnel_name:
             typer.echo(
@@ -367,27 +390,10 @@ def run(
         remote_env[config.playwright_cdp_env] = instance.cdp_url
         # Claim the profile, so the next run against it can say who was here.
         chrome_cdp.mark_driven(config.root_dir, instance.port, base_test_id)
-
-        # Pause-on-failure is attached through behave's own runner option
-        # rather than a hook block the project has to carry. Projects that
-        # still have such a block keep working — this sets a different
-        # variable, so the two cannot both fire.
-        attach_work_dir = Path(tempfile.mkdtemp(prefix="aitlc_attach_"))
-        attach_plan = attach.plan(
-            [*behave_runner.resolve_poetry(), "run", "behave"],
-            config.root_dir,
-            attach_work_dir,
-            aitlc_src=Path(attach.__file__).resolve().parent.parent.parent,
-            pause_on_failure=True,
-        )
-        remote_env.update(attach_plan.env)
-        debug_extra_args = attach_plan.extra_args
-        typer.echo(
-            json.dumps(
-                {"instrumentation": attach_plan.mechanism, "detail": attach_plan.detail}
-            ),
-            err=True,
-        )
+        # Instrumentation (the runner-class attach, or its sitecustomize
+        # fallback) is handled inside gate_launch.launch() below — the same
+        # attach.plan() debug start uses, since this now runs through the
+        # same gated engine rather than a one-shot hard-exit-on-failure hook.
 
     # Reuse a live CDP browser for a normal run, so a plain `aitlc run` attaches
     # to the already-open Chrome instead of launching a fresh one every time —
@@ -416,7 +422,89 @@ def run(
         else workspace.output_path(config.root_dir, ".status", f"{safe_test_id}.json")
     )
 
+    def _run_debug_gated() -> behave_runner.RunResult:
+        """Run through the same live gate `debug start` uses, on-failure.
+
+        Every step runs for real, normally, through behave's own loop --
+        nothing is skipped or auto-run. The moment one fails, the process
+        parks (see runtime/runner.py's AITLC_GATE_ON_FAILURE mode) instead
+        of exiting, and this raises _GateParked with everything needed to
+        find and drive that live session (`aitlc debug retry/next/status`).
+        A scenario that finishes without failing is reported exactly like a
+        plain `run` -- this only changes what happens on a real failure.
+        """
+        gate_socket = gate_launch.socket_path(config.root_dir, base_test_id)
+        progress_path = debug_session.progress_path(config.root_dir, base_test_id)
+        report_dir = Path(tempfile.mkdtemp(prefix="aitlc_run_debug_report_"))
+        report_path = report_dir / f"{feature_path.stem}.report.json"
+
+        proc = gate_launch.launch(
+            config,
+            feature=feature_path,
+            line=line,
+            cdp_url=instance.cdp_url,
+            socket_path_=gate_socket,
+            progress_path=progress_path,
+            gate_env={"AITLC_GATE_ON_FAILURE": "1"},
+            log_name="run_debug.log",
+            report_path=report_path,
+            tags=tags,
+            name_pattern=name,
+            dry_run=dry_run,
+        )
+        outcome = gate_launch.await_park_or_exit(gate_socket, proc.pid, debug_timeout)
+
+        if outcome == "timeout":
+            # The process is still running somewhere; say so rather than
+            # silently discarding a live session run couldn't see finish.
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": f"did not finish or fail within {debug_timeout}s",
+                        "pid": proc.pid,
+                        "hint": "still running; check `aitlc cdp inspect` or "
+                        "raise --debug-timeout",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if isinstance(outcome, dict):
+            # Parked: a real failure produced a live, resumable session.
+            session = debug_session.DebugSession(
+                test_id=base_test_id,
+                feature=str(feature_path),
+                cdp_url=instance.cdp_url,
+                port=instance.port,
+                socket=str(gate_socket),
+                pid=proc.pid,
+                park=outcome.get("index", 0),
+                index=outcome.get("index", 0),
+            )
+            debug_session.save(config.root_dir, session)
+            raise _GateParked(session, outcome)
+
+        # "exited": the process ended on its own -- finished normally, or
+        # crashed before/without ever hitting the gate-on-failure hook (an
+        # import-time error, same class as G52 on the plain `run` path).
+        proc.wait()
+        result = behave_runner.parse_report(report_path)
+        result.exit_code = proc.returncode
+        if result.exit_code != 0 and not result.steps_by_status and not result.failures:
+            try:
+                log_path = workspace.output_path(
+                    config.root_dir, ".aitlc", "debug", "run_debug.log"
+                )
+                captured = log_path.read_text(errors="replace")
+            except OSError:
+                captured = ""
+            result.crash_traceback = behave_runner.detect_crash_traceback(captured)
+        return result
+
     def _run_once() -> behave_runner.RunResult:
+        if debug:
+            return _run_debug_gated()
         return behave_runner.run(
             feature_path,
             cwd=config.root_dir,
@@ -427,7 +515,6 @@ def run(
             env={**remote_env, **local_mobile_env} or None,
             status_file=status_path,
             line=line,
-            extra_args=debug_extra_args,
         )
 
     def _run_with_retries() -> tuple[behave_runner.RunResult, dict]:
@@ -483,6 +570,27 @@ def run(
     except remote_queue.NoSlotAvailableError as exc:
         typer.echo(json.dumps({"error": str(exc)}), err=True)
         raise typer.Exit(code=4) from exc
+    except _GateParked as parked:
+        # A real failure produced a live, resumable session (see
+        # runtime/runner.py's AITLC_GATE_ON_FAILURE mode) rather than a
+        # finished result -- nothing to journal or record to history yet,
+        # since the investigation is still open. `aitlc debug retry/next`
+        # against this exact test_id continue it with zero new setup cost.
+        typer.echo(
+            json.dumps(
+                {
+                    "paused_on_failure": True,
+                    "resumable": True,
+                    "test_id": parked.session.test_id,
+                    "parked_at": parked.status_reply.get("index"),
+                    "current_step": parked.status_reply.get("current_step"),
+                    "cdp_url": parked.session.cdp_url,
+                    "hint": f"fix the code, then: aitlc debug retry {parked.session.test_id}",
+                },
+                indent=2,
+            )
+        )
+        raise typer.Exit(code=1) from parked
 
     # Recorded for every run so flake rate comes from observed outcomes
     # rather than only from hand-written signatures in patterns.yaml.
@@ -496,6 +604,16 @@ def run(
     payload = result.to_dict()
     if retry > 0:
         payload["retry"] = retry_info
+    # Same disambiguation for a plain (non --debug) run: an empty payload with
+    # a nonzero exit means behave never got to step 1. Without this hint the
+    # only visible signal is a report that looks identical to "nothing to
+    # report" — the actual repeated-blind-retry failure mode this closes.
+    if result.crash_traceback and not payload["failures"]:
+        payload["hint"] = (
+            "behave crashed before executing any step (see crash_traceback) — "
+            "this is not a step failure. Fix the underlying error, don't "
+            "just re-run; re-running reproduces the identical empty crash."
+        )
 
     if toon_output and payload["failures"]:
         output = toon.encode_table(payload["failures"], name="failures")

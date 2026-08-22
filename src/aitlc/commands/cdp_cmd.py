@@ -110,16 +110,18 @@ def inspect(
 def launch(
     port: int = typer.Option(chrome_cdp.DEFAULT_PORT, "--port", help="Debugging port."),
     window_size: str = typer.Option(
-        chrome_cdp.DEFAULT_WINDOW_SIZE,
+        chrome_cdp.DESKTOP_WINDOW_SIZE,
         "--window-size",
         help=(
-            "Native window size, e.g. '375,812'. Mobile-sized by default: the "
-            "framework's pre-scenario login runs before per-scenario device "
-            "emulation applies, so a desktop-sized window breaks mobile login."
+            "Native window size, e.g. '1920,1080'. Desktop by default. "
+            "Pass a mobile size (e.g. '375,812') or --mobile for a mobile suite."
         ),
     ),
+    mobile: bool = typer.Option(
+        False, "--mobile", help="Launch at the mobile default size (375x812)."
+    ),
     desktop: bool = typer.Option(
-        False, "--desktop", help="Launch at the OS default size instead of mobile."
+        False, "--desktop", help="(Deprecated, now the default.) Desktop size."
     ),
     chrome_binary: str | None = typer.Option(
         None, "--chrome", help="Path to a specific Chrome/Chromium binary."
@@ -138,11 +140,12 @@ def launch(
 ) -> None:
     """Start (or reuse) a detached debug Chrome that outlives this command."""
     config = AitlcConfig.find_and_load()
+    resolved_size = chrome_cdp.DEFAULT_WINDOW_SIZE if mobile else window_size
     try:
         instance, reused = chrome_cdp.launch(
             config.root_dir,
             port=None if new else port,
-            window_size=None if desktop else window_size,
+            window_size=resolved_size,
             chrome_binary=chrome_binary,
         )
     except chrome_cdp.ChromeCdpError as exc:

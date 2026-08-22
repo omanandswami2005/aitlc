@@ -23,7 +23,8 @@ merely paused.
 
 - **Reproduce / single-step a failure** → `debug` (see below).
 - **Run a test and get a structured result** → `aitlc run PROJ-1234`
-  (add `--debug` to freeze the browser on failure).
+  (add `--debug` — a real failure parks into a live, resumable session instead
+  of exiting; `aitlc debug retry` continues it).
 - **Run many tests concurrently** → `aitlc parallel run -j 4`.
 - **Did it pass in CI?** → `aitlc s3 verify-test PROJ-1234`.
 - **Is it chronic or flaky?** → `aitlc s3 history PROJ-1234 --days 14`.
@@ -43,6 +44,14 @@ aitlc -w PROJ-1234 debug status PROJ-1234          # where the paused run is
 aitlc -w PROJ-1234 debug certify PROJ-1234 --times 2   # fresh instance, real feature, N passes
 aitlc -w PROJ-1234 debug stop PROJ-1234            # tear down the browser + session
 ```
+
+`stop` kills the browser only, by default — it does NOT fire the suite's real
+`after_scenario`/`after_feature` (a tag-driven logout, cleanup, etc.). Pass
+`--cleanup` to run those for real before exiting, when you deliberately want a
+clean handoff — never make it the default in your own workflow, since a
+`run --debug` session often reuses a *persistent* CDP browser across
+invocations, and an automatic logout there would silently reintroduce the
+repeated-login cost this whole engine exists to avoid.
 
 - `--at N` runs steps `0..N-1` through real behave and parks **on** N without
   running it; the first `next` runs N.
@@ -88,11 +97,23 @@ as `[project].playwright_cdp_env`) so the suite attaches instead of launching a
 fresh browser. `run` accepts `--cdp-url URL` / `--no-cdp`; `paver`/`behave`
 accept `--aitlc-cdp-url` / `--aitlc-no-cdp`.
 
-## Pause-on-failure
+## Pause-on-failure is a live session now, not a dead end
 
-`aitlc run --debug` halts on the first failed step **before teardown**, leaving
-the browser open for inspection — provided by aitlc's runner, so the suite needs
-no `after.py`/`environment.py` edit.
+`aitlc run --debug` runs every step normally; the moment one fails, the process
+parks into the SAME live, socket-served gate `debug start` uses — instead of
+exiting. There is no restart, and no separate `debug start` needed even for the
+first failure:
+
+```bash
+aitlc run PROJ-1234 --debug
+# → {"paused_on_failure": true, "resumable": true, "hint": "fix the code, then: aitlc debug retry PROJ-1234"}
+aitlc debug retry PROJ-1234   # fix the code, retry the exact failed step, same session
+```
+
+Provided entirely by aitlc's runner — the suite needs no `after.py`/
+`environment.py` edit. A crash before any step runs (a hooks/steps
+`SyntaxError`/`ImportError`) is reported as `crashed: true` with the real
+traceback instead, correctly distinguished from a genuine pause.
 
 ## Rules aitlc holds to (and you should too)
 
