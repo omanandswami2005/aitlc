@@ -52,10 +52,15 @@ row of a Scenario Outline can be run on its own.
 
 ```bash
 aitlc run PROJ-1234                 # structured JSON result
-aitlc run PROJ-1234 --debug         # halt on failure, browser stays open
+aitlc run PROJ-1234 --debug         # a real failure parks into a live session, not a dead end
 aitlc parallel run -j 4             # concurrent, without editing tags
 aitlc parallel focus PROJ-1234      # pin a selection, then just `aitlc parallel run`
 ```
+
+`--debug` runs the same engine `debug start` uses: on the first real failure the
+process parks into a live, socket-served session instead of exiting, so
+`aitlc debug retry PROJ-1234` continues it immediately — no restart, no
+guessed step index, even for the very first failure.
 
 **Debug a failure end to end.** A session holds one isolated browser and your
 position in the scenario, so fixing a step costs a re-run of *that step* rather
@@ -68,7 +73,14 @@ aitlc debug start PROJ-1234 --at 12      # isolated browser, driven to the step
 aitlc debug retry PROJ-1234              # edit -> re-run that step -> repeat
 aitlc debug next PROJ-1234               # forward, from the state you have
 aitlc debug certify PROJ-1234 --times 2  # fresh instance, real feature, twice
+aitlc debug stop PROJ-1234               # browser down; no cleanup hooks fired
+aitlc debug stop PROJ-1234 --cleanup     # + fires the suite's real after_scenario/after_feature first
 ```
+
+`stop --cleanup` is opt-in, never the default: the debug browser is often the
+persistent one `run --debug` reuses across invocations, and a suite's own
+cleanup can include a logout — reach for it only when you deliberately want a
+clean handoff.
 
 `retry` and `next` drive one paused behave process rather than spawning a new
 one each time. That is a correctness feature first: a process per step
@@ -160,6 +172,18 @@ directly with your project's `.env` and interpreter already set up, so adopting
 aitlc never means losing a flag it does not wrap — `aitlc paver run parallel
 --local` is your suite's own paver task, unchanged. `--print-command` shows the
 exact invocation without running it.
+
+**Get the same environment into your own shell.** aitlc's own commands load
+`.env` and resolve the interpreter for you — but sometimes you need it in the
+shell itself (a raw `poetry run behave`, a one-off script, `step_repl.py`):
+
+```bash
+source "$(aitlc env)"    # activates the venv, exports every .env key
+```
+
+One command, and nothing sensitive touches stdout: it writes the real
+`export ...` lines to an owner-only file and prints just the path, so the
+command is safe even through a logged/captured shell.
 
 **Reuse a live browser instead of paying setup every run.** Launch one debug
 Chrome and every behave-based command attaches to it instead of starting fresh:
