@@ -3,10 +3,9 @@
 What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-**Tracker: 48 of 48 gaps closed.** v0.5.0 closed the four gaps (G45–G48) raised
-against 0.4.0. v0.6.0 is an architecture release, below. Every row came from a
-real debugging session that the tool made harder than it needed to be; none of
-them are speculative features.
+**Tracker: 64 of 67 gaps closed.** Every row came from a real debugging
+session that the tool made harder than it needed to be; none of them are
+speculative features. See each version section below for what's in it.
 
 ## v0.6.0 — the fast loop is real behave (architecture)
 
@@ -39,6 +38,65 @@ data once, parses the tables, and fires the project's own hooks.
   its runner (`AITLC_PAUSE_ON_FAILURE`), so a project needs no `after.py` edit
   to keep the browser on a failed step.
 
+## v0.7.x — gate-unification hardening
+
+| # | Item | Shipped |
+|---|---|---|
+| G49 | `run --debug` crashed with `JSONDecodeError` when the runner halted on failure (no report file to parse) | `behave_runner.parse_report` catches the missing/empty report and returns an empty `RunResult`; `run --debug` distinguishes a genuine pause from a real crash via `crash_traceback`. |
+| G50 | `cdp launch` defaulted to a 375×812 mobile viewport for every scenario | Desktop (1920×1080) by default; `--mobile` opts a suite into the phone size. |
+| G51 | `steps run --range` never fired `before_feature`/`before_scenario`, so any hook-set `context` attribute (e.g. `context.screen_width`) was simply absent — an immediate `AttributeError` with no connection to the real cause | `apply_scenario_setup` (`core/step_console.py`) now defaults `screen_width`/`screen_height` unconditionally, before any early return, and reports `context_defaults_applied` so the default is visible rather than silent. |
+| G52 | `run` reported an empty, indistinguishable-from-nothing result (`exit_code:1, steps_by_status:{}`) when a hooks/steps module failed to import — no forensic trail anywhere | `behave_runner.run()` always captures stderr; when a run never wrote a report, the tail (gated on a real `Traceback` marker, not just "stderr is non-empty" — the first version of this false-flagged a genuine `--debug` pause as a crash) is surfaced as `crash_traceback` plus an explicit "don't just re-run" hint. |
+| G53 | A `run --debug` gate-on-failure park reported **where** (index/current step) but never **why** — no assertion/exception text anywhere in the `paused_on_failure` reply or `debug status`, even though the failed step's `error_message` was sitting right there and unused | `_gate_on_failure_run_hook` captures `step.error_message` into `self._aitlc_park_error`; `_status()` includes it as `"error"`; both `run --debug`'s `paused_on_failure` payload and `debug status`'s reply now forward it. |
+| G55 | A cleanly-**passing** `run --debug` scenario (0 failures, finished in under two minutes) was reported as `{"error": "did not finish or fail within 1800.0s"}` a full 30 minutes later — and held that test's run-lock for the entire false-timeout window, blocking any later `run`/`debug` on the same test id | `await_park_or_exit`'s liveness check used `os.kill(pid, 0)`, which still succeeds against an exited-but-unreaped zombie (the process that spawned the child never called `.wait()`/`.poll()` on it). Fixed by threading the actual `Popen` object through and polling it with `.poll()` — a real non-blocking `waitpid` that both reaps the child and returns instantly once it has actually exited. Regression-tested against a real subprocess (`tests/test_gate_launch.py`), not a mock of the OS boundary the bug lived in. |
+| G58 | `debug next`/`retry` crashed the entire gated behave process outright on the currently-shipped behave version — `AttributeError: module 'behave.matchers' has no attribute 'step_matcher'` inside `_reload_steps`, on every single call, since `_reload_steps` always reloads step modules before running the requested step | Newer behave split `use_step_matcher`/`step_matcher` out of `behave.matchers` into `behave.api.step_matchers`, and replaced the module-level `current_matcher` getter/setter with a factory (`use_current_step_matcher_as_default()`/`use_default_step_matcher()`), matching behave's own current `load_step_modules`. `_reload_steps` now probes for the new module first and only falls back to the pre-split `behave.matchers` attributes for an older behave — same "ask the tool, don't assume its version" principle as the rest of this project. This was the most impactful of the seven: every `next`/`retry` call was silently broken until this fixed it, on this environment's behave version. |
+| G54 | `debug retry`/`next`'s reload only re-execs files under `step_dir`, mirroring behave's own step-loading. A fix inside a page-object/helper module a step imports normally (a real Python `import`, not behave's exec-file loading) stayed cached in the live process's `sys.modules` — `retry`/`next` silently kept running the OLD code, with no warning the edit was skipped | `_reload_stale_project_modules` finds every project module (outside `step_dir`, under the project root) whose file changed since the session started and calls `importlib.reload()` on it — BEFORE `_reload_steps` re-execs the step files, so a step's own `from pages.search.search_page import SearchPage` resolves against the freshly-reloaded attribute, not a stale one. Works cleanly for this kind of codebase's common page-object shape (a class of `@staticmethod`s, no persistent module state) because `importlib.reload()` mutates the SAME module object in place. A module that genuinely can't reload (its own top-level code raises) reports its own error in a `warning`/`stale_modules` field instead of silently running stale code OR crashing the gate — verified both ways end-to-end: a real edit picked up and asserted on inside the re-run step, and a real reload failure surfaced cleanly. `run-text` (see below) gained the same reload-before-run contract `retry`/`next` already had. |
+| G59 | `debug stop` called `chrome_cdp.stop_all(root_dir)` — killing EVERY CDP Chrome tracked for the project, not just the one this session's own `debug start` launched. Found via live end-to-end testing, not the unit suite: a manually-launched, unrelated persistent Chrome in active use for a separate investigation was silently killed as collateral damage the moment an unrelated `debug stop` ran | `chrome_cdp.stop(root_dir, port=session.port)` — the already-existing, PID-verified scoped-stop function — replaces `stop_all`; `debug stop` now only ever touches the port its OWN `debug start` recorded. `stop_all` is unchanged for its one real caller, `aitlc cdp stop --all`, explicitly project-wide by design. |
+| G60 | `doctor` reported aitlc's own behave/playwright versions, not the target project's — measured a full major-version gap live | Probes the target's own env via `poetry run python -c ...`, falls back to aitlc's own only if that fails. |
+| G61 | Every `journal.record` call site left `duration_s` at 0.0 — always, everywhere | `run` sums real `ScenarioResult.duration_seconds`; the 3 `s3` commands wall-clock themselves. Verified live. |
+| G62 | `aitlc call` crashed every invocation — `NameError: time` never imported in `step_console.py` | Added the missing import. |
+| G63 | `aitlc call` never loaded `.env`, unlike every other command — silently broke on any project needing `ENVIRONMENT_URL`/secrets | `call_cmd.py` now loads it, matching `run`/`debug`/`doctor`. |
+| G64 | A failed scenario-setup made `call` report a useless "the console produced no result" — the real reason was sitting in an unrecognized `"done"` event | Result parser now surfaces the setup failure's own detail. |
+| G65 | `classify-failure` crashed (`AttributeError`) on a genuine "raw report.json" input — its own documented second accepted shape is a top-level list, not the dict it assumed | Reuses `behave_runner.parse_report` to handle the list shape too. |
+| G66 | `propose-fix --report` crashed the same way on the same raw report.json shape | Same fix as G65, applied there too. |
+
+Not yet closed:
+
+| # | Item | Status |
+|---|---|---|
+| G67 | `steps run`'s `unhandled_events` reported `feature_status: "failed"` next to 3 correctly-passed steps in `results` — the real, relied-on output was right; this diagnostic field was not | Not root-caused. A bare `parse_file()` on the same feature gives `Status.untested`/`.passed` depending on file — the actual code path reads `feature.status` AFTER real `before_scenario` hooks ran against it, and something in that sequence leaves it at `.failed`. Does not affect `results`' correctness. |
+| G56 | A live `debug next`/`retry` session reported `status=undefined` for a step whose exact text matched a registered step definition, after ~15+ `next`/`retry` calls and several live edits to the feature file (steps added earlier in the file, shifting every later cursor). | Not root-caused; may be related to G58 (a matcher-API crash can leave the registry/cursor in a state that looks like desync rather than a clean crash) — worth deliberately reproducing post-G58 before assuming it's still open as originally diagnosed. |
+| G57 | `run --debug` consistently failed to collect ANY steps for one particular feature/scenario that ran completely fine under plain `run` — parked immediately at `{"parked_at": 0, "current_step": null}` with `total: 0`. | Not root-caused; same caveat as G56 — re-verify against this specific feature/scenario shape post-G58 before continuing to chase it as a separate bug. |
+
+### New capabilities added alongside the above
+
+Not gap fixes — closing a real, previously-unreachable feature gap and a
+requested UX consistency pass, while the gate engine was already open for
+this round of work:
+
+- **`aitlc debug eval "<js-expr>"`** — evaluates a JS expression against the
+  live paused page via Playwright's `page.evaluate()`. The breakpoint()-
+  equivalent for the browser side of a paused session (read DOM state,
+  count/inspect elements, pull text) without editing a page object to add
+  one, and without needing a second CDP connection (G54/G55 in the older
+  numbering, before the gate-unification rewrite, both moot now — this
+  reads off the SAME live `context` the gate already holds).
+- **`aitlc debug run-text "<gherkin-step>"`** — exposes `core/step_console.py`'s
+  `run_text` gate command, which existed on the socket protocol already but
+  had no CLI command sending it. Runs any registered step against the live
+  paused context without advancing the debug cursor; gained the same
+  reload-before-run contract as `retry`/`next` (see G54 above) so it also
+  exercises your latest edit, not a stale one.
+- **Consistent step-count progress everywhere.** `aitlc run`'s live status
+  file (`live_status.py`, read via `--no-status`'s opt-out or polled
+  externally) now reports `step_index`/`step_total` for the current
+  scenario — the same `index`/`total` shape `debug status` already
+  reported, so "where am I" means the same thing regardless of which
+  command is running. `aitlc parallel run` gained a live "`[N/M] feature:
+  outcome`" line per completed feature (via `as_completed` instead of a
+  silently-blocking `pool.map`) plus a `.parallel/progress.json` file —
+  previously a parallel sweep gave zero visible progress until every
+  feature had finished, however long that took.
+
 ## v0.5.0 — delivered
 
 Four gaps found while running the shipped 0.4.0, all in the `debug` session
@@ -62,8 +120,9 @@ G33/G44 are why.
 
 ## Open
 
-Every gap raised from a real session is closed. What remains is verification
-that one of them fully delivers:
+Three gaps from v0.7.x dogfooding aren't root-caused yet (G56, G57, G67 —
+see that section above), plus verification that one older, already-shipped
+gap fully delivers:
 
 | # | Item | Status |
 |---|---|---|

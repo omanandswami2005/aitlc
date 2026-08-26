@@ -13,6 +13,7 @@ adapters/s3/evidence.py's trace search.
 from __future__ import annotations
 
 import json
+import time
 import os
 from pathlib import Path
 from typing import Any
@@ -294,6 +295,7 @@ def triage_run(
     hand-writing a parser. The per-execution Behave JSON is a fraction of the
     HTML report's size and already carries per-step status and error text.
     """
+    _started = time.time()
     config = AitlcConfig.find_and_load()
     if not config.s3_bucket:
         typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
@@ -363,6 +365,7 @@ def triage_run(
         command="s3 triage-run",
         argv=[a for a in [at, suite] if a],
         exit_code=0 if not result.failures else 1,
+        duration_s=round(time.time() - _started, 2),
         payload=payload,
         tags=["triage"],
     )
@@ -466,6 +469,7 @@ def verify_test(
     structured, and carries the scenario tags that make a nested test key
     findable at all.
     """
+    _started = time.time()
     config = AitlcConfig.find_and_load()
     if not config.s3_bucket:
         typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
@@ -527,6 +531,7 @@ def verify_test(
         command="s3 verify-test",
         argv=list(test_keys),
         exit_code=1 if any_failed else 0,
+        duration_s=round(time.time() - _started, 2),
         payload=payload,
         tags=["triage"],
     )
@@ -565,6 +570,7 @@ def history_compare(
     The result is also written to `reports/.aitlc/test-history.json`, so the
     next person reads the answer instead of re-downloading every artifact.
     """
+    _started = time.time()
     config = AitlcConfig.find_and_load()
     if not config.s3_bucket:
         typer.echo(json.dumps({"error": "aitlc.toml has no [s3].bucket set"}), err=True)
@@ -661,6 +667,7 @@ def history_compare(
         command="s3 history",
         argv=list(test_keys),
         exit_code=0,
+        duration_s=round(time.time() - _started, 2),
         payload={"runs": wanted_runs, "tests": [h.test_key for h in histories]},
         tags=["triage"],
     )

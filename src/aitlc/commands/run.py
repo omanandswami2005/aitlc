@@ -452,7 +452,7 @@ def run(
             name_pattern=name,
             dry_run=dry_run,
         )
-        outcome = gate_launch.await_park_or_exit(gate_socket, proc.pid, debug_timeout)
+        outcome = gate_launch.await_park_or_exit(gate_socket, proc, debug_timeout)
 
         if outcome == "timeout":
             # The process is still running somewhere; say so rather than
@@ -584,6 +584,7 @@ def run(
                     "test_id": parked.session.test_id,
                     "parked_at": parked.status_reply.get("index"),
                     "current_step": parked.status_reply.get("current_step"),
+                    "error": parked.status_reply.get("error"),
                     "cdp_url": parked.session.cdp_url,
                     "hint": f"fix the code, then: aitlc debug retry {parked.session.test_id}",
                 },
@@ -629,11 +630,22 @@ def run(
     # Journalled because this is the most expensive command in the tool: a run
     # takes minutes and, on suites that create users or move balances, changes
     # real state. Re-running it to re-read an answer is the cost this avoids.
+    # Real bug found live: every `journal.record` call site in the codebase
+    # left `duration_s` at its 0.0 default -- `journal list`/`diff` always
+    # reported 0.0 regardless of a run actually taking 13s or 30 minutes,
+    # even though the real figure was sitting right there: behave's own
+    # per-step timing, already summed into each `ScenarioResult.duration_seconds`
+    # by `parse_report`. Wall-clock timing the whole CLI invocation would
+    # also count aitlc's own overhead (lock wait, CDP setup); summing the
+    # scenarios' own durations reports what the SUITE actually took, which
+    # is what "did my fix make this faster" (`journal diff`'s stated purpose)
+    # needs.
     journal.record(
         config.root_dir,
         command="run",
         argv=[base_test_id],
         exit_code=0 if result.passed else 1,
+        duration_s=sum(s.duration_seconds for s in result.scenarios),
         payload=payload,
         secret_values=secret_values,
         tags=["run", base_test_id],

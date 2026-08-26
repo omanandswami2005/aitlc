@@ -50,6 +50,7 @@ plus behave itself (guaranteed present: behave is what loaded it).
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -63,6 +64,12 @@ try:
     from behave.runner import Runner as _BaseRunner
 except ImportError:  # pragma: no cover - only when behave is absent
     _BaseRunner = object
+
+# Fires the instant this module is imported -- essentially "process start",
+# since the gate subprocess imports it very early via the --runner attach,
+# before any project code runs. Used by `_stale_project_modules` (G54) as
+# the "has this file changed since the session began" reference point.
+_MODULE_LOAD_TIME = time.time()
 
 
 def _status_name(obj: Any) -> str | None:
@@ -229,6 +236,11 @@ class AitlcRunner(_BaseRunner):
             # a bookkeeping mismatch.
             cursor = len(steps)
         self._aitlc_steps = steps
+        # The one thing worth parking for: without this, `status`/the initial
+        # `paused_on_failure` reply and every later `debug status` say WHERE
+        # (index/current_step) but never WHY -- the actual assertion/exception
+        # text is sitting right here on `step` and was otherwise discarded.
+        self._aitlc_park_error = str(getattr(step, "error_message", "") or "")[:500] or None
         self._serve(context, start_cursor=cursor)
 
     # --------------------------------------------------------------- gate mode
@@ -436,6 +448,34 @@ class AitlcRunner(_BaseRunner):
             "duration_s": round(time.time() - started, 2),
         }
 
+    def _side_eval(self, context: Any, expr: str) -> dict:
+        """Evaluate a JS expression against the live page (Playwright's page.evaluate()).
+
+        The breakpoint()-equivalent for the browser side of a paused session:
+        read live DOM state, count/inspect elements, pull text -- without
+        advancing the cursor, touching the step registry, or leaving the
+        gate. Never raises into the server loop; a bad expression or a
+        page that can't be found both come back as `{"error": ...}`.
+        """
+        self._aitlc_suspended = True
+        started = time.time()
+        try:
+            page = _find_page(context)
+            if page is None:
+                return {
+                    "error": "no live page found on context",
+                    "duration_s": round(time.time() - started, 2),
+                }
+            result = page.evaluate(expr)
+            return {"result": result, "duration_s": round(time.time() - started, 2)}
+        except Exception as exc:  # noqa: BLE001 - report, never crash the server
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_s": round(time.time() - started, 2),
+            }
+        finally:
+            self._aitlc_suspended = False
+
     def _reload_steps(self, step_dir: str) -> list:
         """Re-execute the project's step files so an edit is picked up.
 
@@ -478,18 +518,47 @@ class AitlcRunner(_BaseRunner):
         if not step_dir or not os.path.isdir(step_dir):
             return []
         try:
-            from behave import matchers
             from behave.runner_util import exec_file, PathManager
             from behave.step_registry import setup_step_decorators
         except Exception:  # noqa: BLE001 - behave absent/renamed must not kill the session
             return []
 
+        # Real bug found live: newer behave split `use_step_matcher`/
+        # `step_matcher` out of `behave.matchers` into `behave.api.step_matchers`,
+        # and dropped the module-level `matchers.current_matcher` getter/setter
+        # entirely in favour of a factory object (`get_step_matcher_factory()`)
+        # with `use_current_step_matcher_as_default()`/`use_default_step_matcher()`
+        # helpers. The old code always imported the pre-split names, so every
+        # `next`/`retry` call crashed the whole gated behave process outright
+        # (AttributeError, uncaught, killing the one thing worth debugging) on
+        # any behave version past that split -- probe for the new module first,
+        # matching `load_step_modules`'s own current implementation exactly,
+        # and only fall back to the old module-level attributes for a behave
+        # old enough to still have them (same "ask the tool" principle as
+        # attach.py's own behave-version probing elsewhere in this project).
+        try:
+            from behave.api.step_matchers import step_matcher, use_step_matcher
+            from behave.matchers import (
+                use_current_step_matcher_as_default,
+                use_default_step_matcher,
+            )
+            modern_matcher_api = True
+        except ImportError:
+            from behave import matchers
+
+            use_step_matcher = matchers.use_step_matcher
+            step_matcher = matchers.step_matcher
+            modern_matcher_api = False
+
         step_globals_base = {
-            "use_step_matcher": matchers.use_step_matcher,
-            "step_matcher": matchers.step_matcher,  # -- deprecating, same as load_step_modules
+            "use_step_matcher": use_step_matcher,
+            "step_matcher": step_matcher,  # -- deprecating, same as load_step_modules
         }
         setup_step_decorators(step_globals_base, registry=self.step_registry)
-        default_matcher = matchers.current_matcher
+        if modern_matcher_api:
+            use_current_step_matcher_as_default()
+        else:
+            default_matcher = matchers.current_matcher
 
         reloaded: list[str] = []
         with PathManager([step_dir]):
@@ -503,7 +572,10 @@ class AitlcRunner(_BaseRunner):
                     reloaded.append(file_path)
                 except Exception:  # noqa: BLE001 - a bad edit must not kill the session
                     pass
-                matchers.current_matcher = default_matcher
+                if modern_matcher_api:
+                    use_default_step_matcher()
+                else:
+                    matchers.current_matcher = default_matcher
         return reloaded
 
     def _evict_step_registrations_for_file(self, file_path: str) -> None:
@@ -540,6 +612,72 @@ class AitlcRunner(_BaseRunner):
                 != target
             ]
 
+    def _reload_stale_project_modules(self, step_dir: str) -> dict:
+        """Auto-reload project modules edited since the session started.
+
+        `_reload_steps` only re-execs files directly under `step_dir`,
+        mirroring behave's own step loading. Anything a step imports
+        NORMALLY (a page object, a helper, `common_page_function.py`, ...)
+        is a real Python `import`, cached in `sys.modules` by the
+        interpreter itself; nothing about that reload touches it. Found
+        live: an edit to a page-object function kept silently running the
+        OLD code through any number of `retry` calls, with no error or
+        warning that the fix was never actually exercised.
+
+        `importlib.reload()` handles this correctly for the common shape in
+        this kind of codebase -- a page object as a class of `@staticmethod`s
+        with no persistent module-level state -- because it mutates the
+        SAME module object/namespace `sys.modules` already holds in place,
+        rather than creating a new one. That matters for ordering: this
+        must run BEFORE `_reload_steps` re-execs the step files below, so a
+        step file's own `from pages.search.search_page import SearchPage`
+        (re-run fresh by that exec) resolves against the UPDATED attribute,
+        not a stale one captured before this ran.
+
+        A module that genuinely can't reload cleanly (a real error the
+        module's own top-level code raises -- an open resource, a bound
+        singleton, whatever) reports its own error rather than either
+        silently running stale code or crashing the whole gate; the caller
+        (`_serve`'s "reload" branch) surfaces that as a warning naming a
+        fresh session as the fallback for exactly those files, not for
+        every file that changed.
+
+        Returns `{"reloaded": [...], "failed": {path: error}}`, both keyed
+        by project-relative path, empty when nothing changed. Best-effort
+        throughout: an unreadable path or a module with no real file on
+        disk is skipped rather than raising into the gate's request/reply
+        loop.
+        """
+        root = os.path.abspath(os.getcwd())
+        step_dir_abs = os.path.abspath(step_dir) if step_dir else None
+        reloaded: list[str] = []
+        failed: dict[str, str] = {}
+        for name, module in list(sys.modules.items()):
+            file_path = getattr(module, "__file__", None)
+            if not file_path:
+                continue
+            try:
+                file_abs = os.path.abspath(file_path)
+            except (OSError, ValueError, TypeError):
+                continue
+            if not file_abs.startswith(root + os.sep):
+                continue  # stdlib / site-packages / aitlc itself -- not this project
+            if step_dir_abs and file_abs.startswith(step_dir_abs + os.sep):
+                continue  # already correctly reloaded by _reload_steps
+            try:
+                mtime = os.path.getmtime(file_abs)
+            except OSError:
+                continue
+            if mtime <= _MODULE_LOAD_TIME:
+                continue
+            rel = os.path.relpath(file_abs, root)
+            try:
+                importlib.reload(sys.modules[name])
+                reloaded.append(rel)
+            except Exception as exc:  # noqa: BLE001 - report, never crash the session
+                failed[rel] = f"{type(exc).__name__}: {exc}"
+        return {"reloaded": sorted(reloaded), "failed": failed}
+
     def _status(self, cursor: int, steps: list) -> dict:
         return {
             "event": "status",
@@ -547,6 +685,10 @@ class AitlcRunner(_BaseRunner):
             "total": len(steps),
             "current_step": self._step_text(steps[cursor]) if cursor < len(steps) else None,
             "finished": cursor >= len(steps),
+            # None for a plain `debug start --at N` park (nothing failed --
+            # there is nothing to explain); the captured assertion/exception
+            # text for a `run --debug` gate-on-failure park.
+            "error": getattr(self, "_aitlc_park_error", None),
         }
 
     def _write_progress(self, *, state: str, done: int = 0, **extra: Any) -> None:
@@ -686,7 +828,16 @@ class AitlcRunner(_BaseRunner):
                         self._send(conn, {"finished": True, "index": cursor})
                 elif cmd == "run_text":
                     self._send(conn, self._side_run_text(context, request.get("text", "")))
+                elif cmd == "eval":
+                    self._send(conn, self._side_eval(context, request.get("expr", "")))
                 elif cmd == "reload":
+                    # G54: reload a page-object/helper edit BEFORE the step
+                    # files below, so a step's own `from pages.search... import
+                    # SearchPage` (re-run fresh by _reload_steps) resolves
+                    # against the just-updated attribute, not a stale one.
+                    module_reload = self._reload_stale_project_modules(
+                        request.get("step_dir", "")
+                    )
                     reloaded = self._reload_steps(request.get("step_dir", ""))
                     # Pick up a Gherkin edit too: re-parse and follow the cursor,
                     # so the debugging loop's most common edit needs no restart.
@@ -694,7 +845,21 @@ class AitlcRunner(_BaseRunner):
                     if feature_info is not None:
                         steps = self._aitlc_steps
                         cursor = feature_info["index"]
-                    self._send(conn, {"reloaded": reloaded, "feature": feature_info})
+                    reply = {"reloaded": reloaded, "feature": feature_info}
+                    if module_reload["reloaded"]:
+                        reply["reloaded_modules"] = module_reload["reloaded"]
+                    if module_reload["failed"]:
+                        reply["stale_modules"] = sorted(module_reload["failed"])
+                        reply["warning"] = (
+                            f"{len(module_reload['failed'])} file(s) changed since this "
+                            "session started could not be reloaded automatically -- "
+                            "start a fresh session to exercise these edits: "
+                            + "; ".join(
+                                f"{path} ({err})"
+                                for path, err in sorted(module_reload["failed"].items())
+                            )
+                        )
+                    self._send(conn, reply)
                 elif cmd == "stop":
                     reply = {"stopped": True}
                     if request.get("cleanup"):

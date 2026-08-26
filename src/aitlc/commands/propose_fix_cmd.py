@@ -16,6 +16,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
+from aitlc.core import behave_runner
 from aitlc.core.blast_radius import check as blast_radius_check
 from aitlc.core.patterns import PatternLibrary
 
@@ -48,9 +49,15 @@ def propose_fix(
         patterns_path = config.root_dir / "patterns.yaml"
         if patterns_path.exists():
             payload = json.loads(prior_report.read_text())
+            if isinstance(payload, list):
+                # Same raw report.json shape classify-failure accepts.
+                result = behave_runner.parse_report(prior_report)
+                failures = [{"step": f.step, "error": f.error} for f in result.failures]
+            else:
+                failures = payload.get("failures", [])
             library = PatternLibrary.load(patterns_path)
             classification_lines = []
-            for failure in payload.get("failures", []):
+            for failure in failures:
                 match = library.classify(
                     failure.get("step", ""), failure.get("error", "")
                 )

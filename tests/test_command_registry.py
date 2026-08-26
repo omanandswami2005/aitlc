@@ -19,6 +19,7 @@ runner = CliRunner()
 # (aitlc behave / aitlc pw), mounted last.
 EXPECTED_ORDER = [
     "run",
+    "env",
     "doctor",
     "init",
     "classify-failure",
@@ -86,6 +87,7 @@ def test_plain_command_requires_a_name():
 
 _PLAIN = {
     "run",
+    "env",
     "doctor",
     "init",
     "classify-failure",

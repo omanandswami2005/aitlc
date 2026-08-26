@@ -209,9 +209,11 @@ See [`INTEGRATION.md`](INTEGRATION.md) for the full contract.
 aitlc debug start PROJ-1234 --at 12    # isolated browser, driven to step 12
 aitlc debug next PROJ-1234             # run the step under the cursor, then advance
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
+aitlc debug eval PROJ-1234 "document.title"          # raw JS on the live page
+aitlc debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
 aitlc debug status PROJ-1234           # where am I?
 aitlc debug certify PROJ-1234 --times 2
-aitlc debug stop PROJ-1234              # browser down; no cleanup hooks fired
+aitlc debug stop PROJ-1234              # THIS session's browser down; no cleanup hooks fired
 aitlc debug stop PROJ-1234 --cleanup    # + fires the suite's real after_scenario/after_feature first
 ```
 
@@ -275,9 +277,14 @@ needs more than a viewport default.
 
 **Python — a step definition, a page object, a locator.** Picked up
 automatically: before it runs a step, `retry`/`next` reload your project's step
-modules, so the paused behave process dispatches against your edit rather than
-code imported minutes ago. You pay the reload once; the browser, the Context and
-the run-scoped data stay live across it.
+modules, **and** any other project module a step imports normally (a page
+object, a helper) whose file changed since the session started, in that
+order — a step's own `from pages.search.search_page import SearchPage`
+resolves against the freshly-reloaded attribute, not a stale one. A module
+that genuinely can't reload cleanly (its own top-level code raises) reports
+its own error in the reply rather than silently running stale code. You pay
+the reload once; the browser, the Context and the run-scoped data stay live
+across it.
 
 **Gherkin — the feature file itself.** Picked up automatically, no restart.
 Before each `next`/`retry` the gate re-parses the feature with behave's own
@@ -332,6 +339,10 @@ seen in the *opposite* state: without that check, an element already hidden
 (because the page never loaded) reports a confident "cleared in 0.4s" for
 something that never happened.
 
+Already inside a paused `debug` session (not a bare `cdp launch`)? `aitlc
+debug eval TEST-ID "<js-expr>"` reads the same live page without needing the
+port — it runs against whichever page the gate finds on the paused Context.
+
 ---
 
 ## Calling your own code
@@ -347,7 +358,10 @@ actually think is signed in" — is not a step and had no expression at all.
 
 Runs in your project's interpreter, where its modules are importable. Whether
 the browser handle is passed is read from the signature; `--pass-browser
-yes|no` overrides.
+yes|no` overrides. Loads `.env` first, same as `run`/`debug`/`doctor` — a
+project function that reads a secret or `ENVIRONMENT_URL` works the same way
+it would in a real run, not just when those happen to already be exported in
+your shell.
 
 ---
 
@@ -535,8 +549,15 @@ aitlc doctor                 # versions, and which code path is live
 aitlc steps unused           # dead step definitions, via behave's own registry
 aitlc locators lint          # positional selectors, grid indexes, `.first`
 aitlc history show           # locally recorded outcomes, flakiest first
-aitlc journal list           # what was run, and what it produced
+aitlc journal list           # what was run, how long it took, what it produced
 ```
+
+`doctor`'s `behave`/`playwright` versions are resolved from the TARGET
+project's own environment (a `poetry run python -c ...` probe), not aitlc's
+own — the two commonly differ when aitlc is installed separately from the
+project it's debugging, and the project's own version is the one that
+actually runs every step. `versions_from` in the output says which one you're
+looking at; it falls back to aitlc's own only if that probe itself can't run.
 
 ---
 

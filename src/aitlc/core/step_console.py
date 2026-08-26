@@ -35,6 +35,7 @@ from datetime import datetime
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -369,6 +370,7 @@ def call_project_function(
         cmd += ["--browser-actions", browser_actions]
 
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    setup_failure = None
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -379,10 +381,19 @@ def call_project_function(
             continue
         if record.get("event") in ("call_result", "call_error"):
             return record
+        # A failed scenario_setup exits via a "done" event before _run_call
+        # ever runs -- neither call_result nor call_error, so this loop
+        # would otherwise fall through to a generic, unhelpful message
+        # while the real reason (e.g. a project TypeError) sat right here.
+        if record.get("event") == "scenario_setup" and record.get("status") == "failed":
+            setup_failure = record.get("detail")
+    error = "the console produced no result"
+    if setup_failure:
+        error = f"scenario setup failed before the call ran: {setup_failure}"
     return {
         "event": "call_error",
         "target": spec,
-        "error": "the console produced no result",
+        "error": error,
         "stderr_tail": "\n".join(proc.stderr.strip().splitlines()[-12:]),
     }
 

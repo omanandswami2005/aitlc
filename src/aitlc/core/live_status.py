@@ -38,10 +38,23 @@ class LiveStatusFormatter(Formatter):
         self._status_path = os.environ.get("AITLC_STATUS_FILE")
         self._steps_passed = 0
         self._steps_failed = 0
+        self._scenario_total_steps = 0
+        self._scenario_step_index = 0
         self._start = time.monotonic()
+
+    def scenario(self, scenario: Any) -> None:
+        """Record the step count for the scenario now starting.
+
+        Without this, a status-file reader only ever sees a running
+        passed/failed tally -- no way to tell "3 steps in" from "3 of 47",
+        which is the difference between "on track" and "basically done".
+        """
+        self._scenario_total_steps = len(getattr(scenario, "steps", None) or [])
+        self._scenario_step_index = 0
 
     def step(self, step: Any) -> None:
         """Record a step as it is about to run."""
+        self._scenario_step_index += 1
         self._write(step, "running")
 
     def result(self, step: Any) -> None:
@@ -62,6 +75,12 @@ class LiveStatusFormatter(Formatter):
             "elapsed_s": round(time.monotonic() - self._start, 1),
             "steps_passed": self._steps_passed,
             "steps_failed": self._steps_failed,
+            # Current step's 1-based position in ITS scenario, and that
+            # scenario's own step count -- same "index/total" shape `aitlc
+            # debug status` already reports, for one consistent progress
+            # indicator across every aitlc command that has a notion of steps.
+            "step_index": self._scenario_step_index,
+            "step_total": self._scenario_total_steps,
         }
         tmp_path = f"{self._status_path}.tmp"
         with open(tmp_path, "w") as f:

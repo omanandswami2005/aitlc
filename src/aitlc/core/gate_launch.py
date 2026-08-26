@@ -109,26 +109,32 @@ def launch(
     return proc
 
 
-def _pid_alive(pid: int) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def await_park_or_exit(socket_path_: Path, pid: int, timeout_s: float) -> dict | str:
+def await_park_or_exit(
+    socket_path_: Path, proc: subprocess.Popen, timeout_s: float
+) -> dict | str:
     """Wait for the gate to park, or the process to exit first.
 
     Returns the status dict once parked; `"exited"` if the process ended
     before parking (finished normally with no failure, a setup step failed
     and `behave --stop` aborted, or it crashed); `"timeout"` otherwise.
+
+    Takes the `Popen` object, not a bare pid, and polls it with `.poll()`
+    -- NOT an `os.kill(pid, 0)` liveness check. This process is the child's
+    real parent (`start_new_session=True` puts it in a new session, but
+    does not reparent it), so until something calls `.wait()`/`.poll()` on
+    it, a child that has already exited sits as a zombie: `os.kill(pid, 0)`
+    still succeeds against a zombie's PID (the kernel keeps the entry until
+    reaped), so a pid-based check can never observe the exit at all. Found
+    live: a real behave run that finished cleanly in under two minutes
+    (0 failures, no park -- nothing to serve) was reported as
+    `{"error": "did not finish or fail within 1800.0s"}` a full 30 minutes
+    later, purely because nothing ever reaped it. `.poll()` performs the
+    real non-blocking `waitpid` and returns the exit code the moment it is
+    available, which both reaps the child and gives an accurate answer.
     """
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if not _pid_alive(pid):
+        if proc.poll() is not None:
             return "exited"
         try:
             return gate_client.request(socket_path_, "status")

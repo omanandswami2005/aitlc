@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
+from aitlc.core import behave_runner
 from aitlc.core.patterns import PatternLibrary
 
 
@@ -37,7 +38,15 @@ def classify_failure(
     library = PatternLibrary.load(resolved_patterns_path)
 
     payload = json.loads(report_json.read_text())
-    failures = payload.get("failures", [])
+    if isinstance(payload, list):
+        # Crashed here on a genuine "raw report.json" input: behave's own
+        # json.pretty output IS a top-level list, not the dict shape
+        # `aitlc run`'s own stdout produces -- parse_report already knows
+        # how to walk it into the same {step, error} shape below.
+        result = behave_runner.parse_report(report_json)
+        failures = [{"step": f.step, "error": f.error} for f in result.failures]
+    else:
+        failures = payload.get("failures", [])
 
     results = []
     any_unmatched = False

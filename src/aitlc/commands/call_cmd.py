@@ -14,6 +14,7 @@ import json
 import typer
 from aitlc.config import AitlcConfig
 from aitlc.core import behave_runner, chrome_cdp, step_console
+from aitlc.core.dotenv import load_dotenv
 
 app = typer.Typer(help="Call a project function against the live debug browser.")
 
@@ -34,11 +35,13 @@ def call(
         "--pass-browser",
         help="Pass the browser handle first: auto (detect from the signature), yes, no.",
     ),
+    env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Call a project function and print what it returned."""
     if ctx.invoked_subcommand:
         return
     config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
 
     url = cdp_url
     if not url:

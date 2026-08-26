@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Any
 
 import typer
 from aitlc.config import AitlcConfig
@@ -156,13 +157,14 @@ def start(
         {"state": "running", "test_id": test_id, "target": at, "done": 0,
          "started_at": time.time()},
     )
-    pid = gate_launch.launch(
+    proc = gate_launch.launch(
         config, feature=feature, line=line,
         cdp_url=instance.cdp_url, socket_path_=socket_path,
         progress_path=progress_path,
         gate_env={"AITLC_GATE": "1", "AITLC_GATE_AT": str(at), "AITLC_GATE_EXAMPLE": str(example)},
         log_name="gate.log",
-    ).pid
+    )
+    pid = proc.pid
     session = debug_session.DebugSession(
         test_id=test_id, feature=str(feature), cdp_url=instance.cdp_url,
         port=instance.port, example=example, socket=str(socket_path), pid=pid, park=at,
@@ -185,7 +187,7 @@ def start(
         )
         return
 
-    outcome = gate_launch.await_park_or_exit(socket_path, pid, timeout)
+    outcome = gate_launch.await_park_or_exit(socket_path, proc, timeout)
     if outcome == "exited":
         # behave --stop aborts on a failed setup step: the gate never parked.
         # This is the faithful "parked on a broken precondition" signal (G46).
@@ -264,6 +266,7 @@ def status(test_id: str = typer.Argument(None)) -> None:
                         "total_steps": reply.get("total"),
                         "current_step": reply.get("current_step"),
                         "finished": reply.get("finished"),
+                        "error": reply.get("error"),
                     },
                     indent=2,
                 )
@@ -286,18 +289,18 @@ def status(test_id: str = typer.Argument(None)) -> None:
     raise typer.Exit(code=2)
 
 
-def _drive(config, test_id: str, cmd: str) -> None:
-    """Send one stepping command to the gate and report the reply."""
-    session = _require(config, test_id)
+def _request_or_die(session: debug_session.DebugSession, cmd: str, **kwargs: Any) -> dict:
+    """Send one command to the live gate, or report unreachable and exit.
+
+    Shared by every command that talks to an already-parked session
+    (`retry`/`next` via `_drive`, and `run-text`/`eval` below) so the
+    "session no longer reachable" error is worded once, not once per verb.
+    """
     if not session.socket:
         typer.echo(json.dumps({"error": "session has no gate socket"}), err=True)
         raise typer.Exit(code=2)
     try:
-        # Pick up an edited step definition AND a Gherkin edit before running:
-        # `retry`/`next` must mean "run this again with my change" — for both
-        # Python and the feature file — not against a stale parse.
-        reload_reply = gate_client.request(session.socket, "reload", step_dir=config.step_dir)
-        reply = gate_client.request(session.socket, cmd)
+        return gate_client.request(session.socket, cmd, **kwargs)
     except (gate_client.GateUnavailable, OSError):
         typer.echo(
             json.dumps(
@@ -310,9 +313,29 @@ def _drive(config, test_id: str, cmd: str) -> None:
         )
         raise typer.Exit(code=3)
 
+
+def _drive(config, test_id: str, cmd: str) -> None:
+    """Send one stepping command to the gate and report the reply."""
+    session = _require(config, test_id)
+    # Pick up an edited step definition AND a Gherkin edit before running:
+    # `retry`/`next` must mean "run this again with my change" — for both
+    # Python and the feature file — not against a stale parse.
+    reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+    reply = _request_or_die(session, cmd)
+
     if isinstance(reload_reply, dict) and reload_reply.get("feature"):
         # A Gherkin edit was picked up: report how the cursor moved.
         reply["feature"] = reload_reply["feature"]
+    if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
+        # G54: confirms a page-object/helper edit outside step_dir WAS picked
+        # up automatically -- positive signal, not just silence when it works.
+        reply["reloaded_modules"] = reload_reply["reloaded_modules"]
+    if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
+        # G54: a page-object/helper edit outside step_dir stays cached in
+        # sys.modules -- surface it here so `retry`/`next` never look like a
+        # clean run of code that was never actually re-executed.
+        reply["stale_modules"] = reload_reply["stale_modules"]
+        reply["warning"] = reload_reply["warning"]
     if reply.get("index") is not None:
         session.index = reply["index"]
         debug_session.save(config.root_dir, session)
@@ -340,6 +363,62 @@ def next_step(
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     _drive(config, _default_id(config, test_id), "next")
+
+
+@app.command("run-text")
+def run_text(
+    text: str = typer.Argument(
+        ..., help='Ad-hoc Gherkin step text, e.g. \'click on element ID: "save_btn"\'.'
+    ),
+    test_id: str = typer.Argument(None),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
+    """Run one ad-hoc Gherkin step against the live paused context.
+
+    Any step already registered in the project works, not just the ones in
+    the paused feature file -- the same live browser, login and setup the
+    session already paid for, without advancing the debug cursor: `next`
+    still runs the same step it would have before this. This is
+    `core/step_console.py`'s `run_text` gate command (already built, wired
+    to nothing) exposed as a real command.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    session = _require(config, _default_id(config, test_id))
+    # Same "pick up an edit before running" contract as retry/next -- an
+    # ad-hoc step should exercise your latest code, not whatever was live
+    # when the session started.
+    reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+    reply = _request_or_die(session, "run_text", text=text)
+    if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
+        reply["reloaded_modules"] = reload_reply["reloaded_modules"]
+    if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
+        reply["stale_modules"] = reload_reply["stale_modules"]
+        reply["warning"] = reload_reply["warning"]
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
+
+
+@app.command("eval")
+def eval_js(
+    expr: str = typer.Argument(..., help="JavaScript expression to evaluate on the live page."),
+    test_id: str = typer.Argument(None),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
+    """Evaluate a JS expression against the live paused browser page.
+
+    Runs via Playwright's `page.evaluate()` against whichever page the gate
+    finds on the live context -- read DOM state, count/inspect elements,
+    pull text -- without advancing the debug cursor or touching the step
+    registry. The breakpoint()-equivalent for the browser side of a paused
+    session, reachable without editing a page object to add one.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    session = _require(config, _default_id(config, test_id))
+    reply = _request_or_die(session, "eval", expr=expr)
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if not reply.get("error") else 1)
 
 
 @app.command("stop")
@@ -371,10 +450,20 @@ def stop(
             cleanup_result = reply.get("cleanup")
         except (gate_client.GateUnavailable, OSError):
             pass
-    stopped = chrome_cdp.stop_all(config.root_dir)
+    # Only THIS session's own browser -- real bug found live: `stop_all`
+    # kills every CDP instance tracked for the project, including an
+    # unrelated persistent Chrome someone launched separately (`aitlc cdp
+    # launch` for manual work, or another `run --debug`'s reused browser)
+    # that this session never touched. `session.port` is exactly the one
+    # `debug start` launched for this test id; stop only that.
+    stopped_this_session = chrome_cdp.stop(config.root_dir, port=session.port)
     debug_session.clear(config.root_dir, test_id)
     debug_session.clear_progress(config.root_dir, test_id)
-    payload = {"gate_stopped": gate_stopped, "stopped_ports": stopped, "session_cleared": True}
+    payload = {
+        "gate_stopped": gate_stopped,
+        "stopped_port": session.port if stopped_this_session else None,
+        "session_cleared": True,
+    }
     if cleanup:
         # Never silently claim success: if cleanup was asked for but the
         # gate was unreachable to run it, say so rather than staying quiet.

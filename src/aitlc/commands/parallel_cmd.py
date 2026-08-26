@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import queue
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import typer
@@ -377,8 +377,28 @@ def run(
         )
         return payload
 
+    total = len(to_run)
+    progress_path = workspace.output_path(config.root_dir, ".parallel", "progress.json")
+    results: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        results = list(pool.map(_run_one, enumerate(to_run)))
+        futures = [pool.submit(_run_one, item) for item in enumerate(to_run)]
+        for future in as_completed(futures):
+            row = future.result()
+            results.append(row)
+            # One "N/M done" line per completion, live -- `pool.map` above
+            # blocked silently until every feature finished, the only signal
+            # being the final combined JSON; a run of twenty features gave
+            # zero visible progress for however long the slowest one took.
+            typer.echo(
+                f"[{len(results)}/{total}] {row['feature']}: {row['outcome']}",
+                err=True,
+            )
+            try:
+                progress_path.write_text(
+                    json.dumps({"done": len(results), "total": total})
+                )
+            except OSError:
+                pass
 
     failed = [r for r in results if not r["passed"]]
 

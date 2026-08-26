@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
 from aitlc.adapters.lambdatest import tunnel as tunnel_adapter
 from aitlc.config import AitlcConfig
+from aitlc.core import behave_runner
 from aitlc.core.dotenv import load_dotenv
 
 
@@ -76,7 +78,54 @@ def _check_tunnel_health(log_path: Path) -> CheckResult:
     return CheckResult("LT tunnel", status.healthy, status.detail)
 
 
-def _versions() -> dict:
+def _target_env_versions(root_dir: Path) -> dict | None:
+    """Resolve behave/playwright versions from the TARGET PROJECT's own environment.
+
+    Real bug found live: `run`/`debug` invoke behave as a subprocess in the
+    TARGET project's own environment (`resolve_poetry() + ["run", "behave", ...]`
+    in `behave_runner.build_command`) -- a separate Python environment from
+    whatever aitlc itself happens to be installed under. On a pip-installed
+    aitlc (the common case, not a project-local editable install) these two
+    environments routinely differ: measured live, aitlc's own venv reported
+    behave 1.3.3 while the target project's real poetry venv -- the one that
+    actually runs every step -- had 1.2.7.dev2. Reporting the former as "the"
+    behave version silently describes an environment that never executes a
+    single step; `doctor`'s whole point (G24) is to say what will ACTUALLY
+    run, so this asks the project's own `poetry run python` directly instead
+    of trusting `importlib.metadata` in aitlc's own process.
+
+    Returns `None` (not an empty dict) if the probe itself couldn't run at
+    all (no poetry, no python) -- the caller falls back to aitlc's own
+    versions in that case, since "unknown" is worse than "aitlc's own, which
+    may differ" when there's truly nothing else to go on.
+    """
+    probe = (
+        "import json\n"
+        "from importlib.metadata import version, PackageNotFoundError\n"
+        "out = {}\n"
+        "for pkg in ('behave', 'playwright'):\n"
+        "    try:\n"
+        "        out[pkg] = version(pkg)\n"
+        "    except PackageNotFoundError:\n"
+        "        out[pkg] = 'not installed'\n"
+        "print(json.dumps(out))\n"
+    )
+    cmd = behave_runner.resolve_poetry() + ["run", "python3", "-c", probe]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=root_dir, capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+
+def _versions(root_dir: Path) -> dict:
     """Report versions and, where a capability has a fallback, which branch runs.
 
     Two capabilities here silently degrade with the installed Playwright: the
@@ -93,19 +142,27 @@ def _versions() -> dict:
     except Exception:  # noqa: BLE001 - a missing dist must not fail doctor
         info["aitlc"] = "unknown"
 
-    try:
-        from importlib.metadata import version
+    target = _target_env_versions(root_dir)
+    if target is not None:
+        info["behave"] = target.get("behave", "not installed")
+        info["playwright"] = target.get("playwright", "not installed")
+        info["versions_from"] = "target project's own environment"
+    else:
+        # Fallback: aitlc's own environment, explicitly labeled as such so
+        # this is never mistaken for what the suite itself actually runs.
+        try:
+            from importlib.metadata import version
 
-        info["playwright"] = version("playwright")
-    except Exception:  # noqa: BLE001
-        info["playwright"] = "not installed"
+            info["playwright"] = version("playwright")
+        except Exception:  # noqa: BLE001
+            info["playwright"] = "not installed"
+        try:
+            from importlib.metadata import version
 
-    try:
-        from importlib.metadata import version
-
-        info["behave"] = version("behave")
-    except Exception:  # noqa: BLE001
-        info["behave"] = "not installed"
+            info["behave"] = version("behave")
+        except Exception:  # noqa: BLE001
+            info["behave"] = "not installed"
+        info["versions_from"] = "aitlc's own environment (target project probe failed)"
 
     aria = False
     try:
@@ -235,7 +292,7 @@ def doctor(
             report.checks.append(CheckResult("LT_PROXY_HOST/PORT", True, "Both set"))
 
     payload = report.to_dict()
-    payload["versions"] = _versions()
+    payload["versions"] = _versions(config.root_dir)
     typer.echo(json.dumps(payload, indent=2))
     raise typer.Exit(code=0 if report.all_ok else 1)
 
