@@ -562,11 +562,30 @@ class AitlcRunner(_BaseRunner):
 
         reloaded: list[str] = []
         with PathManager([step_dir]):
-            for name in sorted(os.listdir(step_dir)):
-                if not name.endswith(".py"):
-                    continue
-                file_path = os.path.join(step_dir, name)
+            file_paths = [
+                os.path.join(step_dir, name)
+                for name in sorted(os.listdir(step_dir))
+                if name.endswith(".py")
+            ]
+            # Evict ALL files first, THEN re-exec all of them -- doing both
+            # per file, one at a time, leaves a transient window (on the
+            # 2nd+ reload) where file B still holds its stale entry from the
+            # LAST cycle while file A's is already being re-added this
+            # cycle. If A and B have a genuinely ambiguous pattern overlap
+            # (a specific placeholder pattern vs. a more general one that
+            # can also match it -- e.g. `click on "{option}" for contact
+            # name...` vs. an already-registered `click on "{text}"`),
+            # that transient coexistence raises AmbiguousStep -- something
+            # the real one-time initial load never hits, since it adds
+            # every file exactly once, in order, with nothing to evict.
+            # The exception aborts the failing file's exec_file() partway
+            # through, silently dropping every step defined after that
+            # point in the SAME file. Evicting everything up front restores
+            # the same "clean slate, add in order" shape the initial load
+            # has, so this transient ambiguity can't arise at all.
+            for file_path in file_paths:
                 self._evict_step_registrations_for_file(file_path)
+            for file_path in file_paths:
                 try:
                     exec_file(file_path, step_globals_base.copy())
                     reloaded.append(file_path)

@@ -208,6 +208,7 @@ See [`INTEGRATION.md`](INTEGRATION.md) for the full contract.
 ```bash
 aitlc debug start PROJ-1234 --at 12    # isolated browser, driven to step 12
 aitlc debug next PROJ-1234             # run the step under the cursor, then advance
+aitlc debug continue PROJ-1234         # run every remaining step, stop at the first failure
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug eval PROJ-1234 "document.title"          # raw JS on the live page
 aitlc debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move

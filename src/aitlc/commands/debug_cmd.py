@@ -365,6 +365,58 @@ def next_step(
     _drive(config, _default_id(config, test_id), "next")
 
 
+@app.command("continue")
+def continue_steps(
+    test_id: str = typer.Argument(None),
+    max_steps: int = typer.Option(
+        500, "--max-steps", help="Safety cap on how many steps to advance."
+    ),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
+    """Advance through every remaining step, stopping at the first failure or the end.
+
+    The bulk version of repeated `next` calls: same reload-before-run
+    contract per step, same live state throughout, but one command instead
+    of driving `next` in a shell loop yourself. Stops immediately on a
+    failing step -- it does not skip ahead past one -- so the reply's last
+    entry is always the one that needs attention (if any).
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    session = _require(config, _default_id(config, test_id))
+
+    results = []
+    for _ in range(max_steps):
+        reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+        reply = _request_or_die(session, "next")
+        if isinstance(reload_reply, dict) and reload_reply.get("feature"):
+            reply["feature"] = reload_reply["feature"]
+        if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
+            reply["reloaded_modules"] = reload_reply["reloaded_modules"]
+        if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
+            reply["stale_modules"] = reload_reply["stale_modules"]
+            reply["warning"] = reload_reply["warning"]
+        results.append(reply)
+        if reply.get("index") is not None:
+            session.index = reply["index"]
+            debug_session.save(config.root_dir, session)
+        if reply.get("status") not in (None, "passed") or reply.get("finished"):
+            break
+
+    payload = {
+        "steps_run": len(results),
+        "stopped_reason": (
+            "finished" if results and results[-1].get("finished")
+            else "failed" if results and results[-1].get("status") not in (None, "passed")
+            else "max_steps_reached"
+        ),
+        "results": results,
+    }
+    typer.echo(json.dumps(payload, indent=2))
+    last_status = results[-1].get("status") if results else None
+    raise typer.Exit(code=0 if last_status in (None, "passed") else 1)
+
+
 @app.command("run-text")
 def run_text(
     text: str = typer.Argument(

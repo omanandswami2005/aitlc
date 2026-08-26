@@ -30,6 +30,9 @@ Run & investigate one test:
   device.)
 - **Single-step / reproduce a failure** → `debug start/next/retry/status/stop`
   (see "The debug cycle" below).
+- **Run the whole rest of a scenario, not one step at a time** → `debug
+  continue` — advances through every remaining step and stops at the first
+  failure (or the end), instead of driving `next` in a shell loop yourself.
 - **Investigate mid-session** → `debug eval "<js-expr>"` (raw JS against the
   live paused page) or `debug run-text "<gherkin-step>"` (any registered
   step, without advancing the cursor).
@@ -128,6 +131,7 @@ paying for a full gated session isn't worth it.
 ```bash
 aitlc -w PROJ-1234 debug start PROJ-1234 --at 12   # real behave runs setup, parks at step 12
 aitlc -w PROJ-1234 debug next PROJ-1234            # run the current step, advance
+aitlc -w PROJ-1234 debug continue PROJ-1234        # run every remaining step, stop at the first failure
 aitlc -w PROJ-1234 debug retry PROJ-1234           # after an edit, re-run that step (no restart)
 aitlc -w PROJ-1234 debug eval PROJ-1234 "document.title"      # raw JS on the live page
 aitlc -w PROJ-1234 debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move

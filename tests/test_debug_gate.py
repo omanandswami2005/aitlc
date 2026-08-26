@@ -174,6 +174,44 @@ def test_debug_start_next_retry_stop_over_the_real_gate(monkeypatch, tmp_path):
     assert json.loads(result.output)["gate_stopped"] is True
 
 
+def test_debug_continue_runs_all_remaining_steps_in_one_command(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["stopped_reason"] == "finished"
+    assert payload["steps_run"] == 3
+    assert all(r["status"] == "passed" for r in payload["results"])
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_continue_stops_at_the_first_failure(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
+    (tmp_path / "features" / "steps" / "steps.py").write_text(
+        STEPS.replace(
+            '@when("the first real step runs")\ndef _w(context):\n    pass',
+            '@when("the first real step runs")\ndef _w(context):\n    assert False, "boom"',
+        )
+    )
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1"])
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["stopped_reason"] == "failed"
+    assert payload["steps_run"] == 2  # the passing Given, then the failing When
+    assert payload["results"][-1]["status"] == "failed"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_debug_picks_up_a_gherkin_edit_without_restart(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path)
     feature_path = tmp_path / "features" / "g.feature"
@@ -313,6 +351,62 @@ def test_debug_next_warns_when_a_stale_module_cannot_reload_cleanly(monkeypatch,
     payload = json.loads(result.output)
     assert any("helper_mod2.py" in f for f in payload["stale_modules"])
     assert "cannot reload me" in payload["warning"]
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_next_survives_ambiguous_pattern_across_reload_cycles(monkeypatch, tmp_path):
+    """G56: a specific/general pattern overlap across two files must not make
+    either step vanish after the first reload cycle.
+
+    Real bug found live: `_reload_steps` evicted-then-re-added one file at a
+    time. On the 2nd+ cycle, a file already re-added this cycle could
+    transiently collide with another file's entry not yet re-evicted this
+    cycle (still holding last cycle's registration) -- if the two files have
+    a specific-vs-general pattern overlap, that transient coexistence raises
+    AmbiguousStep, silently dropping everything defined later in the failing
+    file. Never happens on the real one-time initial load, only on reload.
+    """
+    _wire(monkeypatch, tmp_path)
+    steps_dir = tmp_path / "features" / "steps"
+    (steps_dir / "aaa_specific.py").write_text(
+        '''
+from behave import then
+
+@then('click on "{option}" for contact name "{first_name}" and "{last_name}"')
+def _specific(context, option, first_name, last_name):
+    pass
+
+
+@then("canary step ran")
+def _canary(context):
+    pass
+'''
+    )
+    (steps_dir / "zzz_general.py").write_text(
+        '''
+from behave import then
+
+@then('click on "{text}"')
+def _general(context, text):
+    pass
+'''
+    )
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    # Reload cycle #1 (via next): clean, matches the real initial load --
+    # the bug only ever showed up from the 2nd cycle onward.
+    result = runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+
+    # Reload cycle #2 (via run-text, which reloads before running): this is
+    # where the transient collision used to raise AmbiguousStep and
+    # silently drop "canary step ran".
+    result = runner.invoke(debug_cmd.app, ["run-text", "Then canary step ran", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["status"] == "passed"
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 

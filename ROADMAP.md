@@ -3,7 +3,7 @@
 What is built, what is still open, and what is deliberately not being built.
 For how to use any of it, see [`USER-GUIDE.md`](USER-GUIDE.md).
 
-**Tracker: 64 of 67 gaps closed.** Every row came from a real debugging
+**Tracker: 65 of 67 gaps closed.** Every row came from a real debugging
 session that the tool made harder than it needed to be; none of them are
 speculative features. See each version section below for what's in it.
 
@@ -58,14 +58,14 @@ data once, parses the tables, and fires the project's own hooks.
 | G64 | A failed scenario-setup made `call` report a useless "the console produced no result" — the real reason was sitting in an unrecognized `"done"` event | Result parser now surfaces the setup failure's own detail. |
 | G65 | `classify-failure` crashed (`AttributeError`) on a genuine "raw report.json" input — its own documented second accepted shape is a top-level list, not the dict it assumed | Reuses `behave_runner.parse_report` to handle the list shape too. |
 | G66 | `propose-fix --report` crashed the same way on the same raw report.json shape | Same fix as G65, applied there too. |
+| G56 | A live `debug next`/`retry` session reported `status=undefined` for a step whose exact text matched a registered step definition. Root-caused live: `_reload_steps` evicted-then-re-executed step files ONE AT A TIME, in alphabetical order. On the 2nd+ reload cycle, a file already re-added this cycle can transiently coexist with another file's entry not yet re-evicted this cycle (still holding last cycle's registration) — if the two files have a genuinely ambiguous pattern overlap (verified: `click on "{option}" for contact name "{first_name}" and "{last_name}"` vs. an already-registered `click on "{text}"` — confirmed to raise `AmbiguousStep` directly against a real `StepRegistry`, a synthetic 1-placeholder version did not), that transient coexistence raises `AmbiguousStep`, aborting the failing file's `exec_file()` partway through and silently dropping every step defined after that point in the same file (`wait for time`, defined later in the same file as the colliding pattern, went undefined this way). Never happens on the real one-time initial load, since every file is added exactly once, in order, with nothing to evict first | Split `_reload_steps` into two full passes: evict every file's registrations first, THEN re-exec every file — restoring the same "clean slate, add in order" shape the real initial load has, so the transient two-cycle collision can't arise. Verified live end-to-end: a 16-step scenario that previously went `undefined` on step 2 of every attempt now runs clean through all 16, across 15 reload cycles. Regression-tested against a real `StepRegistry` with the exact verified-ambiguous pattern pair, checked to fail against the pre-fix code before confirming the fix (not just checked to pass). |
+| G57 | `run --debug` consistently failed to collect ANY steps for one particular feature/scenario that ran completely fine under plain `run` — parked immediately at `{"parked_at": 0, "current_step": null}` with `total: 0`. | Not root-caused; may be the same class of registry-ordering issue as G56 (now fixed) rather than a separate bug — worth re-verifying against the original feature/scenario shape before assuming it's still open. |
 
 Not yet closed:
 
 | # | Item | Status |
 |---|---|---|
 | G67 | `steps run`'s `unhandled_events` reported `feature_status: "failed"` next to 3 correctly-passed steps in `results` — the real, relied-on output was right; this diagnostic field was not | Not root-caused. A bare `parse_file()` on the same feature gives `Status.untested`/`.passed` depending on file — the actual code path reads `feature.status` AFTER real `before_scenario` hooks ran against it, and something in that sequence leaves it at `.failed`. Does not affect `results`' correctness. |
-| G56 | A live `debug next`/`retry` session reported `status=undefined` for a step whose exact text matched a registered step definition, after ~15+ `next`/`retry` calls and several live edits to the feature file (steps added earlier in the file, shifting every later cursor). | Not root-caused; may be related to G58 (a matcher-API crash can leave the registry/cursor in a state that looks like desync rather than a clean crash) — worth deliberately reproducing post-G58 before assuming it's still open as originally diagnosed. |
-| G57 | `run --debug` consistently failed to collect ANY steps for one particular feature/scenario that ran completely fine under plain `run` — parked immediately at `{"parked_at": 0, "current_step": null}` with `total: 0`. | Not root-caused; same caveat as G56 — re-verify against this specific feature/scenario shape post-G58 before continuing to chase it as a separate bug. |
 
 ### New capabilities added alongside the above
 
@@ -86,6 +86,9 @@ this round of work:
   paused context without advancing the debug cursor; gained the same
   reload-before-run contract as `retry`/`next` (see G54 above) so it also
   exercises your latest edit, not a stale one.
+- **`aitlc debug continue`** — advances through every remaining step and
+  stops at the first failure (or the end), instead of driving `next` in a
+  shell loop yourself.
 - **Consistent step-count progress everywhere.** `aitlc run`'s live status
   file (`live_status.py`, read via `--no-status`'s opt-out or polled
   externally) now reports `step_index`/`step_total` for the current
@@ -120,8 +123,8 @@ G33/G44 are why.
 
 ## Open
 
-Three gaps from v0.7.x dogfooding aren't root-caused yet (G56, G57, G67 —
-see that section above), plus verification that one older, already-shipped
+Two gaps from v0.7.x dogfooding aren't root-caused yet (G57, G67 — see that
+section above), plus verification that one older, already-shipped
 gap fully delivers:
 
 | # | Item | Status |
