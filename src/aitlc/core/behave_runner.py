@@ -71,6 +71,11 @@ class RunResult:
     steps_by_status: dict[str, int] = field(default_factory=dict)
     failures: list[StepFailure] = field(default_factory=list)
     scenarios: list[ScenarioResult] = field(default_factory=list)
+    # Every step, in file order, same shape `debug next`/`retry` already use
+    # (step/keyword/status/duration_s/error) -- so a plain run and a debug
+    # session produce queryable records an agent (or a human with `jq`) can
+    # read the same way regardless of which one actually ran the test.
+    steps: list[dict[str, Any]] = field(default_factory=list)
     exit_code: int = 0
     raw_report_path: Path | None = None
     # Set only when behave died before writing report_path at all (an
@@ -91,6 +96,7 @@ class RunResult:
                 {"scenario": f.scenario, "step": f.step, "error": f.error}
                 for f in self.failures
             ],
+            "steps": self.steps,
         }
         if self.crash_traceback:
             result["crash_traceback"] = self.crash_traceback
@@ -159,18 +165,31 @@ def parse_report(report_path: Path) -> RunResult:
             for step in element.get("steps", []):
                 step_result = step.get("result", {})
                 status = step_result.get("status", "untested")
-                scenario_duration += step_result.get("duration", 0) or 0
+                duration = step_result.get("duration", 0) or 0
+                scenario_duration += duration
                 result.steps_by_status[status] = (
                     result.steps_by_status.get(status, 0) + 1
                 )
+                error = _extract_error_message(step) if status == "failed" else ""
                 if status == "failed":
                     result.failures.append(
                         StepFailure(
                             scenario=scenario_name,
                             step=f"{step.get('keyword', '').strip()} {step.get('name', '')}".strip(),
-                            error=_extract_error_message(step),
+                            error=error,
                         )
                     )
+                result.steps.append(
+                    {
+                        "feature": feature_name,
+                        "scenario": scenario_name,
+                        "keyword": step.get("keyword", "").strip(),
+                        "step": step.get("name", ""),
+                        "status": status,
+                        "duration_s": round(duration, 2),
+                        "error": error or None,
+                    }
+                )
             result.scenarios.append(
                 ScenarioResult(
                     feature=feature_name,

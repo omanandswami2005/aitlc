@@ -130,6 +130,17 @@ def test_to_dict_shape(tmp_path: Path):
         "failures": [
             {"scenario": "Scenario A", "step": "Then check it", "error": "boom"}
         ],
+        "steps": [
+            {
+                "feature": "",
+                "scenario": "Scenario A",
+                "keyword": "Then",
+                "step": "check it",
+                "status": "failed",
+                "duration_s": 0,
+                "error": "boom",
+            }
+        ],
     }
 
 

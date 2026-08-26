@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.7.2.
+Version 0.8.0.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -212,7 +212,11 @@ aitlc debug continue PROJ-1234         # run every remaining step, stop at the f
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug eval PROJ-1234 "document.title"          # raw JS on the live page
 aitlc debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
+aitlc debug run-line PROJ-1234 42       # same, by file line number instead of retyping text
 aitlc debug status PROJ-1234           # where am I?
+aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url needed
+aitlc debug inspect PROJ-1234 --a11y    # same, accessibility tree instead of pixels
+aitlc debug list --prune                # every tracked session; drop dead bookkeeping
 aitlc debug certify PROJ-1234 --times 2
 aitlc debug stop PROJ-1234              # THIS session's browser down; no cleanup hooks fired
 aitlc debug stop PROJ-1234 --cleanup    # + fires the suite's real after_scenario/after_feature first
@@ -312,6 +316,32 @@ default. A CDP-attached browser reuses an existing context — the opposite of
 isolation — so it is never proof. Two consecutive passes are the default
 because one pass does not disprove a race.
 
+### A real `breakpoint()`, not just JS `eval`
+
+`debug eval` reads the live page — useful, but blind to the Python side of a
+failing step: a local variable, an intermediate value, anything that never
+reaches the DOM. A code-level `breakpoint()` anywhere in project code run
+under `debug`/`run --debug` now parks for real instead of hanging — the gate
+subprocess's stdin is closed and its stdout is a log file, so a bare `pdb`
+prompt would have nowhere to read from or print to. `PYTHONBREAKPOINT` is
+pointed at aitlc's own hook instead, which parks on a *second* socket rather
+than the main gate one — the main socket is already busy blocking on the very
+`next`/`retry` request whose step body called `breakpoint()`, so it cannot
+also answer a second concurrent command.
+
+```bash
+aitlc debug status PROJ-1234              # "paused_at": "breakpoint" once one is hit
+aitlc debug py PROJ-1234 "some_local_var" # Python eval in the paused frame's own scope
+aitlc debug resume PROJ-1234              # continue exactly where it stopped
+```
+
+`debug py` is evaluated against `frame.f_locals`/`frame.f_globals` — the same
+thing `pdb`'s `p <expr>` does — which is the actual value of breakpoint
+support: `debug eval` already works at any gate pause, breakpoint or not, so
+routing it to a breakpoint pause too adds nothing new by itself. `next`/
+`retry` on the same session simply wait until `resume` arrives; nothing is
+lost, nothing restarts, the original call just continues from that exact line.
+
 ---
 
 ## Reading a live page
@@ -343,6 +373,9 @@ something that never happened.
 Already inside a paused `debug` session (not a bare `cdp launch`)? `aitlc
 debug eval TEST-ID "<js-expr>"` reads the same live page without needing the
 port — it runs against whichever page the gate finds on the paused Context.
+`aitlc debug screenshot TEST-ID` and `aitlc debug inspect TEST-ID --a11y` are
+the same idea for a screenshot or the accessibility tree: both resolve the
+CDP endpoint from the session itself, so there's nothing to look up first.
 
 ---
 
@@ -461,6 +494,29 @@ environment. Force a fresh browser with `--no-cdp` (run) or `--aitlc-no-cdp`
 (paver/behave); point at a specific endpoint with `--cdp-url` /
 `--aitlc-cdp-url`.
 
+**Reusing a browser means reusing whatever state it was left in.** A plain
+`aitlc run` (no `--debug`) checks whether the instance it is about to attach
+to has ever been driven before and warns if so, since that can carry over a
+previous login a fresh scenario does not expect:
+
+```json
+{"cdp_attach": "http://127.0.0.1:9333", "via": "PLAYWRIGHT_CDP_URL",
+ "warning": "port 9333 has been driven 2 time(s) before (last by 'PROJ-1234') and may already be authenticated -- if this feature's own hooks/steps log in, that step can fail against an already-logged-in browser. Use `aitlc cdp launch --new` for a fresh instance, or `@skip_login` if the reused session is intentional."}
+```
+
+The concrete failure this catches: a feature with no `@skip_login`, run a
+second time against the same persistent browser — its own login hook fails
+against a tab that is already signed in, several steps before the actual
+scenario logic, in a way that reads like an unrelated locator problem. Fix
+is either matching `@skip_login`-style tagging to the browser's real auth
+state, or `aitlc cdp launch --new` for a genuinely fresh instance.
+
+`debug start` carries the same warning when it reuses a tracked instance.
+`--debug`'s own older check (`is_dirty_for`) only fires when a *different*
+test_id last drove the browser; the same test_id reusing its own browser
+across repeated `debug start` attempts previously got no warning from
+either path.
+
 ### Run the project's own tools, with its environment set up
 
 ```bash
@@ -559,6 +615,18 @@ own — the two commonly differ when aitlc is installed separately from the
 project it's debugging, and the project's own version is the one that
 actually runs every step. `versions_from` in the output says which one you're
 looking at; it falls back to aitlc's own only if that probe itself can't run.
+
+**A plain `run` and a `debug` session journal the same way.** A `run`'s JSON
+now carries a full `steps` list too, not just `steps_by_status` counts and
+`failures` — one entry per step, in file order, with its keyword, status,
+duration and error (empty features/skips are `[]`, same fields, so a script
+reading it doesn't need a separate "no steps ran" branch). `debug next`/
+`retry`/`continue`/`run-text`/`run-line` journal themselves with entries
+shaped the same way (a `continue` call's entry carries the whole `results`
+list). `journal list`/`show`/`diff` therefore cover a debug session exactly
+like a full run, however many `next`/`retry` calls it took — the only
+practical difference is you get one entry per debug command instead of one
+per whole run.
 
 ---
 
@@ -704,3 +772,10 @@ two. Calling it failed sends you to fix code that is fine.
 
 **The debug browser looks like a phone.** It defaults to desktop to match a
 real run; pass `--window-size` for a mobile suite.
+
+**`debug list` shows a session from days ago.** A session file persists until
+`debug stop` clears it — if that never happened (a crash, a killed shell,
+forgetting), the bookkeeping just sits there. `debug list --prune` drops any
+session whose gate process no longer actually answers its socket, and only
+that one: a session still genuinely alive is left alone, since it may be one
+you haven't finished with yet, not something to guess about.

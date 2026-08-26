@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import tempfile
+from urllib.parse import urlparse
 from pathlib import Path
 
 import typer
@@ -381,7 +382,7 @@ def run(
             resolved_window = window_size or (
                 chrome_cdp.DEFAULT_WINDOW_SIZE if mobile else chrome_cdp.DESKTOP_WINDOW_SIZE
             )
-            instance, _reused = chrome_cdp.launch(
+            instance, browser_reused = chrome_cdp.launch(
                 config.root_dir, port=cdp_port, window_size=resolved_window
             )
         except chrome_cdp.ChromeCdpError as exc:
@@ -411,8 +412,41 @@ def run(
             chosen = chrome_cdp.resolve_live_cdp_url(config.root_dir)
         if chosen:
             remote_env[env_name] = chosen
+            reuse_warning = None
+            # G75, caught live: a plain `aitlc run` reusing this same test_id's
+            # own CDP browser across repeated attempts is exactly the case
+            # `is_dirty_for` (used below for --debug) does NOT catch -- same
+            # driver every time, so it never trips -- yet it is the actual
+            # collision hit live: the feature has no @skip_login, the
+            # browser is still logged in from the LAST run of this same
+            # test, and the login hook fails at its own "Sign In" step. Any
+            # instance this port has ever driven before (driven_count > 0,
+            # regardless of who) may already carry session state a fresh
+            # instance would not -- flag it before the run pays for a setup
+            # that's likely to fail at its own login, not after.
+            try:
+                port = urlparse(chosen).port
+            except ValueError:
+                port = None
+            if port is not None:
+                instance = chrome_cdp.load_state(config.root_dir, port)
+                if instance is not None and instance.driven_count > 0:
+                    reuse_warning = (
+                        f"port {port} has been driven {instance.driven_count} "
+                        f"time(s) before (last by {instance.last_driven_by!r}) "
+                        "and may already be authenticated -- if this feature's "
+                        "own hooks/steps log in, that step can fail against an "
+                        "already-logged-in browser. Use `aitlc cdp launch --new` "
+                        "for a fresh instance, or `@skip_login` if the reused "
+                        "session is intentional."
+                    )
             typer.echo(
-                json.dumps({"cdp_attach": chosen, "via": env_name}), err=True
+                json.dumps(
+                    {"cdp_attach": chosen, "via": env_name, "warning": reuse_warning}
+                    if reuse_warning
+                    else {"cdp_attach": chosen, "via": env_name}
+                ),
+                err=True,
             )
 
     safe_test_id = test_id.replace("/", "_").replace(":", "_")
@@ -481,6 +515,10 @@ def run(
                 pid=proc.pid,
                 park=outcome.get("index", 0),
                 index=outcome.get("index", 0),
+                reused=browser_reused,
+                log_path=str(
+                    workspace.output_path(config.root_dir, ".aitlc", "debug", "run_debug.log")
+                ),
             )
             debug_session.save(config.root_dir, session)
             raise _GateParked(session, outcome)

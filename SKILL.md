@@ -35,7 +35,19 @@ Run & investigate one test:
   failure (or the end), instead of driving `next` in a shell loop yourself.
 - **Investigate mid-session** → `debug eval "<js-expr>"` (raw JS against the
   live paused page) or `debug run-text "<gherkin-step>"` (any registered
-  step, without advancing the cursor).
+  step, without advancing the cursor). `debug run-line N` does the same as
+  `run-text` but by file line number — no retyping/escaping a step, and
+  higher-fidelity since it re-parses the real bound `Step` object (a
+  Scenario Outline's `<placeholders>` already substituted).
+- **Session-aware `screenshot`/`inspect`/`list`** → no `--cdp-url` lookup
+  needed once a session exists: `debug screenshot`/`debug inspect --a11y`
+  resolve it from the session itself. `debug list` shows every tracked
+  session across more than one live browser; `--prune` drops bookkeeping
+  for any whose gate process is no longer actually running.
+- **A real `breakpoint()` in project code, not just JS `eval`** → `debug
+  status` reports `"paused_at": "breakpoint"` when one is hit; `debug py
+  "<python-expr>"` evaluates it in the paused frame's own locals/globals
+  (like `pdb`'s `p`); `debug resume` continues exactly where it stopped.
 - **Certify a fix actually holds** → `debug certify --times N` — a fresh
   instance, never the debug browser (which only *looks* proven).
 - **Run a slice of steps outside a real session** → `steps run <feature>
@@ -68,6 +80,10 @@ CI and history:
   TEST-ID --out replay.html`.
 - **What's aitlc's own history of running this?** → `aitlc journal
   list/show/diff` — "did my fix work, or was that luck" without a re-run.
+  `debug next`/`retry`/`continue`/`run-text`/`run-line` journal themselves
+  too, in the same place, each shaped like one entry of a plain `run`'s own
+  `steps` list (keyword, step, status, duration, error) — a debug session
+  leaves the same durable trace a full run does, not just a plain `run`.
 
 Environment and setup:
 - **Read a live page as text, storage, or a raw call** → `aitlc cdp
@@ -135,9 +151,15 @@ aitlc -w PROJ-1234 debug continue PROJ-1234        # run every remaining step, s
 aitlc -w PROJ-1234 debug retry PROJ-1234           # after an edit, re-run that step (no restart)
 aitlc -w PROJ-1234 debug eval PROJ-1234 "document.title"      # raw JS on the live page
 aitlc -w PROJ-1234 debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
+aitlc -w PROJ-1234 debug run-line PROJ-1234 42     # same, by file line number instead
 aitlc -w PROJ-1234 debug status PROJ-1234          # where the paused run is
+aitlc -w PROJ-1234 debug screenshot PROJ-1234       # this session's page, no --cdp-url needed
+aitlc -w PROJ-1234 debug inspect PROJ-1234 --a11y   # same, for the accessibility tree
+aitlc -w PROJ-1234 debug py PROJ-1234 "some_local"  # Python eval in a paused breakpoint()'s frame
+aitlc -w PROJ-1234 debug resume PROJ-1234           # continue past that breakpoint(), same session
 aitlc -w PROJ-1234 debug certify PROJ-1234 --times 2   # fresh instance, real feature, N passes
 aitlc -w PROJ-1234 debug stop PROJ-1234            # tear down the browser + session
+aitlc -w PROJ-1234 debug list --prune              # every tracked session; drop dead bookkeeping
 ```
 
 `stop` kills only the browser THIS session launched, by default — it does NOT
@@ -201,6 +223,27 @@ accept `--aitlc-cdp-url` / `--aitlc-no-cdp`.
 (tracked by port on the saved session) — a separate `aitlc cdp launch` for
 manual work elsewhere is never touched by it. `aitlc cdp stop --all` is the
 one command that is deliberately project-wide.
+
+Reusing a browser means reusing whatever state it was left in. A plain
+`aitlc run` (no `--debug`) against an instance something already drove
+warns instead of failing silently mid-scenario — a scenario expecting to
+start logged out, run against an already-logged-in tab, and fail several
+steps in on a step that assumed a fresh session is exactly the case this
+catches:
+
+```json
+{"cdp_attach": "http://127.0.0.1:9333", "via": "PLAYWRIGHT_CDP_URL",
+ "warning": "port 9333 has been driven 2 time(s) before (last by 'PROJ-1234') and may already be authenticated -- if this feature's own hooks/steps log in, that step can fail against an already-logged-in browser. Use `aitlc cdp launch --new` for a fresh instance, or `@skip_login` if the reused session is intentional."}
+```
+
+The fix is either `@skip_login`-style tagging matched to the browser's
+actual auth state, or `aitlc cdp launch --new` for a genuinely fresh
+instance.
+
+`debug start` carries the same warning when it reuses a tracked instance --
+`is_dirty_for` (the older check `run --debug` uses) only fires for a
+*different* driver, so the same test_id reusing its own browser across
+repeated `debug start` attempts previously got no warning at all.
 
 ## Pause-on-failure is a live session now, not a dead end
 

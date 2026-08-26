@@ -10,7 +10,7 @@ own hooks are all behave's, because it IS behave.
 
 Verbs:
 
-    start <TEST-ID> [--at N]   launch an isolated browser, drive real behave to step N
+    start <TEST-ID> [--at N]   reuse a live `cdp launch` browser (or launch an isolated one), drive real behave to step N
     status                     where the paused run is
     retry                      re-run the current step (picks up an edit first)
     next                       advance one real step
@@ -21,17 +21,85 @@ Verbs:
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import typer
 from aitlc.config import AitlcConfig
-from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch
+from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch, journal
+from aitlc.core.cdp_attach import inspect as cdp_inspect
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core import workspace
 
 app = typer.Typer(help="Interactive debug session over one feature file.")
+
+
+_CAPTURED_OUTPUT_PRETTY_CHARS = 2000
+
+
+def _print_pretty_step(reply: dict) -> None:
+    """Render one step's result the way a real run's console shows it.
+
+    Printed to stderr so stdout stays exactly the same JSON a script would
+    parse -- this is purely for the human watching `next`/`retry`/`continue`
+    live, matching the colored Given/When/Then line plus real captured
+    stdout/log a plain run shows, instead of a bare JSON blob.
+    """
+    step_text = reply.get("step")
+    if not step_text:
+        return
+    status = reply.get("status")
+    color_on, color_off = "", ""
+    if sys.stderr.isatty():
+        color_on = "\033[32m" if status == "passed" else "\033[31m" if status == "failed" else ""
+        color_off = "\033[0m" if color_on else ""
+    duration = reply.get("duration_s")
+    suffix = f"  # {duration}s" if duration is not None else ""
+    keyword = reply.get("keyword")
+    line = f"{keyword} {step_text}" if keyword and not step_text.startswith(keyword) else step_text
+    step_index = reply.get("step_index")
+    total = reply.get("total")
+    prefix = f"[{step_index}/{total}] " if step_index is not None and total is not None else ""
+    typer.echo(f"{color_on}{prefix}{line}{suffix}{color_off}", err=True)
+    captured = reply.get("captured_output")
+    if captured:
+        captured = captured.rstrip("\n")
+        # A step that logs a large payload (a full GraphQL query/response,
+        # say) can otherwise bury the actual pass/fail line and error text
+        # under thousands of lines of noise -- capped here, in the PRETTY
+        # rendering only; the raw JSON on stdout keeps the real, complete
+        # captured_output for a script that actually needs it.
+        if len(captured) > _CAPTURED_OUTPUT_PRETTY_CHARS:
+            typer.echo(captured[-_CAPTURED_OUTPUT_PRETTY_CHARS:], err=True)
+            typer.echo(
+                f"... ({len(captured)} chars total, truncated -- see the raw "
+                "JSON's captured_output for everything)",
+                err=True,
+            )
+        else:
+            typer.echo(captured, err=True)
+    error = reply.get("error")
+    if error and status == "failed":
+        typer.echo(f"{color_on}{error}{color_off}", err=True)
+    page_state = reply.get("page_state")
+    if page_state:
+        url = page_state.get("url")
+        if url:
+            typer.echo(f"{color_on}page: {url}{color_off}", err=True)
+        acc = page_state.get("accessibility") or {}
+        tree = acc.get("tree")
+        if tree:
+            typer.echo(tree, err=True)
+            if acc.get("truncated"):
+                typer.echo(
+                    f"... ({acc.get('chars')} chars total, truncated -- "
+                    "`aitlc cdp inspect --a11y` for the full tree)",
+                    err=True,
+                )
 
 
 def _example_line(feature_text: str, example: int) -> int | None:
@@ -100,6 +168,28 @@ def _require(config, test_id: str) -> debug_session.DebugSession:
     return session
 
 
+def _bp_socket(session: debug_session.DebugSession) -> str:
+    """The separate socket a code-level `breakpoint()` pause parks on.
+
+    Its mere existence on disk (checked with a real request, not just
+    `os.path.exists` -- a leftover stale file must not be mistaken for a
+    live pause) is the "is a breakpoint active right now" signal; see
+    `_serve_breakpoint_pause`'s own docstring in runner.py for why this
+    can't share the main gate socket.
+    """
+    return session.socket + ".bp"
+
+
+def _bp_status_if_active(session: debug_session.DebugSession) -> dict | None:
+    """The breakpoint pause's status, or None if none is active right now."""
+    if not session.socket:
+        return None
+    try:
+        return gate_client.request(_bp_socket(session), "status")
+    except (gate_client.GateUnavailable, OSError):
+        return None
+
+
 
 
 @app.command("start")
@@ -122,6 +212,20 @@ def start(
         help="Browser window as WIDTH,HEIGHT. Desktop by default; a phone size "
         "for a mobile suite.",
     ),
+    cdp_url: str = typer.Option(
+        None,
+        "--cdp-url",
+        help="Attach to this existing Chrome instead of launching a new "
+        "isolated one. Unset and a tracked `aitlc cdp launch` instance is "
+        "live, that one is reused automatically; pass --no-cdp to force a "
+        "fresh isolated browser instead.",
+    ),
+    no_cdp: bool = typer.Option(
+        False,
+        "--no-cdp",
+        help="Always launch a fresh isolated browser, even if a tracked "
+        "instance is live.",
+    ),
     summary: bool = typer.Option(
         False, "--summary", help="Emit a compact {parked_at, total_steps, ...} summary."
     ),
@@ -134,7 +238,7 @@ def start(
         300.0, "--timeout", help="Seconds to wait for the run to park (foreground)."
     ),
 ) -> None:
-    """Launch an isolated browser and drive REAL behave to a step, then park."""
+    """Attach to a live `cdp launch` browser (or launch one), drive REAL behave to a step, then park."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     test_id = _default_id(config, test_id)
@@ -148,9 +252,55 @@ def start(
     socket_path = gate_launch.socket_path(config.root_dir, test_id)
     progress_path = debug_session.progress_path(config.root_dir, test_id)
 
-    # A fresh, isolated debug Chrome the suite will attach to; it survives the
-    # gate's hard exit, so `stop` owns its teardown.
-    instance, _reused = chrome_cdp.launch(config.root_dir, port=None, window_size=window_size)
+    # Reuse a live `aitlc cdp launch` instance by default -- launching one
+    # unconditionally (the previous behavior) orphaned it as a second window
+    # every time, defeating the whole point of `cdp launch` once per day.
+    instance = None
+    reused = False
+    resolved_cdp_url = None
+    resolved_port = None
+    if cdp_url:
+        resolved_cdp_url = cdp_url
+        resolved_port = urlparse(cdp_url).port
+        reused = True
+    elif not no_cdp:
+        running = [i for i in chrome_cdp.list_instances(config.root_dir) if i.get("running")]
+        if running:
+            newest = max(running, key=lambda i: int(i.get("port", 0)))
+            instance = chrome_cdp.load_state(config.root_dir, newest["port"])
+            if instance is not None:
+                resolved_cdp_url = instance.cdp_url
+                resolved_port = instance.port
+                reused = True
+    if resolved_cdp_url is None:
+        # No live tracked instance (or --no-cdp/unresolvable --cdp-url): a
+        # fresh, isolated debug Chrome the suite will attach to; it survives
+        # the gate's hard exit, so `stop` owns its teardown.
+        instance, reused = chrome_cdp.launch(config.root_dir, port=None, window_size=window_size)
+        resolved_cdp_url = instance.cdp_url
+        resolved_port = instance.port
+
+    # G75-class collision, but for `debug start` itself rather than plain
+    # `run`: reusing this same test_id's own browser across repeated
+    # `debug start` attempts is not caught by `is_dirty_for` (only used by
+    # `run --debug`, and only trips on a *different* driver) -- any prior
+    # use at all (driven_count > 0) may already be authenticated, and a
+    # scenario whose own hooks/steps log in can fail there before ever
+    # reaching the step actually being debugged.
+    reuse_warning = None
+    if reused and resolved_port:
+        prior = instance or chrome_cdp.load_state(config.root_dir, resolved_port)
+        prior_driven_count = getattr(prior, "driven_count", 0) if prior is not None else 0
+        if prior_driven_count > 0:
+            reuse_warning = (
+                f"port {resolved_port} has been driven {prior_driven_count} "
+                f"time(s) before (last by {getattr(prior, 'last_driven_by', None)!r}) and may "
+                "already be authenticated -- if this feature's own hooks/"
+                "steps log in, that step can fail against an "
+                "already-logged-in browser. Use `aitlc cdp launch --new` "
+                "for a fresh instance, or `@skip_login` if the reused "
+                "session is intentional."
+            )
 
     debug_session.write_progress(
         config.root_dir, test_id,
@@ -159,32 +309,34 @@ def start(
     )
     proc = gate_launch.launch(
         config, feature=feature, line=line,
-        cdp_url=instance.cdp_url, socket_path_=socket_path,
+        cdp_url=resolved_cdp_url, socket_path_=socket_path,
         progress_path=progress_path,
         gate_env={"AITLC_GATE": "1", "AITLC_GATE_AT": str(at), "AITLC_GATE_EXAMPLE": str(example)},
         log_name="gate.log",
     )
     pid = proc.pid
     session = debug_session.DebugSession(
-        test_id=test_id, feature=str(feature), cdp_url=instance.cdp_url,
-        port=instance.port, example=example, socket=str(socket_path), pid=pid, park=at,
-        index=at,
+        test_id=test_id, feature=str(feature), cdp_url=resolved_cdp_url,
+        port=resolved_port, example=example, socket=str(socket_path), pid=pid, park=at,
+        index=at, reused=reused,
+        log_path=str(workspace.output_path(config.root_dir, ".aitlc", "debug", "gate.log")),
     )
     debug_session.save(config.root_dir, session)
+    if reused and resolved_port:
+        chrome_cdp.mark_driven(config.root_dir, resolved_port, test_id)
 
     if background:
-        typer.echo(
-            json.dumps(
-                {
-                    "background": True,
-                    "test_id": test_id,
-                    "cdp_url": instance.cdp_url,
-                    "poll": f"aitlc debug status {test_id}",
-                    "progress_file": str(progress_path),
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "background": True,
+            "test_id": test_id,
+            "cdp_url": resolved_cdp_url,
+            "reused": reused,
+            "poll": f"aitlc debug status {test_id}",
+            "progress_file": str(progress_path),
+        }
+        if reuse_warning:
+            payload["warning"] = reuse_warning
+        typer.echo(json.dumps(payload, indent=2))
         return
 
     outcome = gate_launch.await_park_or_exit(socket_path, proc, timeout)
@@ -219,33 +371,31 @@ def start(
 
     status_reply = outcome
     if summary:
-        typer.echo(
-            json.dumps(
-                {
-                    "test_id": test_id,
-                    "cdp_url": instance.cdp_url,
-                    "parked_at": status_reply.get("index"),
-                    "total_steps": status_reply.get("total"),
-                    "setup_passed": status_reply.get("index"),
-                    "setup_failed": 0,
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "test_id": test_id,
+            "cdp_url": resolved_cdp_url,
+            "reused": reused,
+            "parked_at": status_reply.get("index"),
+            "total_steps": status_reply.get("total"),
+            "setup_passed": status_reply.get("index"),
+            "setup_failed": 0,
+        }
+        if reuse_warning:
+            payload["warning"] = reuse_warning
+        typer.echo(json.dumps(payload, indent=2))
         return
-    typer.echo(
-        json.dumps(
-            {
-                "test_id": test_id,
-                "cdp_url": instance.cdp_url,
-                "engine": "behave-gate",
-                "parked_at": status_reply.get("index"),
-                "total_steps": status_reply.get("total"),
-                "current_step": status_reply.get("current_step"),
-            },
-            indent=2,
-        )
-    )
+    payload = {
+        "test_id": test_id,
+        "cdp_url": resolved_cdp_url,
+        "reused": reused,
+        "engine": "behave-gate",
+        "parked_at": status_reply.get("index"),
+        "total_steps": status_reply.get("total"),
+        "current_step": status_reply.get("current_step"),
+    }
+    if reuse_warning:
+        payload["warning"] = reuse_warning
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @app.command("status")
@@ -255,6 +405,19 @@ def status(test_id: str = typer.Argument(None)) -> None:
     test_id = _default_id(config, test_id)
     session = debug_session.load(config.root_dir, test_id)
     if session is not None and session.socket:
+        # Checked FIRST, before ever touching the main gate socket: while a
+        # breakpoint pause is live, the main socket is busy blocked inside
+        # the very step whose code hit it, so a status request there would
+        # just hang until the pause resumes rather than answering quickly.
+        bp_reply = _bp_status_if_active(session)
+        if bp_reply is not None:
+            typer.echo(
+                json.dumps(
+                    {"test_id": test_id, "cdp_url": session.cdp_url, **bp_reply},
+                    indent=2,
+                )
+            )
+            return
         try:
             reply = gate_client.request(session.socket, "status")
             typer.echo(
@@ -314,6 +477,60 @@ def _request_or_die(session: debug_session.DebugSession, cmd: str, **kwargs: Any
         raise typer.Exit(code=3)
 
 
+def _log_size(log_path: str) -> int:
+    """Current size of the gate's log file, or 0 if it doesn't exist yet."""
+    if not log_path:
+        return 0
+    try:
+        return Path(log_path).stat().st_size
+    except OSError:
+        return 0
+
+
+def _tail_log_since(log_path: str, bookmark: int) -> str:
+    """Bytes appended to the gate's log file since `bookmark`, as text.
+
+    The gate subprocess runs with --no-capture (see gate_launch.launch), so
+    a step's real stdout/stderr/logging goes straight into this file rather
+    than onto behave's own capture machinery -- this is how `next`/`retry`/
+    `continue` show the same real console output a plain run would, without
+    needing behave's capture (which --no-capture switches off regardless of
+    any per-step override). Never raises: this is display plumbing riding
+    along with a real step result.
+    """
+    if not log_path:
+        return ""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(bookmark)
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _journal_step(config, test_id: str, command: str, reply: dict) -> None:
+    """Record one step's outcome the same way plain `run` already journals
+    itself -- so `aitlc journal list`/`show`/`diff` cover a debug session
+    too, not just a full run, in the exact same place and shape (this
+    reply already carries step/keyword/status/duration_s/error, matching
+    `RunResult.to_dict()`'s "steps" entries for a plain run). Never lets a
+    journaling problem fail the command it's merely recording.
+    """
+    try:
+        journal.record(
+            config.root_dir,
+            command=command,
+            argv=[test_id],
+            exit_code=0 if reply.get("status") in (None, "passed") and not reply.get("error") else 1,
+            duration_s=reply.get("duration_s") or 0.0,
+            payload=reply,
+            tags=["debug", test_id],
+        )
+    except OSError:
+        pass
+
+
 def _drive(config, test_id: str, cmd: str) -> None:
     """Send one stepping command to the gate and report the reply."""
     session = _require(config, test_id)
@@ -321,7 +538,9 @@ def _drive(config, test_id: str, cmd: str) -> None:
     # `retry`/`next` must mean "run this again with my change" — for both
     # Python and the feature file — not against a stale parse.
     reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+    bookmark = _log_size(session.log_path)
     reply = _request_or_die(session, cmd)
+    reply["captured_output"] = _tail_log_since(session.log_path, bookmark)
 
     if isinstance(reload_reply, dict) and reload_reply.get("feature"):
         # A Gherkin edit was picked up: report how the cursor moved.
@@ -339,6 +558,8 @@ def _drive(config, test_id: str, cmd: str) -> None:
     if reply.get("index") is not None:
         session.index = reply["index"]
         debug_session.save(config.root_dir, session)
+    _print_pretty_step(reply)
+    _journal_step(config, test_id, f"debug {cmd}", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
 
@@ -383,12 +604,15 @@ def continue_steps(
     """
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
-    session = _require(config, _default_id(config, test_id))
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
 
     results = []
     for _ in range(max_steps):
         reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+        bookmark = _log_size(session.log_path)
         reply = _request_or_die(session, "next")
+        reply["captured_output"] = _tail_log_since(session.log_path, bookmark)
         if isinstance(reload_reply, dict) and reload_reply.get("feature"):
             reply["feature"] = reload_reply["feature"]
         if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
@@ -397,23 +621,36 @@ def continue_steps(
             reply["stale_modules"] = reload_reply["stale_modules"]
             reply["warning"] = reload_reply["warning"]
         results.append(reply)
+        _print_pretty_step(reply)
         if reply.get("index") is not None:
             session.index = reply["index"]
             debug_session.save(config.root_dir, session)
         if reply.get("status") not in (None, "passed") or reply.get("finished"):
             break
 
+    last_status = results[-1].get("status") if results else None
     payload = {
         "steps_run": len(results),
         "stopped_reason": (
             "finished" if results and results[-1].get("finished")
-            else "failed" if results and results[-1].get("status") not in (None, "passed")
+            else "failed" if last_status not in (None, "passed")
             else "max_steps_reached"
         ),
         "results": results,
     }
+    try:
+        journal.record(
+            config.root_dir,
+            command="debug continue",
+            argv=[test_id],
+            exit_code=0 if last_status in (None, "passed") else 1,
+            duration_s=sum(r.get("duration_s") or 0.0 for r in results),
+            payload=payload,
+            tags=["debug", "continue", test_id],
+        )
+    except OSError:
+        pass
     typer.echo(json.dumps(payload, indent=2))
-    last_status = results[-1].get("status") if results else None
     raise typer.Exit(code=0 if last_status in (None, "passed") else 1)
 
 
@@ -436,7 +673,8 @@ def run_text(
     """
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
-    session = _require(config, _default_id(config, test_id))
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
     # Same "pick up an edit before running" contract as retry/next -- an
     # ad-hoc step should exercise your latest code, not whatever was live
     # when the session started.
@@ -447,8 +685,44 @@ def run_text(
     if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
         reply["stale_modules"] = reload_reply["stale_modules"]
         reply["warning"] = reload_reply["warning"]
+    _print_pretty_step(reply)
+    _journal_step(config, test_id, "debug run-text", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
+
+
+@app.command("run-line")
+def run_line(
+    line: int = typer.Argument(
+        ..., help="1-based line number in the feature file, e.g. the line you're looking at."
+    ),
+    test_id: str = typer.Argument(None),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
+    """Run the step at this file line against the live paused context.
+
+    Same idea as `run-text` (doesn't advance the debug cursor), but you
+    point at a line instead of retyping the step's exact text -- no
+    quoting, no escaping, no copying table rows by hand. Reads the REAL
+    bound Step object from the file (same file-reparse `next`/`retry` use,
+    so a Scenario Outline's <placeholder>s are already substituted), so
+    it's higher-fidelity than `run-text`, not just more convenient.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+    reply = _request_or_die(session, "run_line", line=line)
+    if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
+        reply["reloaded_modules"] = reload_reply["reloaded_modules"]
+    if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
+        reply["stale_modules"] = reload_reply["stale_modules"]
+        reply["warning"] = reload_reply["warning"]
+    _print_pretty_step(reply)
+    _journal_step(config, test_id, "debug run-line", reply)
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if reply.get("status") == "passed" and not reply.get("error") else 1)
 
 
 @app.command("eval")
@@ -468,9 +742,218 @@ def eval_js(
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     session = _require(config, _default_id(config, test_id))
-    reply = _request_or_die(session, "eval", expr=expr)
+    # A breakpoint pause blocks the main socket (see _bp_status_if_active's
+    # comment in `status`) -- route there instead when one is active, so
+    # `eval` still works for exactly the case it matters most: inspecting
+    # state while genuinely paused mid-step.
+    if _bp_status_if_active(session) is not None:
+        try:
+            reply = gate_client.request(_bp_socket(session), "eval", expr=expr)
+        except (gate_client.GateUnavailable, OSError):
+            reply = {"error": "the breakpoint pause is no longer reachable"}
+    else:
+        reply = _request_or_die(session, "eval", expr=expr)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if not reply.get("error") else 1)
+
+
+@app.command("py")
+def py_eval(
+    expr: str = typer.Argument(..., help="Python expression to evaluate in the paused frame."),
+    test_id: str = typer.Argument(None),
+) -> None:
+    """Evaluate a Python expression in a paused `breakpoint()`'s own scope.
+
+    Only meaningful while `debug status` shows `"paused_at": "breakpoint"`
+    -- this is the actual point of breakpoint support: `debug eval` (JS on
+    the page) already works at any gate pause, so it can't see local
+    variables in the failing Python code. This can, evaluated exactly like
+    `pdb`'s `p <expr>` against the frame where `breakpoint()` was written.
+    """
+    config = AitlcConfig.find_and_load()
+    session = _require(config, _default_id(config, test_id))
+    if _bp_status_if_active(session) is None:
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "no breakpoint is currently paused",
+                    "hint": "check `debug status` for \"paused_at\": \"breakpoint\" first",
+                }
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        reply = gate_client.request(_bp_socket(session), "pyeval", expr=expr)
+    except (gate_client.GateUnavailable, OSError):
+        reply = {"error": "the breakpoint pause is no longer reachable"}
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if not reply.get("error") else 1)
+
+
+@app.command("resume")
+def resume(test_id: str = typer.Argument(None)) -> None:
+    """Continue past a code-level `breakpoint()`, exactly where it paused.
+
+    Only meaningful while a `breakpoint()` in project code is actually
+    paused there (see `PYTHONBREAKPOINT` in gate_launch.launch) -- `debug
+    status` shows `"paused_at": "breakpoint"` when one is. This is the
+    only thing that unblocks it: the original call stays frozen until
+    this arrives, then returns and keeps running from exactly that line --
+    nothing restarted, nothing lost. `next`/`retry` on the same session
+    will just hang until this is sent first, since the main gate socket
+    stays busy for as long as the breakpoint is paused.
+    """
+    config = AitlcConfig.find_and_load()
+    session = _require(config, _default_id(config, test_id))
+    try:
+        reply = gate_client.request(_bp_socket(session), "resume")
+    except (gate_client.GateUnavailable, OSError):
+        typer.echo(
+            json.dumps(
+                {
+                    "error": "no breakpoint is currently paused",
+                    "hint": "check `debug status` for \"paused_at\": \"breakpoint\" first",
+                }
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    typer.echo(json.dumps(reply, indent=2))
+
+
+@app.command("screenshot")
+def screenshot(
+    test_id: str = typer.Argument(None),
+    path: Path = typer.Option(
+        None,
+        "--path",
+        "-o",
+        help="Where to save it. Defaults to .aitlc/debug/<test_id>-screenshot.png.",
+    ),
+    full_page: bool = typer.Option(
+        False, "--full-page", help="Full-page screenshot, not just viewport."
+    ),
+) -> None:
+    """Screenshot of the live paused page -- no need to know or type its CDP port.
+
+    `cdp inspect --screenshot` already does this, but requires the port by
+    hand every time even though a debug session already knows its own
+    `cdp_url` -- the exact friction `next`/`retry`/`eval`/`run-text` don't
+    have. This is that same session-aware convenience for a screenshot.
+    """
+    config = AitlcConfig.find_and_load()
+    session = _require(config, _default_id(config, test_id))
+    if path is None:
+        safe = session.test_id.replace("/", "_").replace(" ", "_")
+        path = workspace.output_path(config.root_dir, ".aitlc", "debug", f"{safe}-screenshot.png")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = cdp_inspect(session.cdp_url, screenshot_path=path, full_page=full_page)
+    typer.echo(json.dumps(result.to_dict(), indent=2))
+    raise typer.Exit(code=0 if result.screenshot_path else 1)
+
+
+@app.command("inspect")
+def inspect_page(
+    test_id: str = typer.Argument(None),
+    a11y_query: str = typer.Option(
+        None,
+        "--a11y-query",
+        help="Return only accessibility lines containing this text.",
+    ),
+    a11y_selector: str = typer.Option(
+        None, "--a11y-selector", help="Scope the accessibility tree to this selector's subtree."
+    ),
+    all_nodes: bool = typer.Option(
+        False, "--a11y-all", help="Keep semantically uninteresting nodes too."
+    ),
+) -> None:
+    """Accessibility snapshot of the live paused page -- no CDP port needed.
+
+    Session-aware version of `cdp inspect --a11y`: same accessibility tree
+    (cheap, greppable, shows nesting and control state), resolved from the
+    session's own `cdp_url` instead of a port you have to look up and type.
+    """
+    config = AitlcConfig.find_and_load()
+    session = _require(config, _default_id(config, test_id))
+    result = cdp_inspect(
+        session.cdp_url,
+        accessibility=True,
+        interesting_only=not all_nodes,
+        a11y_selector=a11y_selector,
+        a11y_query=a11y_query,
+    )
+    typer.echo(json.dumps(result.to_dict(), indent=2))
+
+
+def _gate_alive(session: debug_session.DebugSession) -> bool:
+    """Is this session's gate subprocess actually still answering?
+
+    A session file persists until `debug stop` clears it -- if that never
+    happens (the process was killed out of band, crashed, or the machine
+    restarted), the file is pure stale bookkeeping pointing at a socket
+    nothing is listening on any more. Reusing the same
+    GateUnavailable/OSError-means-dead convention `stop`/`eval`/`status`
+    already use elsewhere, rather than inventing a new liveness check.
+    """
+    if not session.socket:
+        return False
+    try:
+        gate_client.request(session.socket, "status")
+        return True
+    except (gate_client.GateUnavailable, OSError):
+        return False
+
+
+@app.command("list")
+def list_sessions(
+    prune: bool = typer.Option(
+        False,
+        "--prune",
+        help=(
+            "Also drop tracked sessions whose gate process is no longer "
+            "reachable (crashed, killed out of band, or from before a "
+            "restart) -- deletes only their bookkeeping files, never a "
+            "browser. A session still answering its socket is left alone "
+            "even with this on: it may just be a debug session the user "
+            "hasn't finished with yet, not something to guess about."
+        ),
+    ),
+) -> None:
+    """List every tracked debug session -- test_id, browser, where it's parked.
+
+    For juggling more than one session/browser at once: which `next`/
+    `retry`/`eval` (no explicit test_id) would hit which browser is
+    otherwise invisible without checking each `debug status <test_id>` by
+    hand.
+    """
+    config = AitlcConfig.find_and_load()
+    sessions = debug_session.list_all(config.root_dir)
+    live_ports = {i["port"] for i in chrome_cdp.list_instances(config.root_dir) if i.get("running")}
+    pruned = []
+    rows = []
+    for s in sessions:
+        gate_alive = _gate_alive(s)
+        if prune and not gate_alive:
+            debug_session.clear(config.root_dir, s.test_id)
+            debug_session.clear_progress(config.root_dir, s.test_id)
+            pruned.append(s.test_id)
+            continue
+        rows.append(
+            {
+                "test_id": s.test_id,
+                "cdp_url": s.cdp_url,
+                "port": s.port,
+                "browser_alive": s.port in live_ports,
+                "gate_alive": gate_alive,
+                "parked_at": s.index,
+                "reused": s.reused,
+            }
+        )
+    payload = {"sessions": rows, "count": len(rows)}
+    if prune:
+        payload["pruned"] = pruned
+    typer.echo(json.dumps(payload, indent=2))
 
 
 @app.command("stop")
@@ -486,6 +969,17 @@ def stop(
             "reuses across invocations, and this suite's own cleanup can "
             "log it out -- opt in only for a deliberate clean handoff, "
             "never as routine teardown."
+        ),
+    ),
+    kill_browser: bool = typer.Option(
+        False,
+        "--kill-browser",
+        help=(
+            "Kill the browser even if this session only attached to an "
+            "already-live tracked instance (one it did not launch itself). "
+            "Default: a reused browser is left running so `aitlc cdp launch` "
+            "keeps its point -- only a browser this session actually "
+            "launched is killed automatically."
         ),
     ),
 ) -> None:
@@ -508,12 +1002,23 @@ def stop(
     # launch` for manual work, or another `run --debug`'s reused browser)
     # that this session never touched. `session.port` is exactly the one
     # `debug start` launched for this test id; stop only that.
-    stopped_this_session = chrome_cdp.stop(config.root_dir, port=session.port)
+    #
+    # A session that only *attached* to a live tracked instance (session.
+    # reused) did not launch that browser and should not kill it either --
+    # otherwise every `debug stop` after the reuse fix (G68) would tear down
+    # the exact persistent browser `aitlc cdp launch` exists to keep alive.
+    browser_left_running = False
+    if session.reused and not kill_browser:
+        stopped_this_session = False
+        browser_left_running = True
+    else:
+        stopped_this_session = chrome_cdp.stop(config.root_dir, port=session.port)
     debug_session.clear(config.root_dir, test_id)
     debug_session.clear_progress(config.root_dir, test_id)
     payload = {
         "gate_stopped": gate_stopped,
         "stopped_port": session.port if stopped_this_session else None,
+        "browser_left_running": browser_left_running,
         "session_cleared": True,
     }
     if cleanup:

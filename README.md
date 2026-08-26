@@ -98,6 +98,27 @@ browser, login and setup you already paid for. Editing Gherkin is now as cheap
 as editing Python; you only need a fresh `debug start` for a change to a setup
 step *before* your park point.
 
+```bash
+aitlc debug run-line PROJ-1234 42       # run the step at that file line, no retyping/escaping
+aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url to look up
+aitlc debug inspect PROJ-1234 --a11y    # same, for the accessibility tree
+```
+
+**Drop a real `breakpoint()`, not just a JS eval.** A paused session's `eval`
+runs JavaScript on the live page — useful, but blind to the Python side of a
+failing step. A code-level `breakpoint()` anywhere in project code under
+`debug`/`run --debug` parks on its own socket instead of hanging (stdin is
+closed in the gate subprocess, so a bare `pdb` prompt has nowhere to go):
+
+```bash
+aitlc debug status PROJ-1234            # "paused_at": "breakpoint" when one is hit
+aitlc debug py PROJ-1234 "some_local_var"    # evaluate Python in the paused frame's own scope
+aitlc debug resume PROJ-1234            # continue exactly where it stopped — nothing restarted
+```
+
+`next`/`retry` on the same session simply wait until `resume` is sent — the
+main gate socket stays busy serving the very step that hit the breakpoint.
+
 **Find out what CI did, without guessing which report to open.**
 
 ```bash
@@ -123,6 +144,10 @@ aitlc journal diff <earlier> <later>     # did the fix work, or was that luck?
 ```
 
 Payloads are redacted before they touch disk, size-capped and pruned.
+`debug next`/`retry`/`continue`/`run-text`/`run-line` journal themselves too,
+each entry shaped exactly like a step out of a plain `run`'s own `steps` list
+(keyword, step text, status, duration, error) — so `journal list` is one place
+to look regardless of whether a test ran end to end or one step at a time.
 
 **Check locator hygiene.** `aitlc locators lint` flags selectors that pass while
 reading the wrong element — positional row indices, grid cells with no
@@ -198,6 +223,14 @@ aitlc sets the suite's CDP env var (default `PLAYWRIGHT_CDP_URL`, configurable
 via `[project].playwright_cdp_env`) so the suite connects to the open browser.
 Pass `--cdp-url` (run) or `--aitlc-cdp-url` (paver/behave) to point at a
 specific endpoint.
+
+Reusing a browser means reusing whatever state it was left in — a plain
+`aitlc run` against an instance something already drove warns rather than
+failing silently mid-scenario (a leftover login, say, skipping past a step
+that expected a fresh one). `debug list` shows every tracked session across
+more than one live browser; `--prune` drops the bookkeeping for any whose
+gate process is no longer actually running, without ever touching a browser
+still in use.
 
 ## Documentation
 

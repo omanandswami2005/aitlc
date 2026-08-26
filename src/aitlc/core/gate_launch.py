@@ -73,6 +73,23 @@ def launch(
         "AITLC_GATE_SOCKET": str(socket_path_),
         "AITLC_GATE_PROGRESS": str(progress_path),
         config.playwright_cdp_env: cdp_url,
+        # This process's stdout is redirected to a file (log_name below),
+        # not a TTY -- CPython block-buffers stdout in that case, so a
+        # step's print()/logging output can sit unflushed in the child's
+        # own buffer for many steps before `next`/`retry`'s log-tail (see
+        # debug_cmd.py's _tail_log_since) ever sees it. Force unbuffered
+        # I/O so each step's real output lands in the log the moment it's
+        # written, matching what `next`/`retry` show immediately after.
+        "PYTHONUNBUFFERED": "1",
+        # A bare pdb.set_trace() (or breakpoint()) in project code cannot
+        # work in this subprocess -- stdin is DEVNULL and stdout is this
+        # log file, so nothing could read a command or show a prompt.
+        # Point Python's own breakpoint() hook at aitlc's replacement,
+        # which parks over a socket instead (`debug status`/`eval`/`resume`
+        # while paused) -- reachable by this exact dotted path because
+        # --runner already requires aitlc.runtime.runner to be importable
+        # here for the gate to exist at all.
+        "PYTHONBREAKPOINT": "aitlc.runtime.runner._aitlc_breakpointhook",
     }
     plan = attach.plan(
         behave_cmd,

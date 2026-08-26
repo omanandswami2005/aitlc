@@ -71,6 +71,43 @@ except ImportError:  # pragma: no cover - only when behave is absent
 # the "has this file changed since the session began" reference point.
 _MODULE_LOAD_TIME = time.time()
 
+# Set by the first run_hook() call in a gate process, read by
+# _aitlc_breakpointhook (which PYTHONBREAKPOINT points at -- see
+# gate_launch.launch) since breakpoint() gives its hook no reference to the
+# runner instance on its own.
+_ACTIVE_RUNNER: Any = None
+
+
+def _aitlc_breakpointhook(*args: Any, **kwargs: Any) -> None:
+    """Replaces pdb.set_trace() for code running inside a gate session.
+
+    A plain PDB prompt cannot work here: the gate subprocess has stdin
+    wired to DEVNULL and stdout redirected to a log file (gate_launch.
+    launch), so nothing could read a command or show a prompt. Instead,
+    this parks on a SEPARATE control socket (`AITLC_GATE_SOCKET + ".bp"`)
+    -- separate because a breakpoint hit mid-step fires while the MAIN
+    gate socket is already busy blocking on that step's own `next`/`retry`
+    reply, so it cannot accept a second, concurrent command of its own.
+    `debug status`/`debug eval` work against this while paused; `debug
+    resume` is the signal that makes this call return, continuing
+    execution exactly where it stopped -- no restart, nothing lost.
+
+    Falls back to a real `pdb.set_trace()` when there is no active gate
+    session (a plain uninstrumented run, `aitlc behave` without --debug),
+    so breakpoint() keeps working normally everywhere else.
+    """
+    runner = _ACTIVE_RUNNER
+    # breakpoint() is a builtin with no Python frame of its own -- it calls
+    # sys.breakpointhook (this function) directly, so frame 1 up from here
+    # is the caller's own frame, exactly where `breakpoint()` was written.
+    frame = sys._getframe(1) if hasattr(sys, "_getframe") else None
+    if runner is None or not (runner._gate_active() or runner._gate_on_failure_active()):
+        import pdb
+
+        pdb.Pdb().set_trace(frame)
+        return
+    runner._serve_breakpoint_pause(frame)
+
 
 def _status_name(obj: Any) -> str | None:
     """Return a behave status as a plain string, whatever its type."""
@@ -81,6 +118,42 @@ def _status_name(obj: Any) -> str | None:
 def _stamp(epoch: float) -> str:
     """UTC ISO-8601 for a wall-clock instant."""
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+_PAGE_STATE_TREE_CHARS = 3000
+
+
+def _capture_page_state(context: Any) -> dict | None:
+    """URL + a compact accessibility snapshot of the live page, best-effort.
+
+    Attached to a failed step's result so "was there an unexpected page?"
+    (an onboarding wizard, a popup, a permission prompt) answers itself in
+    the JSON reply instead of requiring a separate manual `cdp inspect`/
+    `debug eval` round trip. Deliberately self-contained (no aitlc import --
+    see this module's own docstring: it runs inside the TARGET project's
+    interpreter, which has no reason to have aitlc itself installed) and
+    bounded to a few thousand chars; reach for `cdp inspect --a11y` by hand
+    for the full, queryable tree. Never raises: this rides along with a
+    real step result and must never cost it.
+    """
+    page = _find_page(context)
+    if page is None:
+        return None
+    try:
+        url = page.url
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    result: dict[str, Any] = {"url": url}
+    try:
+        tree = page.aria_snapshot()
+        result["accessibility"] = {
+            "tree": tree[:_PAGE_STATE_TREE_CHARS],
+            "chars": len(tree),
+            "truncated": len(tree) > _PAGE_STATE_TREE_CHARS,
+        }
+    except Exception as exc:  # noqa: BLE001 - page may be navigating; URL alone still helps
+        result["accessibility"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return result
 
 
 def _find_page(context: Any) -> Any:
@@ -123,6 +196,10 @@ class AitlcRunner(_BaseRunner):
         untouched, and aitlc derives context from `self.context`, stripping a
         leading context arg if an older behave supplied one.
         """
+        global _ACTIVE_RUNNER
+        if _ACTIVE_RUNNER is None:
+            _ACTIVE_RUNNER = self
+
         result = super().run_hook(name, *args)
 
         # A side-run (retry/next) re-enters run_hook via Step.run; the project
@@ -267,9 +344,41 @@ class AitlcRunner(_BaseRunner):
         if name != "before_step":
             return
 
+        if getattr(context, "scenario", None) is None:
+            # G72, caught live: a project's before_feature/before_scenario
+            # hook can inject its own ad-hoc steps via context.execute_steps()
+            # (e.g. an automatic admin login) BEFORE the target scenario's
+            # own steps ever start -- context.scenario is only set once
+            # behave's real Scenario.run() begins, so these hook-injected
+            # steps fire before_step with context.scenario still None.
+            # `--at 0` was treating the FIRST such step as "the scenario's
+            # step 0" and parking on it immediately, permanently
+            # interrupting the hook's own execute_steps mid-flight (the
+            # admin login never finished) and skipping before_scenario --
+            # and everything it sets up (e.g. this project's per-scenario
+            # env vars) -- entirely, since control never returned to
+            # behave's own Scenario.run() to fire it. Let these steps run
+            # through completely untouched; only count/park once we're
+            # genuinely inside the target scenario.
+            return
+
         if not getattr(self, "_aitlc_steps", None):
             scenario = getattr(context, "scenario", None)
-            self._aitlc_steps = self._collect_steps(scenario)
+            steps = self._collect_steps(scenario)
+            if not steps:
+                # `scenario.all_steps` can come back empty on the very first
+                # before_step of a Scenario Outline row (a real behave-timing
+                # gap, not a `--at 0` bug) -- G69, caught live: `debug start
+                # --at 0` reported total_steps=0/current_step=null even
+                # though the real scenario had many steps, and `next` then
+                # ran the real first step correctly and only found the true
+                # count via a full reparse. `_reparse_steps` reads the file
+                # directly and is already proven robust to a None
+                # `context.scenario` (falls back to file order + example
+                # index), so use it here too instead of parking on a bogus
+                # empty step list.
+                steps = self._reparse_steps(context) or []
+            self._aitlc_steps = steps
             if not hasattr(self, "_aitlc_auto"):
                 self._aitlc_auto = 0
                 self._write_progress(state="running", done=0)
@@ -395,7 +504,7 @@ class AitlcRunner(_BaseRunner):
             return ""
         return f"{getattr(step, 'keyword', '')} {getattr(step, 'name', '')}".strip()
 
-    def _side_run(self, step: Any) -> dict:
+    def _side_run(self, step: Any, context: Any = None) -> dict:
         """Re-run one real behave Step object against the live Context.
 
         This is the whole fidelity story: the Step carries its own table, text
@@ -407,6 +516,14 @@ class AitlcRunner(_BaseRunner):
         started = time.time()
         record: dict = {"step": self._step_text(step), "started_at": _stamp(started)}
         try:
+            # capture=True has no effect here: the gate process is launched
+            # with --no-capture (see gate_launch.launch), so behave's own
+            # stdout/stderr/log interception is switched off at the config
+            # level regardless of this flag -- a step's real output goes
+            # straight to the gate's own stdout (captured into gate.log by
+            # the launcher), not onto `step.captured`. `debug_cmd.py` reads
+            # that log's own new bytes around this call instead of relying
+            # on behave's capture machinery for it.
             passed = step.run(self, quiet=True, capture=True)
             status = "passed" if passed else "failed"
             error = None
@@ -426,8 +543,16 @@ class AitlcRunner(_BaseRunner):
                 "error": error,
                 "duration_s": round(ended - started, 2),
                 "ended_at": _stamp(ended),
+                "keyword": getattr(step, "keyword", None),
             }
         )
+        if status == "failed" and context is not None:
+            # Answers "was there an unexpected page?" (an onboarding wizard,
+            # a popup, a permission prompt) right here instead of needing a
+            # separate manual `cdp inspect`/`debug eval` round trip.
+            page_state = _capture_page_state(context)
+            if page_state is not None:
+                record["page_state"] = page_state
         return record
 
     def _side_run_text(self, context: Any, text: str) -> dict:
@@ -447,6 +572,41 @@ class AitlcRunner(_BaseRunner):
             "error": error,
             "duration_s": round(time.time() - started, 2),
         }
+
+    def _side_run_line(self, context: Any, line: int) -> dict:
+        """Run the step at this 1-based file line, by real bound Step object.
+
+        The point: retyping a step's exact text (quoting, escaping, table
+        rows) is real friction for a human, and error-prone -- a line
+        number out of the file you're already looking at is not. Reuses
+        `_reparse_steps` (the same file-reparse `next`/`retry` already rely
+        on for picking up a Gherkin edit), so this gets the real, fully
+        Examples-bound Step object -- table, docstring, <placeholder>
+        substitution all intact -- and runs it through `_side_run`, the
+        exact same path `next`/`retry` use. Higher fidelity than `run-text`
+        (which re-parses a typed string via execute_steps): this is a real
+        Step straight from the file, not a re-derived one.
+
+        Does not touch the debug cursor -- like `run-text`, this is for
+        trying a step without disturbing where the official sequence is
+        parked.
+        """
+        steps = self._reparse_steps(context)
+        if not steps:
+            return {"error": f"could not parse the feature file for line {line}"}
+        match = None
+        for step in steps:
+            step_line = getattr(step, "line", None)
+            if step_line is None:
+                continue
+            if step_line == line:
+                match = step
+                break
+            if step_line <= line and (match is None or step_line > getattr(match, "line", 0)):
+                match = step
+        if match is None:
+            return {"error": f"no step found at or before line {line}"}
+        return self._side_run(match, context)
 
     def _side_eval(self, context: Any, expr: str) -> dict:
         """Evaluate a JS expression against the live page (Playwright's page.evaluate()).
@@ -475,6 +635,107 @@ class AitlcRunner(_BaseRunner):
             }
         finally:
             self._aitlc_suspended = False
+
+    @staticmethod
+    def _side_eval_python(frame: Any, expr: str) -> dict:
+        """Evaluate a Python expression in the paused frame's own scope.
+
+        This is what actually makes `breakpoint()` support worth having:
+        `_side_eval` (JS on the page) is already reachable at any gate
+        pause, breakpoint or not, so routing breakpoint's `eval` there too
+        (as `debug eval` does) adds no new capability -- the one thing
+        only a real `breakpoint()` can see is the paused frame's own local
+        variables, which is what a developer drops one in to inspect.
+        Evaluated against `frame.f_locals` and `frame.f_globals` exactly
+        like `pdb`'s own `p <expr>`. Never raises into the server loop.
+        """
+        started = time.time()
+        try:
+            result = eval(expr, frame.f_globals, frame.f_locals)  # noqa: S307
+        except Exception as exc:  # noqa: BLE001 - report, never crash the server
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_s": round(time.time() - started, 2),
+            }
+        try:
+            json.dumps(result)
+        except TypeError:
+            result = repr(result)
+        return {"result": result, "duration_s": round(time.time() - started, 2)}
+
+    def _serve_breakpoint_pause(self, frame: Any) -> None:
+        """Park at a code-level `breakpoint()` on a socket separate from
+        the main gate one.
+
+        Why a separate socket, not the main gate one `_serve()` already
+        listens on: a `breakpoint()` hit mid-step fires while that main
+        socket is already busy -- blocked inside the very `next`/`retry`
+        request whose step body called it. It cannot also accept a second,
+        concurrent command on the same connection-oriented socket. This
+        one exists only while paused here, so its mere presence on disk
+        (checked by `debug status`/`debug eval`/`debug resume`) is itself
+        the "is a breakpoint active" signal -- no separate marker needed.
+
+        Blocks until a `resume` command arrives, then cleans up and
+        returns, letting the original paused call continue exactly where
+        `breakpoint()` was written -- nothing restarted, nothing lost.
+        """
+        context = getattr(self, "context", None)
+        main_socket = os.environ.get("AITLC_GATE_SOCKET", "")
+        if not main_socket:
+            return  # no gate session at all (e.g. a bare `aitlc behave` run)
+        bp_socket_path = main_socket + ".bp"
+
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            if os.path.exists(bp_socket_path):
+                os.unlink(bp_socket_path)
+            srv.bind(bp_socket_path)
+            srv.listen(1)
+        except OSError as exc:
+            logging.error("aitlc breakpoint could not bind %s: %s", bp_socket_path, exc)
+            return
+
+        location = {
+            "file": getattr(frame.f_code, "co_filename", None) if frame else None,
+            "line": getattr(frame, "f_lineno", None) if frame else None,
+            "function": getattr(frame.f_code, "co_name", None) if frame else None,
+        }
+        sys.stderr.write(
+            json.dumps({"event": "breakpoint_paused", **location, "socket": bp_socket_path})
+            + "\n"
+        )
+        sys.stderr.flush()
+
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    break
+                with conn:
+                    request = self._recv(conn)
+                    cmd = (request or {}).get("cmd")
+                    if cmd == "status":
+                        self._send(conn, {"paused_at": "breakpoint", **location})
+                    elif cmd == "eval":
+                        self._send(conn, self._side_eval(context, request.get("expr", "")))
+                    elif cmd == "pyeval":
+                        self._send(conn, self._side_eval_python(frame, request.get("expr", "")))
+                    elif cmd == "resume":
+                        self._send(conn, {"resumed": True, **location})
+                        break
+                    else:
+                        self._send(conn, {"error": f"unknown command {cmd!r}"})
+        finally:
+            try:
+                srv.close()
+            except OSError:
+                pass
+            try:
+                os.unlink(bp_socket_path)
+            except OSError:
+                pass
 
     def _reload_steps(self, step_dir: str) -> list:
         """Re-execute the project's step files so an edit is picked up.
@@ -561,34 +822,61 @@ class AitlcRunner(_BaseRunner):
             default_matcher = matchers.current_matcher
 
         reloaded: list[str] = []
+        mtimes = getattr(self, "_aitlc_step_mtimes", None)
+        if mtimes is None:
+            mtimes = {}
+            self._aitlc_step_mtimes = mtimes
         with PathManager([step_dir]):
-            file_paths = [
+            all_file_paths = [
                 os.path.join(step_dir, name)
                 for name in sorted(os.listdir(step_dir))
                 if name.endswith(".py")
             ]
-            # Evict ALL files first, THEN re-exec all of them -- doing both
-            # per file, one at a time, leaves a transient window (on the
-            # 2nd+ reload) where file B still holds its stale entry from the
-            # LAST cycle while file A's is already being re-added this
-            # cycle. If A and B have a genuinely ambiguous pattern overlap
-            # (a specific placeholder pattern vs. a more general one that
-            # can also match it -- e.g. `click on "{option}" for contact
-            # name...` vs. an already-registered `click on "{text}"`),
-            # that transient coexistence raises AmbiguousStep -- something
-            # the real one-time initial load never hits, since it adds
-            # every file exactly once, in order, with nothing to evict.
+            # Skip any file whose mtime hasn't moved since it was last
+            # reloaded -- re-exec'ing every one of a suite's step files on
+            # EVERY `next`/`retry` (this project alone has 82) was pure,
+            # avoidable cost when the common case during iteration is "one
+            # file changed, the rest didn't". A file new to `mtimes` (first
+            # call, or a file added since) always counts as changed so it
+            # gets its one real load. Safe to skip untouched files entirely
+            # (no evict, no re-exec): the transient-ambiguity risk the
+            # evict-all-then-exec-all ordering guards against (see the
+            # docstring above) only exists between files that are BOTH
+            # mid-reload at the same time -- a file that is never evicted
+            # never opens that window.
+            file_paths = []
+            for file_path in all_file_paths:
+                try:
+                    current_mtime = os.stat(file_path).st_mtime
+                except OSError:
+                    continue
+                if mtimes.get(file_path) == current_mtime:
+                    continue
+                file_paths.append((file_path, current_mtime))
+
+            # Evict ALL changed files first, THEN re-exec all of them --
+            # doing both per file, one at a time, leaves a transient window
+            # (on the 2nd+ reload) where file B still holds its stale entry
+            # from the LAST cycle while file A's is already being re-added
+            # this cycle. If A and B have a genuinely ambiguous pattern
+            # overlap (a specific placeholder pattern vs. a more general one
+            # that can also match it -- e.g. `click on "{option}" for
+            # contact name...` vs. an already-registered `click on
+            # "{text}"`), that transient coexistence raises AmbiguousStep --
+            # something the real one-time initial load never hits, since it
+            # adds every file exactly once, in order, with nothing to evict.
             # The exception aborts the failing file's exec_file() partway
             # through, silently dropping every step defined after that
             # point in the SAME file. Evicting everything up front restores
             # the same "clean slate, add in order" shape the initial load
             # has, so this transient ambiguity can't arise at all.
-            for file_path in file_paths:
+            for file_path, _mtime in file_paths:
                 self._evict_step_registrations_for_file(file_path)
-            for file_path in file_paths:
+            for file_path, mtime in file_paths:
                 try:
                     exec_file(file_path, step_globals_base.copy())
                     reloaded.append(file_path)
+                    mtimes[file_path] = mtime
                 except Exception:  # noqa: BLE001 - a bad edit must not kill the session
                     pass
                 if modern_matcher_api:
@@ -821,11 +1109,20 @@ class AitlcRunner(_BaseRunner):
                     self._send(conn, self._status(cursor, steps))
                 elif cmd == "next":
                     if cursor < len(steps):
-                        rec = self._side_run(steps[cursor])
+                        ran_at = cursor
+                        rec = self._side_run(steps[cursor], context)
                         cursor += 1
                         rec.update(
                             {
                                 "index": cursor,
+                                # The step actually just executed, 0-based --
+                                # distinct from "index" above, which is the
+                                # POST-increment cursor (the next step to
+                                # run). Kept separate rather than repurposing
+                                # "index" so existing consumers of that
+                                # field's exact meaning aren't disturbed.
+                                "step_index": ran_at,
+                                "total": len(steps),
                                 "finished": cursor >= len(steps),
                                 "current_step": (
                                     self._step_text(steps[cursor])
@@ -840,13 +1137,22 @@ class AitlcRunner(_BaseRunner):
                         self._send(conn, {"finished": True, "index": cursor})
                 elif cmd == "retry":
                     if cursor < len(steps):
-                        rec = self._side_run(steps[cursor])
-                        rec.update({"index": cursor, "finished": False})
+                        rec = self._side_run(steps[cursor], context)
+                        rec.update(
+                            {
+                                "index": cursor,
+                                "step_index": cursor,
+                                "total": len(steps),
+                                "finished": False,
+                            }
+                        )
                         self._send(conn, rec)
                     else:
                         self._send(conn, {"finished": True, "index": cursor})
                 elif cmd == "run_text":
                     self._send(conn, self._side_run_text(context, request.get("text", "")))
+                elif cmd == "run_line":
+                    self._send(conn, self._side_run_line(context, request.get("line", 0)))
                 elif cmd == "eval":
                     self._send(conn, self._side_eval(context, request.get("expr", "")))
                 elif cmd == "reload":
