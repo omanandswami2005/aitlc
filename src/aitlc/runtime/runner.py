@@ -1288,34 +1288,63 @@ class AitlcRunner(_BaseRunner):
                     # uses, but against the LIVE steps/cursor this loop
                     # already tracks, not a throwaway reparse -- so next/
                     # retry afterwards run the exact step landed on here.
-                    target_line = request.get("line", 0)
-                    match = None
-                    for step in steps:
-                        step_line = getattr(step, "line", None)
-                        if step_line is None:
-                            continue
-                        if step_line == target_line:
-                            match = step
-                            break
-                        if step_line <= target_line and (
-                            match is None or step_line > getattr(match, "line", 0)
-                        ):
-                            match = step
-                    if match is None:
-                        self._send(
-                            conn, {"error": f"no step found at or before line {target_line}"}
-                        )
+                    rel = request.get("rel")
+                    if rel is not None:
+                        # Relative to the CURRENT parked step, by step count --
+                        # not file line. Answers "one step back"/"one step
+                        # forward" without first looking up an adjacent
+                        # step's line number by hand.
+                        target_index = cursor + rel
+                        if target_index < 0 or target_index >= len(steps):
+                            self._send(
+                                conn,
+                                {
+                                    "error": (
+                                        f"relative jump {rel:+d} from step {cursor} is "
+                                        f"out of range (0-{len(steps) - 1})"
+                                    )
+                                },
+                            )
+                        else:
+                            cursor = target_index
+                            self._send(
+                                conn,
+                                {
+                                    "jumped_to": cursor,
+                                    "total": len(steps),
+                                    "current_step": self._step_text(steps[cursor]),
+                                    "finished": cursor >= len(steps),
+                                },
+                            )
                     else:
-                        cursor = steps.index(match)
-                        self._send(
-                            conn,
-                            {
-                                "jumped_to": cursor,
-                                "total": len(steps),
-                                "current_step": self._step_text(match),
-                                "finished": cursor >= len(steps),
-                            },
-                        )
+                        target_line = request.get("line", 0)
+                        match = None
+                        for step in steps:
+                            step_line = getattr(step, "line", None)
+                            if step_line is None:
+                                continue
+                            if step_line == target_line:
+                                match = step
+                                break
+                            if step_line <= target_line and (
+                                match is None or step_line > getattr(match, "line", 0)
+                            ):
+                                match = step
+                        if match is None:
+                            self._send(
+                                conn, {"error": f"no step found at or before line {target_line}"}
+                            )
+                        else:
+                            cursor = steps.index(match)
+                            self._send(
+                                conn,
+                                {
+                                    "jumped_to": cursor,
+                                    "total": len(steps),
+                                    "current_step": self._step_text(match),
+                                    "finished": cursor >= len(steps),
+                                },
+                            )
                 elif cmd == "stop":
                     reply = {"stopped": True}
                     if request.get("cleanup"):

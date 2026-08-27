@@ -1270,6 +1270,64 @@ def test_jump_moves_the_cursor_without_running_anything(monkeypatch, tmp_path):
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_jump_rel_moves_by_step_count_not_line_number(monkeypatch, tmp_path):
+    """`jump --rel` answers "one step forward/back from here" without
+    first looking up an adjacent step's file line by hand -- and rejects
+    passing both a line and --rel, or neither.
+    """
+    _wire(monkeypatch, tmp_path)
+    # No explicit test_id anywhere below: with `line` now optional too, a
+    # lone bare positional (an explicit test_id with no line) would bind to
+    # `line` first and fail int conversion -- so this exercises the same
+    # single-feature default-resolution path real single-feature usage
+    # relies on, matching `line`+explicit-test_id calls elsewhere in this
+    # file which never hit that ambiguity.
+    result = runner.invoke(debug_cmd.app, ["start", "--at", "1", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["jump", "--rel", "1"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["jumped_to"] == 2
+
+    result = runner.invoke(debug_cmd.app, ["jump", "--rel", "-1"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["jumped_to"] == 1
+
+    result = runner.invoke(debug_cmd.app, ["jump", "--rel", "-99"])
+    assert result.exit_code != 0
+    assert "out of range" in result.output
+
+    result = runner.invoke(debug_cmd.app, ["jump", "5", "PROJ-1", "--rel", "1"])
+    assert result.exit_code != 0
+    assert "exactly one" in result.output
+
+    result = runner.invoke(debug_cmd.app, ["jump"])
+    assert result.exit_code != 0
+    assert "exactly one" in result.output
+
+    runner.invoke(debug_cmd.app, ["stop"])
+
+
+def test_retry_and_next_accept_rel_to_reposition_before_running(monkeypatch, tmp_path):
+    """`retry --rel`/`next --rel` must jump first, then run from the new
+    position -- the same "reposition then act" contract `continue --from`
+    already has, so a step back/forward doesn't require a separate `jump`
+    call plus knowing the target line number.
+    """
+    _wire(monkeypatch, tmp_path)
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "2", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["retry", "--rel", "-1", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["step"] == "When the first real step runs"
+
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["parked_at"] == 1
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_continue_from_jumps_then_runs_only_from_there(monkeypatch, tmp_path):
     """`continue --from <line>` must jump the cursor first, then run only
     from that point on -- the two earlier steps are never executed.

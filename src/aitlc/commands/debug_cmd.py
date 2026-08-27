@@ -666,6 +666,26 @@ def _journal_step(config, test_id: str, command: str, reply: dict) -> None:
         pass
 
 
+def _jump_first(config, session, from_line: int | None, rel: int | None) -> None:
+    """Move the cursor before driving a step command -- shared by `continue
+    --from`, `retry --from`/`--rel`, `next --from`/`--rel`. Mutates `session`
+    in place (same contract `debug jump` itself uses) and exits(2) on a
+    jump that can't land anywhere."""
+    if from_line is None and rel is None:
+        return
+    if from_line is not None and rel is not None:
+        typer.echo(json.dumps({"error": "pass --from or --rel, not both"}), err=True)
+        raise typer.Exit(code=2)
+    _request_or_die(session, "reload", step_dir=config.step_dir)
+    kwargs = {"line": from_line} if from_line is not None else {"rel": rel}
+    jump_reply = _request_or_die(session, "jump", **kwargs)
+    if jump_reply.get("error"):
+        typer.echo(json.dumps(jump_reply), err=True)
+        raise typer.Exit(code=2)
+    session.index = jump_reply["jumped_to"]
+    debug_session.save(config.root_dir, session)
+
+
 def _drive(config, test_id: str, cmd: str) -> None:
     """Send one stepping command to the gate and report the reply."""
     session = _require(config, test_id)
@@ -702,23 +722,48 @@ def _drive(config, test_id: str, cmd: str) -> None:
 @app.command("retry")
 def retry(
     test_id: str = typer.Argument(None),
+    from_line: int = typer.Option(
+        None, "--from", help="Move the cursor to this file line first, then retry that step."
+    ),
+    rel: int = typer.Option(
+        None,
+        "--rel",
+        help="Move the cursor this many steps from where it's parked (e.g. -1 for the "
+        "previous step, 1 for the next), then retry that step -- no need to look up "
+        "its file line by hand.",
+    ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Re-run the current step (picking up an edit), without advancing."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
-    _drive(config, _default_id(config, test_id), "retry")
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    _jump_first(config, session, from_line, rel)
+    _drive(config, test_id, "retry")
 
 
 @app.command("next")
 def next_step(
     test_id: str = typer.Argument(None),
+    from_line: int = typer.Option(
+        None, "--from", help="Move the cursor to this file line first, then advance one step."
+    ),
+    rel: int = typer.Option(
+        None,
+        "--rel",
+        help="Move the cursor this many steps from where it's parked (e.g. -1 for the "
+        "previous step, 1 for the next), then advance one step from there.",
+    ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Advance one real behave step and run it, keeping the live state."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
-    _drive(config, _default_id(config, test_id), "next")
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    _jump_first(config, session, from_line, rel)
+    _drive(config, test_id, "next")
 
 
 _COMPACT_STEP_FIELDS = (
@@ -755,6 +800,12 @@ def continue_steps(
         "manually and want the session to pick up from where things "
         "actually stand.",
     ),
+    rel: int = typer.Option(
+        None,
+        "--rel",
+        help="Move the cursor this many steps from where it's parked (e.g. -1 for the "
+        "previous step), then continue as normal.",
+    ),
     full: bool = typer.Option(
         None,
         "--full/--compact",
@@ -781,14 +832,7 @@ def continue_steps(
     session = _require(config, test_id)
     compact_output = not full if full is not None else config.debug.continue_output != "full"
 
-    if from_line is not None:
-        _request_or_die(session, "reload", step_dir=config.step_dir)
-        jump_reply = _request_or_die(session, "jump", line=from_line)
-        if jump_reply.get("error"):
-            typer.echo(json.dumps(jump_reply), err=True)
-            raise typer.Exit(code=2)
-        session.index = jump_reply["jumped_to"]
-        debug_session.save(config.root_dir, session)
+    _jump_first(config, session, from_line, rel)
 
     results = []
     for _ in range(max_steps):
@@ -914,9 +958,18 @@ def run_line(
 @app.command("jump")
 def jump(
     line: int = typer.Argument(
-        ..., help="1-based line number in the feature file to move the cursor to."
+        None,
+        help="1-based line number in the feature file to move the cursor to. "
+        "Omit if passing --rel instead.",
     ),
     test_id: str = typer.Argument(None),
+    rel: int = typer.Option(
+        None,
+        "--rel",
+        help="Move the cursor this many steps from where it's parked instead of an "
+        "absolute line -- e.g. --rel -1 for the previous step, --rel 1 for the next. "
+        "Mutually exclusive with the line argument.",
+    ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Move the debug cursor to the step at (or nearest before) this file line -- no execution.
@@ -928,12 +981,18 @@ def jump(
     opposite case: run one step without moving the cursor; this moves the
     cursor without running anything.
     """
+    if (line is None) == (rel is None):
+        typer.echo(
+            json.dumps({"error": "pass exactly one of: line argument, --rel"}), err=True
+        )
+        raise typer.Exit(code=2)
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     test_id = _default_id(config, test_id)
     session = _require(config, test_id)
     _request_or_die(session, "reload", step_dir=config.step_dir)
-    reply = _request_or_die(session, "jump", line=line)
+    kwargs = {"line": line} if line is not None else {"rel": rel}
+    reply = _request_or_die(session, "jump", **kwargs)
     if reply.get("jumped_to") is not None:
         session.index = reply["jumped_to"]
         debug_session.save(config.root_dir, session)

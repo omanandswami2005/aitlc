@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.4.
+Version 0.8.5.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -376,6 +376,21 @@ raw exception/traceback the same way for every failure type.
 "traceback": "Traceback (most recent call last):\n  File \"...\", line 142, in find_by_text\n    ...\nAssertionError: Text 'X' not found in DOM\n"
 ```
 
+`failed_at` picks the deepest traceback frame *inside the project*, not the
+true deepest frame overall. That distinction matters for a Playwright
+`TimeoutError`: the exception always bottoms out inside Playwright's own
+`_connection.py`, several frames past the project's actual step/page-object
+line — always taking the literal deepest frame would point every single
+timeout at the same library-internal line, useless as a "where" answer.
+
+The short `error` field on a `continue`/`paused_on_failure` reply is capped
+(1000/500 chars) so one huge traceback doesn't dominate the JSON — a cut
+string now ends with `...[truncated, N more chars]` rather than stopping
+silently mid-line. The FULL text is always in `traceback` (dropped only
+from `continue --compact`'s per-step summary, which trades it away because
+it already streamed live during the run) and in `aitlc journal list
+--last 1` either way.
+
 **This does not replace `breakpoint()`, it narrows when you need it.**
 `failed_at`/`traceback` answer "where did it fail, and why" for free, on
 every failure, with no setup. `breakpoint()`/`debug py` answer a different
@@ -639,7 +654,9 @@ used — a plain `run` with no `--extra-tag` behaves exactly as before.
 ```bash
 aitlc debug restart PROJ-1234 --extra-tag skip_login
 aitlc debug jump PROJ-1234 42
+aitlc debug jump PROJ-1234 --rel -1     # one step back from wherever it's parked
 aitlc debug continue PROJ-1234 --from 42
+aitlc debug retry PROJ-1234 --rel -1    # reposition, then re-run from there
 ```
 
 `debug restart` is `debug stop` (browser-preserving) + `debug start --at 0
@@ -657,6 +674,13 @@ to resume from where things actually stand rather than where the last
 handled manually, or back to an earlier one. `debug continue --from
 <line>` is the same jump, immediately followed by the normal continue
 loop from that point.
+
+`--rel N` is an alternative to the line argument, on `jump`, `retry`,
+`next` and `continue` alike — move N steps from wherever the cursor is
+currently parked (negative for back, positive for forward) instead of
+naming an absolute file line. Answers "go back one step" without first
+reading the feature file to find that step's line number. Mutually
+exclusive with the line argument/`--from`.
 
 ### Run the project's own tools, with its environment set up
 
