@@ -66,7 +66,13 @@ def _print_pretty_step(reply: dict) -> None:
     prefix = f"[{step_index}/{total}] " if step_index is not None and total is not None else ""
     typer.echo(f"{color_on}{prefix}{line}{suffix}{color_off}", err=True)
     captured = reply.get("captured_output")
-    if captured:
+    # Only on a FAILURE -- a passing step's own real output (INFO:root:...
+    # logging, GraphQL traffic, whatever the project logs) has nothing to
+    # act on, and printing it for every single step (pass or fail) is what
+    # was actually flooding the terminal, real complaint hit live. Still
+    # there in full on stdout's JSON and in the journal regardless; this
+    # only decides what's worth showing live.
+    if captured and status == "failed":
         captured = captured.rstrip("\n")
         # A step that logs a large payload (a full GraphQL query/response,
         # say) can otherwise bury the actual pass/fail line and error text

@@ -837,7 +837,10 @@ def _fail(context):
     assert payload["status"] == "passed"
     assert payload["keyword"] == "When"
     assert "hello from the real step" in payload["captured_output"]
-    assert "hello from the real step" in result.stderr
+    # Captured output is only printed live (pretty, stderr) on a FAILURE --
+    # a passing step's own real output is still complete on stdout's JSON
+    # above, just not repeated on the terminal where there's nothing to act on.
+    assert "hello from the real step" not in result.stderr
     # step_index is the step that just ran (1), distinct from "index" (2,
     # the post-increment cursor / next step to run) -- and the pretty line
     # must render it as "[1/3]", not silently drop position information.
@@ -869,6 +872,25 @@ def test_print_pretty_step_truncates_huge_captured_output(capsys):
     assert "THE ACTUAL ERROR IS RIGHT HERE" in captured.err  # tail survives
     assert "truncated" in captured.err
     assert len(captured.err) < len(huge)
+
+
+def test_print_pretty_step_is_quiet_on_a_passing_step(capsys):
+    """captured_output must NOT print live for a PASSING step -- real
+    complaint hit live: a project that logs INFO:root:... on every action
+    flooded the terminal for every single step, not just the ones that
+    actually need attention. Still complete on stdout's JSON/the journal;
+    this only decides what the human watching live actually sees.
+    """
+    debug_cmd._print_pretty_step(
+        {
+            "step": "do a thing",
+            "status": "passed",
+            "captured_output": "INFO:root:some routine log line\n",
+        }
+    )
+    captured = capsys.readouterr()
+    assert "do a thing" in captured.err
+    assert "some routine log line" not in captured.err
 
 
 def test_next_includes_captured_output_on_a_failing_step(monkeypatch, tmp_path):

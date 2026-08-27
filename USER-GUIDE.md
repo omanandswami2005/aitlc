@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.2.
+Version 0.8.3.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -256,6 +256,19 @@ needs a logged-out start).
 `next` therefore runs N; only once a step has been attempted does `next` move
 past it. Advancing first would skip the step you parked on, and everything
 after it would fail for a reason that is not there.
+
+### What actually prints live, and why
+
+`next`/`retry`/`continue` render each step as a colored `Given`/`When`/
+`Then` line (to stderr; stdout stays the same JSON a script would parse).
+The step's own real console output (`captured_output` — logging, GraphQL
+traffic, whatever the project logs) prints alongside it **only when that
+step failed**. A passing step has nothing to act on, and a project that
+logs on every action (`INFO:root:...` per click, say) would otherwise
+flood the terminal every single step, real complaint hit live. The output
+is never actually lost either way — it's complete on stdout's JSON, and in
+the journal (`aitlc journal list --last 1`) — this only decides what's
+worth showing on the terminal while you watch a run live.
 
 ### Why it is fast, and why that matters for correctness
 
