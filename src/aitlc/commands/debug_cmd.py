@@ -274,6 +274,15 @@ def start(
         "given -- pass --no-cdp too if a tracked instance would otherwise "
         "win.",
     ),
+    reattach: bool = typer.Option(
+        False,
+        "--reattach",
+        help="If a session for this test_id is already alive, attach to it "
+        "as-is (same cursor, same browser, nothing re-run) instead of "
+        "stopping it and starting fresh. Falls through to the normal fresh "
+        "start when no existing session is alive -- --at/--example/etc are "
+        "ignored in that case, since there is nothing left to configure.",
+    ),
 ) -> None:
     """Attach to a live `cdp launch` browser (or launch one), drive REAL behave to a step, then park."""
     config = AitlcConfig.find_and_load()
@@ -290,6 +299,26 @@ def start(
     # has a session is exactly the same situation.
     existing = debug_session.load(config.root_dir, test_id)
     if existing is not None and existing.socket:
+        if reattach:
+            try:
+                reply = gate_client.request(existing.socket, "status")
+                typer.echo(
+                    json.dumps(
+                        {
+                            "test_id": test_id,
+                            "cdp_url": existing.cdp_url,
+                            "reattached": True,
+                            "parked_at": reply.get("index"),
+                            "total_steps": reply.get("total"),
+                            "current_step": reply.get("current_step"),
+                            "finished": reply.get("finished"),
+                        },
+                        indent=2,
+                    )
+                )
+                return
+            except (gate_client.GateUnavailable, OSError):
+                pass  # not actually alive -- fall through to a normal fresh start
         try:
             gate_client.request(existing.socket, "stop", cleanup=False)
         except (gate_client.GateUnavailable, OSError):

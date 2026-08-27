@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.5.
+Version 0.8.6.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -629,6 +629,16 @@ prune if a record never existed. `reap` scans real `ps` output instead,
 for this project's own gate invocations specifically (an unrelated
 `aitlc` session for a different project on the same machine is never
 touched), and kills only the ones no known session accounts for.
+
+**`start --reattach`** is the escape hatch when stopping the old session is
+NOT what you want — e.g. your terminal was Ctrl+C'd waiting on a slow step's
+reply, but the gate itself was still fine, and restarting fresh would throw
+away real progress for no reason. With an alive session for that test_id,
+`--reattach` reports its current cursor/browser as-is and touches nothing
+(`--at`/`--example`/etc are ignored — there's nothing left to configure);
+with no alive session to reattach to, it falls through to a normal fresh
+start. The plain default (no `--reattach`) is unchanged: stop old, start
+fresh, exactly as above.
 
 ### `--extra-tag`: the generic fix for a browser that's already in a state your hooks don't expect
 

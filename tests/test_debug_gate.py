@@ -1066,6 +1066,55 @@ def test_debug_start_stops_a_pre_existing_session_instead_of_orphaning_it(
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_debug_start_reattach_keeps_the_existing_session_instead_of_restarting(
+    monkeypatch, tmp_path
+):
+    """`start --reattach` against an alive session must NOT stop it or run
+    anything -- same pid, same cursor, just reported back. The default
+    (no --reattach) behavior -- stop and restart fresh -- must be
+    unaffected, since that's still what most callers want (G89).
+    """
+    import os
+
+    from aitlc.core import debug_session
+
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "1", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    config = debug_cmd.AitlcConfig.find_and_load()
+    original_pid = debug_session.load(config.root_dir, "PROJ-1").pid
+    os.kill(original_pid, 0)  # confirm genuinely alive before reattaching
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--reattach"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["reattached"] is True
+    assert payload["parked_at"] == 1
+    assert payload["current_step"] == "When the first real step runs"
+
+    # Same process the whole time -- --reattach touched nothing.
+    os.kill(original_pid, 0)
+    assert debug_session.load(config.root_dir, "PROJ-1").pid == original_pid
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_start_reattach_falls_through_to_fresh_when_nothing_alive(monkeypatch, tmp_path):
+    """`--reattach` with no live session for this test_id must behave like
+    a normal `start` -- not error out just because there was nothing to
+    reattach to."""
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--reattach", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "reattached" not in payload
+    assert payload["parked_at"] == 0
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_reap_kills_a_real_orphan_with_no_session_record(monkeypatch, tmp_path):
     """`debug list --prune` only prunes stale SESSION RECORDS -- an orphan
     from before that record existed (a crash, a killed shell) has no
