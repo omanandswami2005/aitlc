@@ -180,3 +180,30 @@ def test_serve_rebuild_forces_build_even_if_already_built(project, monkeypatch):
     assert result.exit_code == 0, result.output
     assert len(calls) == 2
     assert calls[0][0][:4] == ["uv", "run", "stepatlas", "build"]
+
+
+def test_stop_kills_matching_preview_process(project, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[0] == "pgrep":
+            return type("R", (), {"returncode": 0, "stdout": "12345\n"})()
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr("aitlc.commands.stepatlas_cmd.subprocess.run", fake_run)
+    result = runner.invoke(app, ["stepatlas", "stop"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"stopped": [12345]}
+    assert calls[0][0] == "pgrep"
+    assert calls[1] == ["kill", "12345"]
+
+
+def test_stop_reports_empty_when_nothing_running(project, monkeypatch):
+    monkeypatch.setattr(
+        "aitlc.commands.stepatlas_cmd.subprocess.run",
+        lambda cmd, **kw: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+    result = runner.invoke(app, ["stepatlas", "stop"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"stopped": []}

@@ -85,6 +85,24 @@ def serve(
     raise typer.Exit(code=proc.returncode)
 
 
+@app.command("stop")
+def stop() -> None:
+    """Stop a running `stepatlas serve` preview server.
+
+    `pnpm run preview` wraps astro's own server as a child process; a
+    Ctrl+C sometimes only signals the pnpm wrapper (exit 143) and leaves
+    astro.mjs holding the port. This finds and kills it directly.
+    """
+    config = AitlcConfig.find_and_load()
+    stepatlas_path = _require_stepatlas_path(config)
+    pattern = f"{stepatlas_path / 'site'}.*astro.*preview"
+    found = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    pids = [pid for pid in found.stdout.split() if pid]
+    for pid in pids:
+        subprocess.run(["kill", pid])
+    typer.echo(json.dumps({"stopped": [int(pid) for pid in pids]}))
+
+
 def _matches_file_line(step: dict, file: str, line: int) -> bool:
     return step["file"].endswith(file) and step["line"] == line
 
