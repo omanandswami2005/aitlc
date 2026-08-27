@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.1.
+Version 0.8.2.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -79,6 +79,23 @@ the directory and it all goes together.
 | `--workspace` / `-w` | one command |
 | `AITLC_WORKSPACE` | a shell working on one thing |
 | `[project].workspace` | a project that always wants it |
+
+### What's actually in there, and what cleans itself up
+
+| Path | What it is | Named how | Retention today |
+|---|---|---|---|
+| `.aitlc/artifacts/` | Cached CI reports (`s3 verify-test`/`triage-run`) — downloaded once, re-read from disk after | `<hash>-behave_<TESTID>_<timestamp>.json`, plus `index.json` | **None.** Grows forever; safe to delete entirely any time (re-fetches on next use). No automatic pruning yet — a real gap, not a design choice. |
+| `.aitlc/runs/` | The journal (`aitlc journal list/show/diff`) — every `run`, and every `debug next`/`retry`/`continue`/`run-text`/`run-line` | `<UTC-timestamp>-<command>.json`, e.g. `20260827T070512-debug_continue.json` | Auto-pruned to the newest 200 entries after every write (`journal.DEFAULT_KEEP`). Self-managing, nothing to do. |
+| `.aitlc/debug/` | Live debug session state | `<test_id>.json` (session), `<test_id>.progress.json` (live setup progress), `gate.log`/`run_debug.log` (raw subprocess stdout, shared across every `debug start`/`run --debug` in the project) | Session files: manual — `debug list --prune` drops any whose gate process no longer answers. **`gate.log`/`run_debug.log`: none, ever** — they accumulate across every session forever. Don't hand-truncate one while a session is live (an in-flight `next`/`retry` holds a byte-offset bookmark into it). |
+| `.status/` | Live `current_step.json`-style status for `run` (unless `--no-status`) | `<test_id>.json` | One file per test_id, overwritten each run — doesn't grow unbounded, but stale entries for tests you no longer run just sit there. |
+| `.locks/`, `.parallel/`, `.cdp/`, `traces/` | Per-test concurrency locks, one log per feature from `parallel run`, CDP browser profiles, Playwright traces | see each command's own docs | No automatic pruning on any of these yet. |
+
+**If your reports directory has gotten large:** `.aitlc/artifacts/` is almost
+always the biggest, cheapest-to-clear offender — it's purely a re-fetchable
+cache, safe to `rm -rf` entirely. `debug list --prune` cleans up abandoned
+debug sessions. Everything else here needs manual attention for now; none of
+it is dangerous to delete, since none of it is the source of truth for
+anything (the source of truth is your feature files, Xray, and CI).
 
 Unset, everything stays under `reports/` as before. The name is relative to the
 project root; an absolute path is refused rather than quietly made relative.
@@ -218,7 +235,7 @@ aitlc debug continue PROJ-1234 --from 42   # jump, then continue normally from t
 aitlc debug restart PROJ-1234 --extra-tag skip_login  # same browser, re-run from step 0
 aitlc debug status PROJ-1234           # where am I?
 aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url needed
-aitlc debug inspect PROJ-1234 --a11y    # same, accessibility tree instead of pixels
+aitlc debug inspect PROJ-1234           # same, accessibility tree instead of pixels
 aitlc debug list --prune                # every tracked session; drop dead bookkeeping
 aitlc debug certify PROJ-1234 --times 2
 aitlc debug stop PROJ-1234              # THIS session's browser down; no cleanup hooks fired
@@ -410,7 +427,7 @@ something that never happened.
 Already inside a paused `debug` session (not a bare `cdp launch`)? `aitlc
 debug eval TEST-ID "<js-expr>"` reads the same live page without needing the
 port — it runs against whichever page the gate finds on the paused Context.
-`aitlc debug screenshot TEST-ID` and `aitlc debug inspect TEST-ID --a11y` are
+`aitlc debug screenshot TEST-ID` and `aitlc debug inspect TEST-ID` are
 the same idea for a screenshot or the accessibility tree: both resolve the
 CDP endpoint from the session itself, so there's nothing to look up first.
 
@@ -707,6 +724,23 @@ list). `journal list`/`show`/`diff` therefore cover a debug session exactly
 like a full run, however many `next`/`retry` calls it took — the only
 practical difference is you get one entry per debug command instead of one
 per whole run.
+
+**`debug continue`'s own stdout summary is compact by default, on purpose.**
+Real complaint hit live: the full `results` list repeats every step's
+`captured_output`/`traceback`/`page_state` in one giant dump at the end —
+already shown once, live, per step, via each step's own pretty line during
+the run. `--compact` (the default) keeps only step/keyword/status/duration/
+error/`failed_at` per entry; `--full` restores the complete records. Either
+way the journal keeps the untrimmed version — `--compact` never loses data,
+it just stops repeating it on the terminal. Set a project-wide default in
+`aitlc.toml`:
+
+```toml
+[debug]
+continue_output = "compact"   # or "full"
+```
+
+The CLI flag always wins over the config when passed.
 
 ---
 

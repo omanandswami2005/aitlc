@@ -101,7 +101,7 @@ step *before* your park point.
 ```bash
 aitlc debug run-line PROJ-1234 42       # run the step at that file line, no retyping/escaping
 aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url to look up
-aitlc debug inspect PROJ-1234 --a11y    # same, for the accessibility tree
+aitlc debug inspect PROJ-1234           # same, for the accessibility tree
 ```
 
 **Every failed step already carries a real Python traceback, no setup

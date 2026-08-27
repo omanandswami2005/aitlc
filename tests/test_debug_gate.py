@@ -55,6 +55,11 @@ def _w2(context):
 '''
 
 
+class _DebugCfg:
+    def __init__(self) -> None:
+        self.continue_output = "compact"
+
+
 class _Cfg:
     def __init__(self, root: Path, feature: Path) -> None:
         self.root_dir = root
@@ -64,6 +69,7 @@ class _Cfg:
         self.step_dir = "features/steps"
         self.browser_actions = None
         self.browser_factory = None
+        self.debug = _DebugCfg()
 
     def resolve_feature_path(self, _tid):
         return self._feature
@@ -229,6 +235,49 @@ def test_debug_continue_stops_at_the_first_failure(monkeypatch, tmp_path):
     assert payload["stopped_reason"] == "failed"
     assert payload["steps_run"] == 2  # the passing Given, then the failing When
     assert payload["results"][-1]["status"] == "failed"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_continue_compact_output_drops_captured_output_but_journal_keeps_it(
+    monkeypatch, tmp_path
+):
+    """Compact (the default) must strip captured_output/traceback/page_state
+    from the STDOUT summary -- already shown once, live, per step -- while
+    the journal entry keeps the full, untrimmed record regardless. --full
+    must restore the complete records on stdout too.
+    """
+    from aitlc.core import journal
+
+    _wire(monkeypatch, tmp_path)
+    (tmp_path / "features" / "steps" / "steps.py").write_text(
+        STEPS.replace(
+            '@when("the first real step runs")\ndef _w(context):\n    pass',
+            '@when("the first real step runs")\ndef _w(context):\n    print("hello")',
+        )
+    )
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert all("captured_output" not in r for r in payload["results"])
+    assert all(set(r) <= set(debug_cmd._COMPACT_STEP_FIELDS) for r in payload["results"])
+
+    entries = journal.entries(tmp_path)
+    continue_entry = next(e for e in entries if e.command == "debug continue")
+    assert any("hello" in (r.get("captured_output") or "") for r in continue_entry.payload["results"])
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1", "--full"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert any("hello" in (r.get("captured_output") or "") for r in payload["results"])
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 

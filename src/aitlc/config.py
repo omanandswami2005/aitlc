@@ -72,6 +72,21 @@ class MobileConfig:
 
 
 @dataclass
+class DebugConfig:
+    """Defaults for the `debug` command group."""
+
+    # `debug continue`'s final stdout summary can either repeat every
+    # step's full record (captured_output/traceback/page_state -- already
+    # shown once, live, via each step's own pretty line during the run) or
+    # a compact one (step/status/duration/error only). Real complaint hit
+    # live: the full form floods the terminal on a long `continue`, with
+    # everything already shown once. Compact by default; the full record
+    # is always in the journal (`aitlc journal list --last 1`) regardless
+    # of this setting, so nothing is actually lost by defaulting compact.
+    continue_output: str = "compact"
+
+
+@dataclass
 class LambdaTestConfig:
     """Remote-execution settings for the LambdaTest platform."""
 
@@ -149,6 +164,7 @@ class AitlcConfig:
     env: EnvMap = field(default_factory=EnvMap)
     mobile: MobileConfig = field(default_factory=MobileConfig)
     lambdatest: LambdaTestConfig = field(default_factory=LambdaTestConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
     root_dir: Path = field(default_factory=Path.cwd)
 
     @classmethod
@@ -182,6 +198,7 @@ class AitlcConfig:
         env_data = data.get("env", {})
         mobile_data = data.get("mobile", {})
         lt_data = data.get("lambdatest", {})
+        debug_data = data.get("debug", {})
         xray_data = data.get("xray", {})
         jira_data = data.get("jira", {})
         s3_data = data.get("s3", {})
@@ -209,6 +226,7 @@ class AitlcConfig:
             env=EnvMap(**env_data),
             mobile=MobileConfig(**mobile_data),
             lambdatest=LambdaTestConfig(**lt_data),
+            debug=DebugConfig(**debug_data),
             root_dir=root_dir,
         )
 

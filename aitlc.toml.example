@@ -66,6 +66,15 @@ s3_session_token = "AWS_SESSION_TOKEN"
 # `aitlc notify-teams` posts a per-run failure + duration summary here.
 teams_webhook_url = "TEAMS_WEBHOOK_URL"
 
+[debug]
+# `debug continue`'s final stdout summary: "compact" (default) drops each
+# step's captured_output/traceback/page_state -- already shown once, live,
+# per step, during the run; the full record is always in the journal
+# (`aitlc journal list --last 1`) regardless. "full" repeats everything on
+# stdout too, for a script that wants it there directly. Override per call
+# with `debug continue --full` / `--compact`.
+continue_output = "compact"
+
 [mobile]
 mobile_feature_title_pattern = "Mobile browser:"
 mobile_device_env_var = "DEVICE_NAME"

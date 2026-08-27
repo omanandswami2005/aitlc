@@ -684,6 +684,26 @@ def next_step(
     _drive(config, _default_id(config, test_id), "next")
 
 
+_COMPACT_STEP_FIELDS = (
+    "step",
+    "keyword",
+    "status",
+    "duration_s",
+    "step_index",
+    "total",
+    "error",
+    "failed_at",
+)
+
+
+def _compact_step_summary(reply: dict) -> dict:
+    """Just enough to see what happened, per step -- drops captured_output/
+    traceback/page_state, which already streamed once, live, via that
+    step's own pretty line during the run. The full record never actually
+    goes away: it's what got journaled (`aitlc journal list --last 1`)."""
+    return {k: reply[k] for k in _COMPACT_STEP_FIELDS if k in reply}
+
+
 @app.command("continue")
 def continue_steps(
     test_id: str = typer.Argument(None),
@@ -697,6 +717,16 @@ def continue_steps(
         "then continue as normal -- for when you navigated the browser "
         "manually and want the session to pick up from where things "
         "actually stand.",
+    ),
+    full: bool = typer.Option(
+        None,
+        "--full/--compact",
+        help="Final stdout summary: --full repeats every step's complete "
+        "record (captured_output/traceback/page_state included); --compact "
+        "keeps only step/status/duration/error (already shown once, live, "
+        "per step, during the run). Defaults to [debug].continue_output in "
+        "aitlc.toml (\"compact\" if unset). The journal always keeps the "
+        "full record either way -- see `aitlc journal list --last 1`.",
     ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
@@ -712,6 +742,7 @@ def continue_steps(
     load_dotenv(config.root_dir / env_file)
     test_id = _default_id(config, test_id)
     session = _require(config, test_id)
+    compact_output = not full if full is not None else config.debug.continue_output != "full"
 
     if from_line is not None:
         _request_or_die(session, "reload", step_dir=config.step_dir)
@@ -765,7 +796,10 @@ def continue_steps(
         )
     except OSError:
         pass
-    typer.echo(json.dumps(payload, indent=2))
+    echo_payload = payload
+    if compact_output:
+        echo_payload = {**payload, "results": [_compact_step_summary(r) for r in results]}
+    typer.echo(json.dumps(echo_payload, indent=2))
     raise typer.Exit(code=0 if last_status in (None, "passed") else 1)
 
 

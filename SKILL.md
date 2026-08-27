@@ -40,7 +40,7 @@ Run & investigate one test:
   higher-fidelity since it re-parses the real bound `Step` object (a
   Scenario Outline's `<placeholders>` already substituted).
 - **Session-aware `screenshot`/`inspect`/`list`** → no `--cdp-url` lookup
-  needed once a session exists: `debug screenshot`/`debug inspect --a11y`
+  needed once a session exists: `debug screenshot`/`debug inspect`
   resolve it from the session itself. `debug list` shows every tracked
   session across more than one live browser; `--prune` drops bookkeeping
   for any whose gate process is no longer actually running.
@@ -169,7 +169,7 @@ aitlc -w PROJ-1234 debug continue PROJ-1234 --from 42  # jump, then continue fro
 aitlc -w PROJ-1234 debug restart PROJ-1234 --extra-tag skip_login  # same browser, re-run from step 0
 aitlc -w PROJ-1234 debug status PROJ-1234          # where the paused run is
 aitlc -w PROJ-1234 debug screenshot PROJ-1234       # this session's page, no --cdp-url needed
-aitlc -w PROJ-1234 debug inspect PROJ-1234 --a11y   # same, for the accessibility tree
+aitlc -w PROJ-1234 debug inspect PROJ-1234           # same, for the accessibility tree
 aitlc -w PROJ-1234 debug py PROJ-1234 "some_local"  # Python eval in a paused breakpoint()'s frame
 aitlc -w PROJ-1234 debug resume PROJ-1234           # continue past that breakpoint(), same session
 aitlc -w PROJ-1234 debug certify PROJ-1234 --times 2   # fresh instance, real feature, N passes
