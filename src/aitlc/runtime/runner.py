@@ -124,6 +124,30 @@ def _stamp(epoch: float) -> str:
 _PAGE_STATE_TREE_CHARS = 3000
 
 
+def _find_step_index_for_line(steps: list, target_line: int) -> int | None:
+    """Index of the step at (or nearest before) `target_line`, or None.
+
+    Shared by `jump`'s line branch and the read-only `resolve_line` --
+    same nearest-at-or-before matching, one mutates the cursor, one
+    doesn't.
+    """
+    match = None
+    for step in steps:
+        step_line = getattr(step, "line", None)
+        if step_line is None:
+            continue
+        if step_line == target_line:
+            match = step
+            break
+        if step_line <= target_line and (
+            match is None or step_line > getattr(match, "line", 0)
+        ):
+            match = step
+    if match is None:
+        return None
+    return steps.index(match)
+
+
 def _truncate(text: str, limit: int) -> str:
     """Cap `text` at `limit` chars, marking it when cut so a short field never
     reads as complete when it silently isn't (full text lives in `traceback`
@@ -1318,33 +1342,43 @@ class AitlcRunner(_BaseRunner):
                             )
                     else:
                         target_line = request.get("line", 0)
-                        match = None
-                        for step in steps:
-                            step_line = getattr(step, "line", None)
-                            if step_line is None:
-                                continue
-                            if step_line == target_line:
-                                match = step
-                                break
-                            if step_line <= target_line and (
-                                match is None or step_line > getattr(match, "line", 0)
-                            ):
-                                match = step
-                        if match is None:
+                        match_index = _find_step_index_for_line(steps, target_line)
+                        if match_index is None:
                             self._send(
                                 conn, {"error": f"no step found at or before line {target_line}"}
                             )
                         else:
-                            cursor = steps.index(match)
+                            cursor = match_index
                             self._send(
                                 conn,
                                 {
                                     "jumped_to": cursor,
                                     "total": len(steps),
-                                    "current_step": self._step_text(match),
+                                    "current_step": self._step_text(steps[cursor]),
                                     "finished": cursor >= len(steps),
                                 },
                             )
+                elif cmd == "resolve_line":
+                    # Read-only version of jump's line lookup -- answers
+                    # "which step index is line N" without moving the
+                    # cursor, so `continue --to <line>` can compute a
+                    # stopping point without disturbing where a real
+                    # next/retry afterwards would resume from.
+                    target_line = request.get("line", 0)
+                    match_index = _find_step_index_for_line(steps, target_line)
+                    if match_index is None:
+                        self._send(
+                            conn, {"error": f"no step found at or before line {target_line}"}
+                        )
+                    else:
+                        self._send(
+                            conn,
+                            {
+                                "resolved_index": match_index,
+                                "total": len(steps),
+                                "current_step": self._step_text(steps[match_index]),
+                            },
+                        )
                 elif cmd == "stop":
                     reply = {"stopped": True}
                     if request.get("cleanup"):

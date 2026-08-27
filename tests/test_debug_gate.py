@@ -1464,6 +1464,83 @@ def test_continue_from_jumps_then_runs_only_from_there(monkeypatch, tmp_path):
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_continue_to_runs_up_to_and_including_that_line_then_stops(monkeypatch, tmp_path):
+    """`continue --to <line>` must run every real step up to and including
+    the target, then stop -- even though every step here passes, unlike
+    plain `continue` which would run all the way to the end.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    lines = feature_path.read_text().splitlines()
+    when_line = next(i for i, l in enumerate(lines, start=1) if "the first real step runs" in l)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1", "--to", str(when_line)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["stopped_reason"] == "reached_to_line"
+    assert payload["steps_run"] == 2
+    assert payload["results"][-1]["step"] == "When the first real step runs"
+
+    # The Then step must NOT have run -- --to stopped one short of the end.
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["current_step"] == "Then the second real step runs"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_continue_from_and_to_together_run_exactly_that_range(monkeypatch, tmp_path):
+    """`--from`/`--to` combined must do the jump-then-run-a-range in one
+    call -- no separate `jump` plus `continue --max-steps` needed. Jumping
+    onto the SAME step as --to and running from there executes exactly
+    that one step, neither the ones before it nor the one after.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    lines = feature_path.read_text().splitlines()
+    when_line = next(i for i, l in enumerate(lines, start=1) if "the first real step runs" in l)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        debug_cmd.app, ["continue", "PROJ-1", "--from", str(when_line), "--to", str(when_line)]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["stopped_reason"] == "reached_to_line"
+    assert payload["steps_run"] == 1
+    assert payload["results"][0]["step"] == "When the first real step runs"
+
+    # Neither the earlier Given nor the later Then ran.
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["current_step"] == "Then the second real step runs"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_continue_to_a_line_already_behind_the_cursor_runs_nothing(monkeypatch, tmp_path):
+    """A `--to <line>` the session has already run past must not silently
+    run a full `continue` to the end -- report it plainly instead."""
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    lines = feature_path.read_text().splitlines()
+    given_line = next(i for i, l in enumerate(lines, start=1) if "the setup step runs" in l)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "2", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1", "--to", str(given_line)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["stopped_reason"] == "already_past_to_line"
+    assert payload["steps_run"] == 0
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_debug_screenshot_resolves_cdp_url_from_the_session(monkeypatch, tmp_path):
     """`debug screenshot` must use the SESSION's own cdp_url, not a port
     the caller has to look up and type -- the same friction `eval`/

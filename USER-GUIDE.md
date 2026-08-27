@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.8.
+Version 0.8.9.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -721,6 +721,16 @@ currently parked (negative for back, positive for forward) instead of
 naming an absolute file line. Answers "go back one step" without first
 reading the feature file to find that step's line number. Mutually
 exclusive with the line argument/`--from`.
+
+**`continue --to <line>` runs every real step up to and including that
+line, then stops** — even when everything passes, unlike plain `continue`
+which only stops at the first failure or the end. Combine with
+`--from`/`--rel` to jump first, e.g. `continue --from 12 --to 40` runs
+exactly that range in one call instead of a separate `jump` plus
+`continue --max-steps <N>` (which needs you to count the steps between
+them by hand). `--to` a line already behind the cursor runs nothing and
+reports `"stopped_reason": "already_past_to_line"` rather than silently
+running all the way to the end.
 
 ### Run the project's own tools, with its environment set up
 

@@ -851,6 +851,14 @@ def continue_steps(
         help="Move the cursor this many steps from where it's parked (e.g. -1 for the "
         "previous step), then continue as normal.",
     ),
+    to_line: int = typer.Option(
+        None,
+        "--to",
+        help="Run every real step up to (and including) the step at this file line, "
+        "then stop -- even if every one of them passes. Combine with --from/--rel "
+        "to jump first, e.g. --from 12 --to 40 runs exactly that range in one call "
+        "instead of a `jump`/`continue --max-steps` pair.",
+    ),
     full: bool = typer.Option(
         None,
         "--full/--compact",
@@ -879,33 +887,49 @@ def continue_steps(
 
     _jump_first(config, session, from_line, rel)
 
+    target_index = None
+    if to_line is not None:
+        resolve_reply = _request_or_die(session, "resolve_line", line=to_line)
+        if resolve_reply.get("error"):
+            typer.echo(json.dumps(resolve_reply), err=True)
+            raise typer.Exit(code=2)
+        target_index = resolve_reply["resolved_index"]
+
+    reached_to_line = False
+    already_past_to_line = target_index is not None and session.index > target_index
     results = []
-    for _ in range(max_steps):
-        reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
-        bookmark = _log_size(session.log_path)
-        reply = _request_or_die(session, "next")
-        reply["captured_output"] = _tail_log_since(session.log_path, bookmark)
-        if isinstance(reload_reply, dict) and reload_reply.get("feature"):
-            reply["feature"] = reload_reply["feature"]
-        if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
-            reply["reloaded_modules"] = reload_reply["reloaded_modules"]
-        if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
-            reply["stale_modules"] = reload_reply["stale_modules"]
-            reply["warning"] = reload_reply["warning"]
-        results.append(reply)
-        _print_pretty_step(reply, config.debug)
-        if reply.get("index") is not None:
-            session.index = reply["index"]
-            debug_session.save(config.root_dir, session)
-        if reply.get("status") not in (None, "passed") or reply.get("finished"):
-            break
+    if not already_past_to_line:
+        for _ in range(max_steps):
+            reload_reply = _request_or_die(session, "reload", step_dir=config.step_dir)
+            bookmark = _log_size(session.log_path)
+            reply = _request_or_die(session, "next")
+            reply["captured_output"] = _tail_log_since(session.log_path, bookmark)
+            if isinstance(reload_reply, dict) and reload_reply.get("feature"):
+                reply["feature"] = reload_reply["feature"]
+            if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
+                reply["reloaded_modules"] = reload_reply["reloaded_modules"]
+            if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
+                reply["stale_modules"] = reload_reply["stale_modules"]
+                reply["warning"] = reload_reply["warning"]
+            results.append(reply)
+            _print_pretty_step(reply, config.debug)
+            if reply.get("index") is not None:
+                session.index = reply["index"]
+                debug_session.save(config.root_dir, session)
+            if reply.get("status") not in (None, "passed") or reply.get("finished"):
+                break
+            if target_index is not None and reply.get("step_index") == target_index:
+                reached_to_line = True
+                break
 
     last_status = results[-1].get("status") if results else None
     payload = {
         "steps_run": len(results),
         "stopped_reason": (
-            "finished" if results and results[-1].get("finished")
+            "already_past_to_line" if already_past_to_line
+            else "finished" if results and results[-1].get("finished")
             else "failed" if last_status not in (None, "passed")
+            else "reached_to_line" if reached_to_line
             else "max_steps_reached"
         ),
         "results": results,
