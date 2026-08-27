@@ -124,6 +124,15 @@ def _stamp(epoch: float) -> str:
 _PAGE_STATE_TREE_CHARS = 3000
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Cap `text` at `limit` chars, marking it when cut so a short field never
+    reads as complete when it silently isn't (full text lives in `traceback`
+    and the journal either way)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f" ...[truncated, {len(text) - limit} more chars]"
+
+
 def _extract_python_failure(exc: BaseException | None, tb: Any) -> dict | None:
     """Full traceback + innermost frame for a failed step, from the RAW
     exception/traceback -- not behave's own `error_message` text.
@@ -147,11 +156,20 @@ def _extract_python_failure(exc: BaseException | None, tb: Any) -> dict | None:
     frames = traceback.extract_tb(tb)
     result: dict[str, Any] = {"traceback": text}
     if frames:
-        last = frames[-1]
+        # The deepest frame is usually inside a library (Playwright, retry,
+        # behave itself) for the most common failure -- a Playwright
+        # TimeoutError always bottoms out in playwright's own connection
+        # code, never the project's step/page-object line. Prefer the
+        # deepest frame that's actually IN the project (cwd is root_dir --
+        # gate_launch.py launches this process with cwd=config.root_dir),
+        # falling back to the true deepest frame if none match.
+        project_root = os.getcwd()
+        project_frames = [f for f in frames if f.filename.startswith(project_root)]
+        chosen = project_frames[-1] if project_frames else frames[-1]
         result["failed_at"] = {
-            "file": last.filename,
-            "line": last.lineno,
-            "function": last.name,
+            "file": chosen.filename,
+            "line": chosen.lineno,
+            "function": chosen.name,
         }
     return result
 
@@ -334,7 +352,7 @@ class AitlcRunner(_BaseRunner):
         payload = {
             "event": "paused_on_failure",
             "step": getattr(step, "name", None),
-            "error": str(getattr(step, "error_message", "") or "")[:500],
+            "error": _truncate(str(getattr(step, "error_message", "") or ""), 500),
             "page_url": url,
             "hint": (
                 "Process halted before teardown; the browser is still open. "
@@ -384,7 +402,7 @@ class AitlcRunner(_BaseRunner):
         # `paused_on_failure` reply and every later `debug status` say WHERE
         # (index/current_step) but never WHY -- the actual assertion/exception
         # text is sitting right here on `step` and was otherwise discarded.
-        self._aitlc_park_error = str(getattr(step, "error_message", "") or "")[:500] or None
+        self._aitlc_park_error = _truncate(str(getattr(step, "error_message", "") or ""), 500) or None
         self._serve(context, start_cursor=cursor)
 
     # --------------------------------------------------------------- gate mode
@@ -596,7 +614,7 @@ class AitlcRunner(_BaseRunner):
             error = None
             python_failure = None
             if not passed:
-                error = str(getattr(step, "error_message", "") or "")[:1000] or (
+                error = _truncate(str(getattr(step, "error_message", "") or ""), 1000) or (
                     f"step did not pass (status={_status_name(step)})"
                 )
                 python_failure = _extract_python_failure(
