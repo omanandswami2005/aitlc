@@ -57,14 +57,19 @@ def build() -> None:
 
 @app.command("serve")
 def serve(
-    skip_build: bool = typer.Option(
-        False, "--skip-build", help="Serve whatever's already built; don't regenerate first."
+    rebuild: bool = typer.Option(
+        None,
+        "--rebuild/--skip-build",
+        help="Force a regenerate, or skip it and serve whatever's already built. "
+        "Default: regenerate only if nothing's built yet (dist/ is empty/missing).",
     ),
 ) -> None:
-    """Build (unless --skip-build) then serve the StepAtlas site."""
+    """Serve the StepAtlas site, regenerating first only if needed."""
     config = AitlcConfig.find_and_load()
     stepatlas_path = _require_stepatlas_path(config)
-    if not skip_build:
+    already_built = (stepatlas_path / "site" / "dist" / "index.html").is_file()
+    do_build = rebuild if rebuild is not None else not already_built
+    if do_build:
         proc = subprocess.run(
             [
                 "uv", "run", "stepatlas", "build",

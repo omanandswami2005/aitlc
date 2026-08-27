@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.9.0.
+Version 0.9.1.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -585,8 +585,9 @@ is a thin wrapper: it shells out to StepAtlas's own CLI/site and reads its
 
 ```bash
 aitlc stepatlas build              # regenerate the catalog (no site preview)
-aitlc stepatlas serve              # regenerate + serve the site
-aitlc stepatlas serve --skip-build # just serve whatever's already built
+aitlc stepatlas serve               # serve; regenerates first only if nothing's built yet
+aitlc stepatlas serve --rebuild     # force a fresh regenerate even if already built
+aitlc stepatlas serve --skip-build  # force serving what's there, never regenerate
 aitlc stepatlas info "select database"        # text search
 aitlc stepatlas info features/steps/step_definition_search_page.py:573  # by file:line
 ```

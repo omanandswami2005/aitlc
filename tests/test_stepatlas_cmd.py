@@ -137,3 +137,46 @@ def test_serve_skip_build_only_runs_preview(project, monkeypatch):
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
     assert calls[0][0] == ["pnpm", "run", "preview"]
+
+
+def test_serve_default_builds_when_nothing_is_built_yet(project, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "aitlc.commands.stepatlas_cmd.subprocess.run",
+        lambda cmd, **kw: calls.append((cmd, kw)) or type("R", (), {"returncode": 0})(),
+    )
+    result = runner.invoke(app, ["stepatlas", "serve"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    assert calls[0][0][:4] == ["uv", "run", "stepatlas", "build"]
+    assert calls[1][0] == ["pnpm", "run", "preview"]
+
+
+def test_serve_default_skips_build_when_already_built(project, monkeypatch):
+    dist = project / "StepAtlas" / "site" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<html></html>")
+    calls = []
+    monkeypatch.setattr(
+        "aitlc.commands.stepatlas_cmd.subprocess.run",
+        lambda cmd, **kw: calls.append((cmd, kw)) or type("R", (), {"returncode": 0})(),
+    )
+    result = runner.invoke(app, ["stepatlas", "serve"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0][0] == ["pnpm", "run", "preview"]
+
+
+def test_serve_rebuild_forces_build_even_if_already_built(project, monkeypatch):
+    dist = project / "StepAtlas" / "site" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<html></html>")
+    calls = []
+    monkeypatch.setattr(
+        "aitlc.commands.stepatlas_cmd.subprocess.run",
+        lambda cmd, **kw: calls.append((cmd, kw)) or type("R", (), {"returncode": 0})(),
+    )
+    result = runner.invoke(app, ["stepatlas", "serve", "--rebuild"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    assert calls[0][0][:4] == ["uv", "run", "stepatlas", "build"]
