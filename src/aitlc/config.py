@@ -178,6 +178,17 @@ class AitlcConfig:
     lambdatest: LambdaTestConfig = field(default_factory=LambdaTestConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     root_dir: Path = field(default_factory=Path.cwd)
+    # None means find_and_load() never found an aitlc.toml -- root_dir then
+    # silently defaulted to plain cwd, which is NOT the project root a real
+    # config would have resolved to. Real confusion hit live: `cdp list`/
+    # `debug list` run from one directory up (a monorepo root, say) reported
+    # "0 instances"/"0 sessions" with no hint that this was the wrong
+    # directory rather than genuinely nothing tracked -- state tracked under
+    # the REAL project's aitlc.toml was invisible from there. Distinct from
+    # a legitimately no-config project (`aitlc doctor` etc. still work; this
+    # field just lets a caller that cares warn instead of trusting an empty
+    # result silently).
+    config_path: Path | None = None
 
     @classmethod
     def find_and_load(cls, start_dir: Path | None = None) -> AitlcConfig:
@@ -193,17 +204,37 @@ class AitlcConfig:
                 candidate = directory / name
                 if candidate.is_file():
                     return cls.load(candidate)
-        return cls()
+        # Real gap found live: this used to be a bare `cls()`, whose
+        # `root_dir` default (`Path.cwd()`) ignores `start_dir` entirely --
+        # an explicit `find_and_load(some_dir)` that finds nothing silently
+        # reported the PROCESS's cwd as root_dir instead of the directory it
+        # was actually told to search from.
+        return cls(root_dir=current)
+
+    def no_config_warning(self) -> str | None:
+        """A caller-facing warning when this config is the bare fallback --
+        no aitlc.toml was found anywhere above the directory it looked from,
+        so `root_dir` is just wherever the command happened to run, not a
+        real project root. None when a real config was loaded."""
+        if self.config_path is not None:
+            return None
+        return (
+            f"no aitlc.toml found above {self.root_dir} -- showing state for "
+            "this bare directory, not necessarily your project (run from "
+            "inside the project, or check you're not one level too high)"
+        )
 
     @classmethod
     def load(cls, path: Path) -> AitlcConfig:
         """Load configuration from a specific file."""
         with open(path, "rb") as f:
             data = tomllib.load(f)
-        return cls.from_dict(data, root_dir=path.parent)
+        return cls.from_dict(data, root_dir=path.parent, config_path=path)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any], root_dir: Path) -> AitlcConfig:
+    def from_dict(
+        cls, data: dict[str, Any], root_dir: Path, config_path: Path | None = None
+    ) -> AitlcConfig:
         """Build a config from already-parsed TOML data."""
         project = data.get("project", {})
         workspace_module.set_config_default(project.get("workspace", ""))
@@ -240,6 +271,7 @@ class AitlcConfig:
             lambdatest=LambdaTestConfig(**lt_data),
             debug=DebugConfig(**debug_data),
             root_dir=root_dir,
+            config_path=config_path,
         )
 
     def require_env(self, generic_name: str) -> str:

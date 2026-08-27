@@ -89,3 +89,32 @@ def test_resolve_feature_path_missing_returns_none(project_root: Path):
 def test_find_and_load_returns_default_when_no_config(tmp_path: Path):
     config = AitlcConfig.find_and_load(tmp_path)
     assert config.project_name == "project"  # default, not an error
+
+
+def test_no_config_warning_fires_for_the_bare_fallback(tmp_path: Path):
+    """Real confusion hit live: `cdp list`/`debug list` run one directory up
+    from a real project (a monorepo root, say) silently reported 0
+    instances/sessions, indistinguishable from genuinely nothing tracked --
+    state tracked under the REAL project's aitlc.toml was invisible from
+    there. The bare fallback must be able to say so.
+    """
+    config = AitlcConfig.find_and_load(tmp_path)
+    warning = config.no_config_warning()
+    assert warning is not None
+    assert str(tmp_path) in warning
+
+
+def test_no_config_warning_is_none_for_a_real_config(project_root: Path):
+    config = AitlcConfig.load(project_root / "aitlc.toml")
+    assert config.no_config_warning() is None
+
+
+def test_find_and_load_finds_a_config_in_a_parent_directory(project_root: Path):
+    """The warning must NOT fire just because the command ran from a
+    subdirectory of a real project -- only when no aitlc.toml exists
+    anywhere above it at all."""
+    nested = project_root / "features" / "sub"
+    nested.mkdir()
+    config = AitlcConfig.find_and_load(nested)
+    assert config.project_name == "myproject"
+    assert config.no_config_warning() is None

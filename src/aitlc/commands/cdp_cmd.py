@@ -9,6 +9,7 @@ import typer
 from aitlc.config import AitlcConfig
 from aitlc.core import chrome_cdp
 from aitlc.core import cdp_attach
+from aitlc.core import debug_session
 from aitlc.core.cdp_attach import inspect as cdp_inspect
 
 app = typer.Typer(help="Launch, inspect and stop a live Chromium instance over CDP.")
@@ -198,6 +199,9 @@ def status(
         payload["note"] = (
             "tracked instance is no longer answering; run 'aitlc cdp launch'"
         )
+    warning = config.no_config_warning()
+    if warning:
+        payload["warning"] = warning
 
     typer.echo(json.dumps(payload))
     raise typer.Exit(code=0 if version is not None else 1)
@@ -208,7 +212,27 @@ def list_() -> None:
     """List every tracked debug Chrome and whether it is still alive."""
     config = AitlcConfig.find_and_load()
     instances = chrome_cdp.list_instances(config.root_dir)
-    typer.echo(json.dumps({"instances": instances, "count": len(instances)}, indent=2))
+    payload = {"instances": instances, "count": len(instances)}
+    warning = config.no_config_warning()
+    if warning:
+        payload["warning"] = warning
+    typer.echo(json.dumps(payload, indent=2))
+
+
+def _sessions_orphaned_by_stopping(root_dir: Path, ports: list[int]) -> list[str]:
+    """test_ids of tracked debug sessions whose browser is one of `ports`.
+
+    Real confusion hit live: `cdp stop` killed the browser a live `debug`
+    session was actively using, with no warning at all -- `debug status`/
+    `next`/`continue` kept reporting success afterward (a step that never
+    touches the page, like a pure filesystem assertion, genuinely can pass
+    with no browser at all), silently masking that the session's browser
+    was gone. `debug list` already tracks `browser_alive` separately from
+    `gate_alive` and would have shown it -- this surfaces the same fact
+    at the moment it actually happens, not only if you go looking.
+    """
+    ports_set = set(ports)
+    return [s.test_id for s in debug_session.list_all(root_dir) if s.port in ports_set]
 
 
 @app.command("stop")
@@ -238,7 +262,16 @@ def stop(
     config = AitlcConfig.find_and_load()
     if all_:
         ports = chrome_cdp.stop_all(config.root_dir)
-        typer.echo(json.dumps({"stopped_ports": ports, "count": len(ports)}))
+        payload = {"stopped_ports": ports, "count": len(ports)}
+        orphaned = _sessions_orphaned_by_stopping(config.root_dir, ports)
+        if orphaned:
+            payload["warning"] = (
+                f"debug session(s) {orphaned} were using a stopped port and are now "
+                "orphaned -- their next/retry/continue will keep reporting success "
+                "for any step that doesn't touch the page; run `debug stop` on them "
+                "or `debug start` fresh"
+            )
+        typer.echo(json.dumps(payload))
         return
     resolved_port = port
     if resolved_port is None:
@@ -257,7 +290,17 @@ def stop(
         newest = max(running, key=lambda i: int(i.get("port", 0)))
         resolved_port = newest["port"]
     stopped = chrome_cdp.stop(config.root_dir, port=resolved_port)
-    typer.echo(json.dumps({"port": resolved_port, "stopped": stopped}))
+    payload = {"port": resolved_port, "stopped": stopped}
+    if stopped:
+        orphaned = _sessions_orphaned_by_stopping(config.root_dir, [resolved_port])
+        if orphaned:
+            payload["warning"] = (
+                f"debug session(s) {orphaned} were using this port and are now "
+                "orphaned -- their next/retry/continue will keep reporting success "
+                "for any step that doesn't touch the page; run `debug stop` on them "
+                "or `debug start` fresh"
+            )
+    typer.echo(json.dumps(payload))
 
 
 @app.command("time-until")

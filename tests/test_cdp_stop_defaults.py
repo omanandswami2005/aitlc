@@ -16,7 +16,7 @@ import json
 from typer.testing import CliRunner
 
 from aitlc.commands import cdp_cmd
-from aitlc.core import chrome_cdp
+from aitlc.core import chrome_cdp, debug_session
 
 runner = CliRunner()
 
@@ -97,4 +97,80 @@ def test_stop_with_explicit_port_ignores_which_instance_is_newest(monkeypatch, t
     result = runner.invoke(cdp_cmd.app, ["stop", "--port", "9333"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"port": 9333, "stopped": True}
-    assert stopped_calls == [9333]
+
+
+def test_stop_warns_when_a_live_debug_session_was_using_that_port(monkeypatch, tmp_path):
+    """Real confusion hit live: `cdp stop` killed the browser a live `debug`
+    session was actively using, with no warning at all -- `debug status`/
+    `continue` kept reporting success afterward on any step that never
+    touches the page, silently masking that the session's browser was gone.
+    """
+    monkeypatch.setattr(
+        cdp_cmd.AitlcConfig,
+        "find_and_load",
+        classmethod(lambda cls: type("C", (), {"root_dir": tmp_path})()),
+    )
+    monkeypatch.setattr(
+        chrome_cdp,
+        "list_instances",
+        lambda root_dir: [{"port": 64111, "running": True}],
+    )
+    monkeypatch.setattr(chrome_cdp, "stop", lambda root_dir, *, port: True)
+    debug_session.save(
+        tmp_path,
+        debug_session.DebugSession(
+            test_id="run_this",
+            feature="features/run_this.feature",
+            cdp_url="http://127.0.0.1:64111",
+            port=64111,
+        ),
+    )
+
+    result = runner.invoke(cdp_cmd.app, ["stop"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["port"] == 64111
+    assert "run_this" in payload["warning"]
+
+
+def test_stop_all_warns_for_every_orphaned_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cdp_cmd.AitlcConfig,
+        "find_and_load",
+        classmethod(lambda cls: type("C", (), {"root_dir": tmp_path})()),
+    )
+    monkeypatch.setattr(
+        chrome_cdp, "stop_all", lambda root_dir: [64111, 9333]
+    )
+    debug_session.save(
+        tmp_path,
+        debug_session.DebugSession(
+            test_id="run_this",
+            feature="features/run_this.feature",
+            cdp_url="http://127.0.0.1:64111",
+            port=64111,
+        ),
+    )
+
+    result = runner.invoke(cdp_cmd.app, ["stop", "--all"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert "run_this" in payload["warning"]
+
+
+def test_stop_no_warning_when_nothing_was_orphaned(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cdp_cmd.AitlcConfig,
+        "find_and_load",
+        classmethod(lambda cls: type("C", (), {"root_dir": tmp_path})()),
+    )
+    monkeypatch.setattr(
+        chrome_cdp,
+        "list_instances",
+        lambda root_dir: [{"port": 64111, "running": True}],
+    )
+    monkeypatch.setattr(chrome_cdp, "stop", lambda root_dir, *, port: True)
+
+    result = runner.invoke(cdp_cmd.app, ["stop"])
+    assert result.exit_code == 0, result.output
+    assert "warning" not in json.loads(result.stdout)

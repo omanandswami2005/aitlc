@@ -183,16 +183,15 @@ def _default_id(config, test_id: str | None) -> str:
         return test_id
     resolved = config.default_feature_id()
     if not resolved:
-        typer.echo(
-            json.dumps(
-                {
-                    "error": "no test id given and no feature found",
-                    "hint": f"pass a test id/path, or put one *.feature in "
-                    f"'{config.feature_dir}' (or set [project].default_feature)",
-                }
-            ),
-            err=True,
-        )
+        payload = {
+            "error": "no test id given and no feature found",
+            "hint": f"pass a test id/path, or put one *.feature in "
+            f"'{config.feature_dir}' (or set [project].default_feature)",
+        }
+        warning = config.no_config_warning()
+        if warning:
+            payload["warning"] = warning
+        typer.echo(json.dumps(payload), err=True)
         raise typer.Exit(code=2)
     return resolved
 
@@ -633,10 +632,11 @@ def status(test_id: str = typer.Argument(None)) -> None:
             out["elapsed_s"] = round(time.time() - progress["started_at"], 1)
         typer.echo(json.dumps(out, indent=2))
         return
-    typer.echo(
-        json.dumps({"error": f"no debug session for {test_id}; run `debug start` first"}),
-        err=True,
-    )
+    status_error = {"error": f"no debug session for {test_id}; run `debug start` first"}
+    warning = config.no_config_warning()
+    if warning:
+        status_error["warning"] = warning
+    typer.echo(json.dumps(status_error), err=True)
     raise typer.Exit(code=2)
 
 
@@ -1341,6 +1341,9 @@ def list_sessions(
     payload = {"sessions": rows, "count": len(rows)}
     if prune:
         payload["pruned"] = pruned
+    warning = config.no_config_warning()
+    if warning:
+        payload["warning"] = warning
     typer.echo(json.dumps(payload, indent=2))
 
 

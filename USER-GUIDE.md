@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.10.
+Version 0.8.11.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -481,6 +481,24 @@ the same way `debug start`'s own reuse logic does — the highest port among
 running instances — so "stop the browser I'm looking at" and "what `cdp
 stop` picks by default" are the same thing again. Pass `--port <n>`
 explicitly to target a specific one regardless of which is newest.
+
+**`cdp stop`/`cdp stop --all` warns when a live `debug` session was using
+the port(s) just stopped.** Real confusion hit live: killing the browser
+underneath an active `debug` session gave no warning at all, and `debug
+status`/`continue` kept reporting success afterward — a step that never
+touches the page (a pure filesystem assertion, say) genuinely can pass
+with no browser at all, silently masking that the session's browser was
+gone. Now the reply names the orphaned test_id(s) so `debug stop`/`debug
+start` on them is a deliberate next step, not a surprise discovered later.
+
+**`cdp list`/`cdp status`/`debug list`/`debug status` warn when no
+`aitlc.toml` was found near the current directory.** Real confusion hit
+live: running any of these one directory too high (a monorepo root, say)
+silently reported `"count": 0` / "no session" — indistinguishable from
+genuinely nothing tracked, when the real state was tracked under the
+actual project's `aitlc.toml` a level down, invisible from there. A
+`"warning"` on the reply now names the directory it actually looked from
+instead of a config resolving silently to the wrong `root_dir`.
 
 `--user-data-dir` (alias `--profile-dir`, also on `debug start`) points the
 launched browser at a specific profile directory you keep across days

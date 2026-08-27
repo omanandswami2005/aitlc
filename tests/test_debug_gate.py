@@ -79,6 +79,9 @@ class _Cfg:
     def default_feature_id(self):
         return self._feature.stem
 
+    def no_config_warning(self):
+        return None
+
 
 def _wire(monkeypatch, tmp_path):
     (tmp_path / "features" / "steps").mkdir(parents=True)
