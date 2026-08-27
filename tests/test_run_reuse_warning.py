@@ -49,7 +49,7 @@ def test_plain_run_warns_when_reusing_a_previously_driven_instance(project, monk
         lambda *_a, **_k: "http://127.0.0.1:9333",
     )
 
-    result = runner.invoke(app, ["run", "PROJ-1", "--no-lock", "--no-status"])
+    result = runner.invoke(app, ["run", "PROJ-1", "--cdp", "--no-lock", "--no-status"])
 
     assert result.exit_code == 0, result.stdout
     assert "port 9333 has been driven 3 time(s) before" in result.stderr
@@ -70,7 +70,7 @@ def test_plain_run_is_quiet_for_a_never_driven_instance(project, monkeypatch):
         lambda *_a, **_k: "http://127.0.0.1:9333",
     )
 
-    result = runner.invoke(app, ["run", "PROJ-1", "--no-lock", "--no-status"])
+    result = runner.invoke(app, ["run", "PROJ-1", "--cdp", "--no-lock", "--no-status"])
 
     assert result.exit_code == 0, result.stdout
     assert "has been driven" not in result.stderr

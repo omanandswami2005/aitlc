@@ -223,14 +223,17 @@ def run(
         ),
     ),
     cdp: bool = typer.Option(
-        True,
+        False,
         "--cdp/--no-cdp",
         help=(
             "Reuse a live CDP debug browser if one is running (from "
             "`aitlc cdp launch` or a prior `run --debug`), so the suite ATTACHES "
-            "to the already-open Chrome instead of launching a fresh browser "
-            "every run. On by default and a no-op when nothing is running; "
-            "--no-cdp forces a fresh browser. Ignored with --remote/--debug."
+            "to the already-open Chrome instead of launching a fresh browser. "
+            "Off by default -- a plain `run` always gets a fresh browser, since "
+            "reusing one already logged in/mid-scenario from a prior attempt is "
+            "exactly what made a feature with no @skip_login fail at its own "
+            "login step (G75). Pass --cdp to opt back into reuse. Ignored with "
+            "--remote/--debug, which own their own browser lifecycle."
         ),
     ),
     cdp_url: str | None = typer.Option(

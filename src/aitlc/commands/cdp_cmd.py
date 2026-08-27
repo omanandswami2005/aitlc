@@ -213,19 +213,51 @@ def list_() -> None:
 
 @app.command("stop")
 def stop(
-    port: int = typer.Option(chrome_cdp.DEFAULT_PORT, "--port", help="Debugging port."),
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        help="Debugging port. Omit to stop the newest RUNNING tracked instance -- "
+        "the same one `debug start`/`cdp status` auto-reuse when no port is given -- "
+        "instead of a fixed port that may not be the one you're actually looking at.",
+    ),
     all_: bool = typer.Option(
         False, "--all", help="Stop every tracked instance, not just --port."
     ),
 ) -> None:
-    """Stop the tracked debug Chrome (or all of them with --all)."""
+    """Stop the tracked debug Chrome (or all of them with --all).
+
+    Real confusion hit live: bare `cdp stop` used to always target a FIXED
+    port (9333) regardless of what was actually running -- with more than
+    one tracked instance (a stale one plus the real, currently-visible
+    browser on a different port), it silently reported "stopped": true for
+    the wrong one, leaving the actual window open. Defaulting to the
+    newest RUNNING instance instead matches what a bare `debug start` would
+    have reused, so "stop the browser I'm using" and "the instance stop
+    picks by default" are the same thing again.
+    """
     config = AitlcConfig.find_and_load()
     if all_:
         ports = chrome_cdp.stop_all(config.root_dir)
         typer.echo(json.dumps({"stopped_ports": ports, "count": len(ports)}))
         return
-    stopped = chrome_cdp.stop(config.root_dir, port=port)
-    typer.echo(json.dumps({"port": port, "stopped": stopped}))
+    resolved_port = port
+    if resolved_port is None:
+        running = [i for i in chrome_cdp.list_instances(config.root_dir) if i.get("running")]
+        if not running:
+            typer.echo(
+                json.dumps(
+                    {
+                        "error": "no running tracked instance to stop",
+                        "hint": "pass --port <n>, or --all to clear stale records too",
+                    }
+                ),
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        newest = max(running, key=lambda i: int(i.get("port", 0)))
+        resolved_port = newest["port"]
+    stopped = chrome_cdp.stop(config.root_dir, port=resolved_port)
+    typer.echo(json.dumps({"port": resolved_port, "stopped": stopped}))
 
 
 @app.command("time-until")

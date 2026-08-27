@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.7.
+Version 0.8.8.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -447,8 +447,21 @@ aitlc cdp inspect --port 9333 --storage
 aitlc cdp inspect --check '#save,[data-testid="row"]'
 aitlc cdp time-until '#banner' --condition hidden
 aitlc cdp list                         # every tracked instance, alive or dead
+aitlc cdp stop                          # stops the newest RUNNING instance -- see below
 aitlc cdp stop --all
 ```
+
+**`cdp stop` with no `--port` targets the newest RUNNING tracked instance**,
+not a fixed port. Real confusion hit live: it used to always default to a
+fixed port (9333) — with one real, currently-open browser tracked on a
+*different* port and nothing tracked on 9333 at all, it reported `{"port":
+9333, "stopped": true}` (a false positive: nothing was ever running at
+9333, so `stop`'s own "already gone" fallback trivially reads as success)
+while the actual visible window stayed open, untouched. Now it resolves
+the same way `debug start`'s own reuse logic does — the highest port among
+running instances — so "stop the browser I'm looking at" and "what `cdp
+stop` picks by default" are the same thing again. Pass `--port <n>`
+explicitly to target a specific one regardless of which is newest.
 
 `--user-data-dir` (alias `--profile-dir`, also on `debug start`) points the
 launched browser at a specific profile directory you keep across days
@@ -583,16 +596,23 @@ command attach to it:
 
 ```bash
 aitlc cdp launch                     # detached CDP browser, survives the shell
-aitlc run PROJ-1234                  # attaches automatically if one is live
+aitlc run PROJ-1234 --cdp            # attach to it instead of a fresh browser
 aitlc paver run parallel --local     # so does the paver pass-through
 ```
+
+**`aitlc run` gets a fresh browser by default — pass `--cdp` to opt into
+reuse.** Reusing one already logged in/mid-scenario from a prior attempt is
+exactly what made a feature with no `@skip_login` fail at its own login
+step (G75, below) — attaching is deliberately not automatic for a plain
+run. `aitlc paver run`/`aitlc behave` still auto-attach when a tracked
+instance is live (`--aitlc-no-cdp` forces fresh there); `debug start`/`run
+--debug` always reuse-or-launch the persistent debug Chrome, since that
+session's whole point IS the same long-lived browser across steps.
 
 aitlc sets your suite's CDP env var — default `PLAYWRIGHT_CDP_URL`, named in
 `[project].playwright_cdp_env` — so the suite connects to the open browser
 instead of launching its own. It never overrides a value already in the
-environment. Force a fresh browser with `--no-cdp` (run) or `--aitlc-no-cdp`
-(paver/behave); point at a specific endpoint with `--cdp-url` /
-`--aitlc-cdp-url`.
+environment. Point at a specific endpoint with `--cdp-url` / `--aitlc-cdp-url`.
 
 **Reusing a browser means reusing whatever state it was left in.** A plain
 `aitlc run` (no `--debug`) checks whether the instance it is about to attach

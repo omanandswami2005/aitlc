@@ -225,8 +225,8 @@ Chrome and every behave-based command attaches to it instead of starting fresh:
 
 ```bash
 aitlc cdp launch                    # detached CDP browser, survives the shell
-aitlc run PROJ-1234                 # attaches automatically if one is live (--no-cdp to force fresh)
-aitlc paver run parallel --local    # reuses the same browser
+aitlc run PROJ-1234 --cdp           # opt in to attach to it (fresh browser by default)
+aitlc paver run parallel --local    # reuses the same browser automatically
 ```
 
 aitlc sets the suite's CDP env var (default `PLAYWRIGHT_CDP_URL`, configurable
