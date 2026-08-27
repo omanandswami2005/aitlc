@@ -532,6 +532,42 @@ def test_debug_start_warns_when_reusing_a_previously_driven_instance(monkeypatch
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_debug_restart_reruns_from_zero_on_the_same_browser(monkeypatch, tmp_path):
+    """`debug restart` = stop (browser-preserving) + start --at 0 on the SAME
+    cdp_url, in one command -- the scenario re-runs from the top without
+    paying for a whole new browser. --extra-tag must reach the fresh run's
+    hooks too, same as a plain `debug start --extra-tag`.
+    """
+    _wire(monkeypatch, tmp_path)
+    seen_tags = tmp_path / "seen_tags.txt"
+    (tmp_path / "features" / "environment.py").write_text(
+        f'''
+def before_feature(context, feature):
+    with open(r"{seen_tags}", "w") as f:
+        f.write(",".join(feature.tags))
+'''
+    )
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "1", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    original_cdp_url = json.loads(result.stdout)["cdp_url"]
+
+    result = runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        debug_cmd.app,
+        ["restart", "PROJ-1", "--timeout", "60", "--extra-tag", "skip_login"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["parked_at"] == 0
+    assert payload["cdp_url"] == original_cdp_url
+    assert "skip_login" in seen_tags.read_text().split(",")
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_debug_start_no_cdp_forces_an_isolated_browser(monkeypatch, tmp_path):
     """--no-cdp must skip a live tracked instance even when one exists."""
     _wire(monkeypatch, tmp_path)
@@ -814,6 +850,16 @@ def _w(context):
     payload = json.loads(result.stdout)
     assert payload["status"] == "failed"
     assert "about to fail" in payload["captured_output"]
+    # An AssertionError (the most common step failure) gets NO traceback at
+    # all in behave's own error_message unless behave itself runs verbose --
+    # this must come from the raw exception/traceback behave always stores
+    # on the step regardless (Step.store_exception_context), not from
+    # error_message's own verbose-gated formatting.
+    assert "deliberate failure" in payload["traceback"]
+    assert "steps.py" in payload["traceback"]
+    assert payload["failed_at"]["file"].endswith("steps.py")
+    assert payload["failed_at"]["line"] == 13
+    assert payload["failed_at"]["function"] == "_w"
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
@@ -872,6 +918,33 @@ def _hook2(context):
     assert payload["parked_at"] == 0
     assert payload["total_steps"] == 3
     assert payload["current_step"] == "Given the setup step runs"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_start_extra_tag_makes_the_project_s_own_hook_logic_see_it(monkeypatch, tmp_path):
+    """--extra-tag must add the tag onto feature.tags before before_feature
+    runs, so a project's own tag-driven hook logic (e.g. `if "skip_login" in
+    feature.tags`) treats it exactly as if it were physically in the file --
+    without ever editing the file. Generic: aitlc itself knows nothing about
+    what the tag does, only where tags live on behave's own objects.
+    """
+    _wire(monkeypatch, tmp_path)
+    seen_tags = tmp_path / "seen_tags.txt"
+    (tmp_path / "features" / "environment.py").write_text(
+        f'''
+def before_feature(context, feature):
+    with open(r"{seen_tags}", "w") as f:
+        f.write(",".join(feature.tags))
+'''
+    )
+
+    result = runner.invoke(
+        debug_cmd.app,
+        ["start", "PROJ-1", "--at", "0", "--timeout", "60", "--extra-tag", "skip_login"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "skip_login" in seen_tags.read_text().split(",")
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
@@ -982,6 +1055,63 @@ def test_run_line_reports_an_error_for_an_out_of_range_line(monkeypatch, tmp_pat
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
     assert "error" in payload
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_jump_moves_the_cursor_without_running_anything(monkeypatch, tmp_path):
+    """`jump` must move the cursor to the target line's step and run
+    NOTHING -- the opposite contract of `run-line` (runs a step, cursor
+    untouched). Both directions: forward past unrun steps, and back to an
+    earlier one, since a human may have driven the browser either way.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    lines = feature_path.read_text().splitlines()
+    then_line = next(i for i, l in enumerate(lines, start=1) if "the second real step runs" in l)
+    given_line = next(i for i, l in enumerate(lines, start=1) if "the setup step runs" in l)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    # Forward: jump from step 0 straight to step 2, skipping step 1 entirely.
+    result = runner.invoke(debug_cmd.app, ["jump", str(then_line), "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["jumped_to"] == 2
+    assert payload["current_step"] == "Then the second real step runs"
+
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["parked_at"] == 2
+
+    # Backward: jump back to step 0.
+    result = runner.invoke(debug_cmd.app, ["jump", str(given_line), "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["jumped_to"] == 0
+
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["parked_at"] == 0
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_continue_from_jumps_then_runs_only_from_there(monkeypatch, tmp_path):
+    """`continue --from <line>` must jump the cursor first, then run only
+    from that point on -- the two earlier steps are never executed.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    lines = feature_path.read_text().splitlines()
+    then_line = next(i for i, l in enumerate(lines, start=1) if "the second real step runs" in l)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["continue", "PROJ-1", "--from", str(then_line)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["steps_run"] == 1
+    assert payload["results"][0]["step"] == "Then the second real step runs"
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 

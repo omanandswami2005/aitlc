@@ -13,6 +13,7 @@ import typer
 from aitlc.adapters.lambdatest import queue as remote_queue
 from aitlc.config import AitlcConfig
 from aitlc.core import behave_runner, journal, chrome_cdp, debug_session, gate_launch
+from aitlc.runtime import attach
 from aitlc.core import history as history_core
 from aitlc.core import locks, toon
 from aitlc.core.dotenv import load_dotenv
@@ -250,6 +251,13 @@ def run(
             "running either way; this only bounds how long `run` itself waits)."
         ),
     ),
+    extra_tag: list[str] = typer.Option(
+        [],
+        "--extra-tag",
+        help="Add this tag (without @) to the feature/scenario before its hooks "
+        "run, without editing the file -- e.g. --extra-tag skip_login when "
+        "reusing an already-authenticated CDP browser. Repeatable.",
+    ),
 ) -> None:
     """Run one feature file and report structured results."""
     config = AitlcConfig.find_and_load()
@@ -472,6 +480,9 @@ def run(
         report_dir = Path(tempfile.mkdtemp(prefix="aitlc_run_debug_report_"))
         report_path = report_dir / f"{feature_path.stem}.report.json"
 
+        gate_env = {"AITLC_GATE_ON_FAILURE": "1"}
+        if extra_tag:
+            gate_env["AITLC_EXTRA_TAGS"] = ",".join(extra_tag)
         proc = gate_launch.launch(
             config,
             feature=feature_path,
@@ -479,7 +490,7 @@ def run(
             cdp_url=instance.cdp_url,
             socket_path_=gate_socket,
             progress_path=progress_path,
-            gate_env={"AITLC_GATE_ON_FAILURE": "1"},
+            gate_env=gate_env,
             log_name="run_debug.log",
             report_path=report_path,
             tags=tags,
@@ -543,6 +554,24 @@ def run(
     def _run_once() -> behave_runner.RunResult:
         if debug:
             return _run_debug_gated()
+        # Plain `run` attaches no custom runner at all by default (unlike
+        # `debug start`/`run --debug`, which always do) -- --extra-tag needs
+        # AitlcRunner in the loop for its run_hook tag-injection to fire, so
+        # only pay for the attach when this option is actually used.
+        attach_extra_args: list[str] = []
+        attach_env: dict[str, str] = {}
+        if extra_tag:
+            behave_cmd = behave_runner.resolve_poetry() + ["run", "behave"]
+            work_dir = workspace.output_path(config.root_dir, ".aitlc", "run", "_attach_site")
+            attach_plan = attach.plan(
+                behave_cmd,
+                config.root_dir,
+                work_dir,
+                aitlc_src=gate_launch.aitlc_src(),
+                gate_env={"AITLC_EXTRA_TAGS": ",".join(extra_tag)},
+            )
+            attach_extra_args = attach_plan.extra_args
+            attach_env = attach_plan.env
         return behave_runner.run(
             feature_path,
             cwd=config.root_dir,
@@ -550,9 +579,10 @@ def run(
             name_pattern=name,
             dry_run=dry_run,
             no_capture=no_capture,
-            env={**remote_env, **local_mobile_env} or None,
+            env={**remote_env, **local_mobile_env, **attach_env} or None,
             status_file=status_path,
             line=line,
+            extra_args=attach_extra_args or None,
         )
 
     def _run_with_retries() -> tuple[behave_runner.RunResult, dict]:

@@ -85,6 +85,16 @@ def _print_pretty_step(reply: dict) -> None:
     error = reply.get("error")
     if error and status == "failed":
         typer.echo(f"{color_on}{error}{color_off}", err=True)
+    failed_at = reply.get("failed_at")
+    if failed_at:
+        typer.echo(
+            f"{color_on}at {failed_at.get('file')}:{failed_at.get('line')} "
+            f"in {failed_at.get('function')}{color_off}",
+            err=True,
+        )
+    tb = reply.get("traceback")
+    if tb:
+        typer.echo(tb.rstrip("\n"), err=True)
     page_state = reply.get("page_state")
     if page_state:
         url = page_state.get("url")
@@ -237,6 +247,14 @@ def start(
     timeout: float = typer.Option(
         300.0, "--timeout", help="Seconds to wait for the run to park (foreground)."
     ),
+    extra_tag: list[str] = typer.Option(
+        [],
+        "--extra-tag",
+        help="Add this tag (without @) to the feature/scenario before its hooks "
+        "run, without editing the file -- e.g. --extra-tag skip_login to make "
+        "a project's own tag-driven hook logic behave as if it were tagged. "
+        "Repeatable.",
+    ),
 ) -> None:
     """Attach to a live `cdp launch` browser (or launch one), drive REAL behave to a step, then park."""
     config = AitlcConfig.find_and_load()
@@ -307,11 +325,14 @@ def start(
         {"state": "running", "test_id": test_id, "target": at, "done": 0,
          "started_at": time.time()},
     )
+    gate_env = {"AITLC_GATE": "1", "AITLC_GATE_AT": str(at), "AITLC_GATE_EXAMPLE": str(example)}
+    if extra_tag:
+        gate_env["AITLC_EXTRA_TAGS"] = ",".join(extra_tag)
     proc = gate_launch.launch(
         config, feature=feature, line=line,
         cdp_url=resolved_cdp_url, socket_path_=socket_path,
         progress_path=progress_path,
-        gate_env={"AITLC_GATE": "1", "AITLC_GATE_AT": str(at), "AITLC_GATE_EXAMPLE": str(example)},
+        gate_env=gate_env,
         log_name="gate.log",
     )
     pid = proc.pid
@@ -396,6 +417,83 @@ def start(
     if reuse_warning:
         payload["warning"] = reuse_warning
     typer.echo(json.dumps(payload, indent=2))
+
+
+@app.command("restart")
+def restart(
+    test_id: str = typer.Argument(None),
+    example: int = typer.Option(
+        0, "--example", help="Examples row to run, 0-based. Scenario Outlines only."
+    ),
+    extra_tag: list[str] = typer.Option(
+        [],
+        "--extra-tag",
+        help="Add this tag (without @) to the feature/scenario before its hooks "
+        "run, without editing the file -- e.g. --extra-tag skip_login when the "
+        "same browser is already authenticated from the run being restarted. "
+        "Repeatable.",
+    ),
+    cleanup: bool = typer.Option(
+        False,
+        "--cleanup",
+        help="Fire the project's real after_scenario/after_feature hooks on "
+        "the OLD session before restarting (same meaning as `debug stop "
+        "--cleanup`). Off by default.",
+    ),
+    env_file: str = typer.Option(".env", "--env-file"),
+    window_size: str = typer.Option(
+        chrome_cdp.DESKTOP_WINDOW_SIZE,
+        "--window-size",
+        help="Browser window as WIDTH,HEIGHT. Desktop by default; a phone size "
+        "for a mobile suite.",
+    ),
+    summary: bool = typer.Option(
+        False, "--summary", help="Emit a compact {parked_at, total_steps, ...} summary."
+    ),
+    background: bool = typer.Option(
+        False,
+        "--background",
+        help="Return immediately; the setup runs detached. Poll `debug status`.",
+    ),
+    timeout: float = typer.Option(
+        300.0, "--timeout", help="Seconds to wait for the run to park (foreground)."
+    ),
+) -> None:
+    """Re-run this scenario from step 0, reusing the SAME browser this session already has.
+
+    The `debug stop` + `debug start --cdp-url <same>` two-step, in one
+    command -- for the case that motivated it: the scenario needs re-running
+    from the top, but paying for a whole new browser (and its own login)
+    defeats the point of staying in one session. `--extra-tag skip_login`
+    (or whatever a project's own tag-driven hook logic checks) is the
+    generic way to tell the restarted run the browser is already in a state
+    its own hooks shouldn't fight -- without editing the feature file.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    old_cdp_url = session.cdp_url
+    if session.socket:
+        try:
+            gate_client.request(session.socket, "stop", cleanup=cleanup)
+        except (gate_client.GateUnavailable, OSError):
+            pass
+    debug_session.clear(config.root_dir, test_id)
+    debug_session.clear_progress(config.root_dir, test_id)
+    start(
+        test_id,
+        at=0,
+        example=example,
+        env_file=env_file,
+        window_size=window_size,
+        cdp_url=old_cdp_url,
+        no_cdp=False,
+        summary=summary,
+        background=background,
+        timeout=timeout,
+        extra_tag=extra_tag,
+    )
 
 
 @app.command("status")
@@ -592,6 +690,14 @@ def continue_steps(
     max_steps: int = typer.Option(
         500, "--max-steps", help="Safety cap on how many steps to advance."
     ),
+    from_line: int = typer.Option(
+        None,
+        "--from",
+        help="Move the cursor to this file line first (see `debug jump`), "
+        "then continue as normal -- for when you navigated the browser "
+        "manually and want the session to pick up from where things "
+        "actually stand.",
+    ),
     env_file: str = typer.Option(".env", "--env-file"),
 ) -> None:
     """Advance through every remaining step, stopping at the first failure or the end.
@@ -606,6 +712,15 @@ def continue_steps(
     load_dotenv(config.root_dir / env_file)
     test_id = _default_id(config, test_id)
     session = _require(config, test_id)
+
+    if from_line is not None:
+        _request_or_die(session, "reload", step_dir=config.step_dir)
+        jump_reply = _request_or_die(session, "jump", line=from_line)
+        if jump_reply.get("error"):
+            typer.echo(json.dumps(jump_reply), err=True)
+            raise typer.Exit(code=2)
+        session.index = jump_reply["jumped_to"]
+        debug_session.save(config.root_dir, session)
 
     results = []
     for _ in range(max_steps):
@@ -723,6 +838,36 @@ def run_line(
     _journal_step(config, test_id, "debug run-line", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") == "passed" and not reply.get("error") else 1)
+
+
+@app.command("jump")
+def jump(
+    line: int = typer.Argument(
+        ..., help="1-based line number in the feature file to move the cursor to."
+    ),
+    test_id: str = typer.Argument(None),
+    env_file: str = typer.Option(".env", "--env-file"),
+) -> None:
+    """Move the debug cursor to the step at (or nearest before) this file line -- no execution.
+
+    For when the browser is no longer where the session thinks it is (you
+    navigated manually, clicked ahead, went back) and you want `next`/
+    `retry`/`continue` to pick up from where things actually stand, without
+    re-running or skip-verifying anything in between. `run-line` is the
+    opposite case: run one step without moving the cursor; this moves the
+    cursor without running anything.
+    """
+    config = AitlcConfig.find_and_load()
+    load_dotenv(config.root_dir / env_file)
+    test_id = _default_id(config, test_id)
+    session = _require(config, test_id)
+    _request_or_die(session, "reload", step_dir=config.step_dir)
+    reply = _request_or_die(session, "jump", line=line)
+    if reply.get("jumped_to") is not None:
+        session.index = reply["jumped_to"]
+        debug_session.save(config.root_dir, session)
+    typer.echo(json.dumps(reply, indent=2))
+    raise typer.Exit(code=0 if not reply.get("error") else 1)
 
 
 @app.command("eval")

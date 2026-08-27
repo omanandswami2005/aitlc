@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.0.
+Version 0.8.1.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -213,6 +213,9 @@ aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug eval PROJ-1234 "document.title"          # raw JS on the live page
 aitlc debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
 aitlc debug run-line PROJ-1234 42       # same, by file line number instead of retyping text
+aitlc debug jump PROJ-1234 42           # move the cursor there instead -- no execution at all
+aitlc debug continue PROJ-1234 --from 42   # jump, then continue normally from there
+aitlc debug restart PROJ-1234 --extra-tag skip_login  # same browser, re-run from step 0
 aitlc debug status PROJ-1234           # where am I?
 aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url needed
 aitlc debug inspect PROJ-1234 --a11y    # same, accessibility tree instead of pixels
@@ -315,6 +318,40 @@ next to the step's own work.
 default. A CDP-attached browser reuses an existing context — the opposite of
 isolation — so it is never proof. Two consecutive passes are the default
 because one pass does not disprove a race.
+
+### Every failed step already carries a real Python traceback
+
+Before reaching for `breakpoint()`, check what `next`/`retry`/`continue`
+already gave you: a failed step's reply carries `failed_at` (`file`,
+`line`, `function`) and the full `traceback` text — read straight off the
+raw exception object behave stores on every failed step
+(`Step.exception`/`Step.exc_traceback`, set unconditionally regardless of
+verbosity).
+
+This is a real gap in behave itself, not something aitlc worked around
+cosmetically: for the single most common step failure — a plain `assert`
+in step code, raising `AssertionError` — behave's own `error_message` is
+just `"ASSERT FAILED: {message}"`, no file, no line, no traceback at all,
+*unless behave itself runs with `--verbose`* (`Step._process_error`'s
+`use_traceback` gate only fires for verbose runs). Any OTHER exception
+type gets a full `traceback.format_exc()` baked into `error_message`
+regardless of verbosity — so the gap is not just "no traceback ever," it's
+specifically, silently worse for the most common case. `failed_at`/
+`traceback` sidestep `error_message`'s formatting entirely and read the
+raw exception/traceback the same way for every failure type.
+
+```json
+"failed_at": {"file": "pages/search/search_page.py", "line": 142, "function": "find_by_text"},
+"traceback": "Traceback (most recent call last):\n  File \"...\", line 142, in find_by_text\n    ...\nAssertionError: Text 'X' not found in DOM\n"
+```
+
+**This does not replace `breakpoint()`, it narrows when you need it.**
+`failed_at`/`traceback` answer "where did it fail, and why" for free, on
+every failure, with no setup. `breakpoint()`/`debug py` answer a different
+question — "what was actually IN that variable at the moment it failed" —
+which a traceback's frame list cannot show you. Reach for a traceback
+first; drop a `breakpoint()` only when the traceback alone doesn't explain
+it and you need to inspect real values.
 
 ### A real `breakpoint()`, not just JS `eval`
 
@@ -516,6 +553,49 @@ state, or `aitlc cdp launch --new` for a genuinely fresh instance.
 test_id last drove the browser; the same test_id reusing its own browser
 across repeated `debug start` attempts previously got no warning from
 either path.
+
+### `--extra-tag`: the generic fix for a browser that's already in a state your hooks don't expect
+
+`aitlc run PROJ-1234 --extra-tag skip_login` (also on `debug start` and
+`debug restart`) adds the given tag (no `@`) onto `feature.tags`/
+`scenario.tags` right before that hook fires — so a project's own
+tag-driven hook logic (`if "skip_login" in feature.tags: ...`) sees it
+exactly as if it were physically written into the feature file. aitlc
+itself knows nothing about what any given tag does; it only knows where
+tags live on behave's own objects. This is the generic answer to the
+reuse-collision warning above: skip only the piece a project's hooks
+would otherwise get wrong against an already-authenticated (or otherwise
+pre-set-up) browser, without touching the file and without skipping
+anything else those hooks do.
+
+Plain `run` attaches no custom runner at all by default (unlike `debug
+start`/`run --debug`, which always do), so `--extra-tag` on `run`
+specifically opts into that attach machinery only when it's actually
+used — a plain `run` with no `--extra-tag` behaves exactly as before.
+
+### Restarting and moving the cursor without restarting the session
+
+```bash
+aitlc debug restart PROJ-1234 --extra-tag skip_login
+aitlc debug jump PROJ-1234 42
+aitlc debug continue PROJ-1234 --from 42
+```
+
+`debug restart` is `debug stop` (browser-preserving) + `debug start --at 0
+--cdp-url <the same one>`, in one command: the scenario re-runs from step
+0 without paying for a whole new browser (or its own login, if
+`--extra-tag skip_login` says so).
+
+`debug jump <line>` moves the cursor to the step at (or nearest before)
+that file line — the exact inverse of `run-line`, which runs a step but
+never moves the cursor; `jump` moves the cursor and runs nothing. For when
+a human drove the live browser somewhere the session's own cursor doesn't
+reflect (navigated ahead, went back) and wants `next`/`retry`/`continue`
+to resume from where things actually stand rather than where the last
+`next` left off. Works in either direction — forward past steps already
+handled manually, or back to an earlier one. `debug continue --from
+<line>` is the same jump, immediately followed by the normal continue
+loop from that point.
 
 ### Run the project's own tools, with its environment set up
 

@@ -57,6 +57,7 @@ import os
 import socket
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any
 
@@ -121,6 +122,38 @@ def _stamp(epoch: float) -> str:
 
 
 _PAGE_STATE_TREE_CHARS = 3000
+
+
+def _extract_python_failure(exc: BaseException | None, tb: Any) -> dict | None:
+    """Full traceback + innermost frame for a failed step, from the RAW
+    exception/traceback -- not behave's own `error_message` text.
+
+    Real gap found live: behave's own `error_message` for the single most
+    common step failure (a plain `assert` in step code, i.e. AssertionError)
+    is JUST `"ASSERT FAILED: {message}"` by default -- no file, no line, no
+    traceback at all -- unless behave itself is run with `--verbose`
+    (`Step._process_error`'s `use_traceback` gate). A non-assertion
+    exception DOES get a full `traceback.format_exc()` baked into
+    `error_message` regardless of verbosity, so this gap is specific to
+    (and silently inconsistent across) the most common case. behave
+    ALWAYS stores the raw exception and traceback on the step regardless
+    (`Step.store_exception_context`, called unconditionally on any
+    failure) -- this reads those directly, sidestepping error_message's
+    verbose-gated formatting entirely, for every failure the same way.
+    """
+    if exc is None or tb is None:
+        return None
+    text = "".join(traceback.format_exception(type(exc), exc, tb))
+    frames = traceback.extract_tb(tb)
+    result: dict[str, Any] = {"traceback": text}
+    if frames:
+        last = frames[-1]
+        result["failed_at"] = {
+            "file": last.filename,
+            "line": last.lineno,
+            "function": last.name,
+        }
+    return result
 
 
 def _capture_page_state(context: Any) -> dict | None:
@@ -200,6 +233,9 @@ class AitlcRunner(_BaseRunner):
         if _ACTIVE_RUNNER is None:
             _ACTIVE_RUNNER = self
 
+        if name in ("before_feature", "before_scenario"):
+            self._inject_extra_tags(name)
+
         result = super().run_hook(name, *args)
 
         # A side-run (retry/next) re-enters run_hook via Step.run; the project
@@ -223,6 +259,37 @@ class AitlcRunner(_BaseRunner):
 
         self._observe_run_hook(name, context, *payload)
         return result
+
+    def _inject_extra_tags(self, name: str) -> None:
+        """Add AITLC_EXTRA_TAGS onto the feature/scenario before its hook runs.
+
+        The generic way to skip login (or anything else a project's own
+        hooks already branch on via a tag, e.g. `@skip_login`) for one
+        invocation without editing the feature file: this makes
+        `context.feature.tags`/`context.scenario.tags` read exactly as if
+        that tag were physically in the file, since a project's hook code
+        (before_feature/before_scenario) reads those lists directly -- no
+        project-specific knowledge of what the tag does lives here, only
+        where tags live on behave's own objects. Applies to every mode
+        (plain `run`, `debug start`/`restart`, `run --debug`) because all
+        three share this one `run_hook` override.
+        """
+        raw = os.environ.get("AITLC_EXTRA_TAGS", "")
+        if not raw:
+            return
+        extra = [t.strip() for t in raw.split(",") if t.strip()]
+        if not extra:
+            return
+        context = getattr(self, "context", None)
+        target = getattr(context, "feature" if name == "before_feature" else "scenario", None)
+        if target is None:
+            return
+        tags = getattr(target, "tags", None)
+        if tags is None:
+            return
+        for tag in extra:
+            if tag not in tags:
+                tags.append(tag)
 
     # ------------------------------------------------------------ observe mode
     def _observe_run_hook(self, name: str, context: Any, *args: Any) -> None:
@@ -527,13 +594,18 @@ class AitlcRunner(_BaseRunner):
             passed = step.run(self, quiet=True, capture=True)
             status = "passed" if passed else "failed"
             error = None
+            python_failure = None
             if not passed:
                 error = str(getattr(step, "error_message", "") or "")[:1000] or (
                     f"step did not pass (status={_status_name(step)})"
                 )
+                python_failure = _extract_python_failure(
+                    getattr(step, "exception", None), getattr(step, "exc_traceback", None)
+                )
         except Exception as exc:  # noqa: BLE001 - report, never crash the server
             status = "failed"
             error = f"{type(exc).__name__}: {exc}"
+            python_failure = _extract_python_failure(exc, exc.__traceback__)
         finally:
             self._aitlc_suspended = False
         ended = time.time()
@@ -546,6 +618,8 @@ class AitlcRunner(_BaseRunner):
                 "keyword": getattr(step, "keyword", None),
             }
         )
+        if python_failure is not None:
+            record.update(python_failure)
         if status == "failed" and context is not None:
             # Answers "was there an unexpected page?" (an onboarding wizard,
             # a popup, a permission prompt) right here instead of needing a
@@ -1185,6 +1259,45 @@ class AitlcRunner(_BaseRunner):
                             )
                         )
                     self._send(conn, reply)
+                elif cmd == "jump":
+                    # Moves the cursor to the step at (or nearest before) a
+                    # file line -- no execution, unlike run_line. For the
+                    # case a human navigated the live browser out of step
+                    # with the session's own idea of where it is (went
+                    # back, clicked ahead) and wants the cursor to match
+                    # reality before driving next/retry/continue normally
+                    # again. Same nearest-at-or-before matching run_line
+                    # uses, but against the LIVE steps/cursor this loop
+                    # already tracks, not a throwaway reparse -- so next/
+                    # retry afterwards run the exact step landed on here.
+                    target_line = request.get("line", 0)
+                    match = None
+                    for step in steps:
+                        step_line = getattr(step, "line", None)
+                        if step_line is None:
+                            continue
+                        if step_line == target_line:
+                            match = step
+                            break
+                        if step_line <= target_line and (
+                            match is None or step_line > getattr(match, "line", 0)
+                        ):
+                            match = step
+                    if match is None:
+                        self._send(
+                            conn, {"error": f"no step found at or before line {target_line}"}
+                        )
+                    else:
+                        cursor = steps.index(match)
+                        self._send(
+                            conn,
+                            {
+                                "jumped_to": cursor,
+                                "total": len(steps),
+                                "current_step": self._step_text(match),
+                                "finished": cursor >= len(steps),
+                            },
+                        )
                 elif cmd == "stop":
                     reply = {"stopped": True}
                     if request.get("cleanup"):

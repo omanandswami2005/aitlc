@@ -48,6 +48,18 @@ Run & investigate one test:
   status` reports `"paused_at": "breakpoint"` when one is hit; `debug py
   "<python-expr>"` evaluates it in the paused frame's own locals/globals
   (like `pdb`'s `p`); `debug resume` continues exactly where it stopped.
+- **Every failed step already carries a real Python traceback, no
+  breakpoint needed for most failures** → `next`/`retry`/`continue`'s
+  reply includes `failed_at` (`file`/`line`/`function`) and the full
+  `traceback` text, read straight off the raw exception behave always
+  stores on the step. This is NOT the same thing `error_message` already
+  gives you: for the single most common failure (a plain `assert` in step
+  code — `AssertionError`) behave's own `error_message` is just `"ASSERT
+  FAILED: {message}"` with no file/line/traceback at all unless behave
+  itself runs `--verbose`. Reach for `breakpoint()`/`debug py` only when
+  you need to see an actual *variable's value* at the failure point —
+  `failed_at`/`traceback` answer "where and why", not "what was in that
+  variable".
 - **Certify a fix actually holds** → `debug certify --times N` — a fresh
   instance, never the debug browser (which only *looks* proven).
 - **Run a slice of steps outside a real session** → `steps run <feature>
@@ -152,6 +164,9 @@ aitlc -w PROJ-1234 debug retry PROJ-1234           # after an edit, re-run that 
 aitlc -w PROJ-1234 debug eval PROJ-1234 "document.title"      # raw JS on the live page
 aitlc -w PROJ-1234 debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
 aitlc -w PROJ-1234 debug run-line PROJ-1234 42     # same, by file line number instead
+aitlc -w PROJ-1234 debug jump PROJ-1234 42         # move the cursor there instead -- no execution
+aitlc -w PROJ-1234 debug continue PROJ-1234 --from 42  # jump, then continue from there
+aitlc -w PROJ-1234 debug restart PROJ-1234 --extra-tag skip_login  # same browser, re-run from step 0
 aitlc -w PROJ-1234 debug status PROJ-1234          # where the paused run is
 aitlc -w PROJ-1234 debug screenshot PROJ-1234       # this session's page, no --cdp-url needed
 aitlc -w PROJ-1234 debug inspect PROJ-1234 --a11y   # same, for the accessibility tree
@@ -244,6 +259,26 @@ instance.
 `is_dirty_for` (the older check `run --debug` uses) only fires for a
 *different* driver, so the same test_id reusing its own browser across
 repeated `debug start` attempts previously got no warning at all.
+
+**`--extra-tag` is the generic fix**, available on `run`, `debug start` and
+`debug restart`: it adds a tag (without `@`) onto `feature.tags`/
+`scenario.tags` before that hook fires, so a project's own tag-driven hook
+logic (e.g. `if "skip_login" in feature.tags`) sees it exactly as if it
+were physically in the file — without editing the file, and without aitlc
+itself knowing anything about what the tag does. `aitlc run PROJ-1234
+--extra-tag skip_login` is the generic answer to the reuse warning above:
+skip only the login a project's hooks would otherwise attempt against an
+already-authenticated browser, while everything else those hooks set up
+still runs normally.
+
+**`debug restart`** is `debug stop` (browser-preserving) + `debug start
+--at 0 --cdp-url <same>` in one command: re-run the scenario from the top
+without paying for a whole new browser. **`debug jump <line>`** moves the
+cursor to the step at that file line with no execution at all — the
+inverse of `run-line` (which runs a step but never moves the cursor) — for
+when the browser no longer matches where the session thinks it is (you
+navigated manually, clicked ahead, went back). `debug continue --from
+<line>` does the jump then keeps going normally from there.
 
 ## Pause-on-failure is a live session now, not a dead end
 

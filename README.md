@@ -104,6 +104,16 @@ aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url to l
 aitlc debug inspect PROJ-1234 --a11y    # same, for the accessibility tree
 ```
 
+**Every failed step already carries a real Python traceback, no setup
+required.** `next`/`retry`/`continue`'s reply includes `failed_at`
+(file/line/function) and the full `traceback` — read from the raw
+exception behave stores on every failed step, not from `error_message`
+(which, for a plain `assert` failure — the most common case — carries no
+file/line at all unless behave itself runs `--verbose`). Try this before
+reaching for a breakpoint: it answers "where and why" for free; a
+breakpoint is for when you need an actual variable's value, which a
+traceback can't show.
+
 **Drop a real `breakpoint()`, not just a JS eval.** A paused session's `eval`
 runs JavaScript on the live page — useful, but blind to the Python side of a
 failing step. A code-level `breakpoint()` anywhere in project code under
@@ -231,6 +241,16 @@ that expected a fresh one). `debug list` shows every tracked session across
 more than one live browser; `--prune` drops the bookkeeping for any whose
 gate process is no longer actually running, without ever touching a browser
 still in use.
+
+`--extra-tag skip_login` (on `run`, `debug start` and `debug restart`) is
+the generic fix for that warning: it adds the tag onto `feature.tags`/
+`scenario.tags` before hooks run, so a project's own tag-driven logic
+treats it exactly as if it were physically in the file — no editing
+required. `debug restart` re-runs a scenario from step 0 on the SAME
+browser (stop, browser-preserving, then start again); `debug jump <line>`
+moves the cursor to a file line with no execution, for when the browser no
+longer matches where the session thinks it is; `debug continue --from
+<line>` does that jump and then keeps going.
 
 ## Documentation
 
