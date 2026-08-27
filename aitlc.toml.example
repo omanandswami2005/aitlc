@@ -75,6 +75,15 @@ teams_webhook_url = "TEAMS_WEBHOOK_URL"
 # with `debug continue --full` / `--compact`.
 continue_output = "compact"
 
+# Caps on the LIVE view of a FAILED step during `next`/`retry`/`continue`
+# (the colored stderr line printed as it happens) -- the JSON reply and the
+# journal always keep the complete text regardless of these. 0 disables a
+# given cap (print it whole). Lower these further if a failure's live view
+# still runs long (e.g. a step that chains two exceptions -- a caught
+# Playwright TimeoutError re-raised as the project's own AssertionError).
+captured_output_pretty_chars = 2000
+traceback_pretty_chars = 1500
+
 [mobile]
 mobile_feature_title_pattern = "Mobile browser:"
 mobile_device_env_var = "DEVICE_NAME"

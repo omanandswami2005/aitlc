@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.6.
+Version 0.8.7.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -390,6 +390,16 @@ silently mid-line. The FULL text is always in `traceback` (dropped only
 from `continue --compact`'s per-step summary, which trades it away because
 it already streamed live during the run) and in `aitlc journal list
 --last 1` either way.
+
+The LIVE stderr view (`next`/`retry`/`continue`'s per-step line as it
+happens) applies its own caps, `[debug].captured_output_pretty_chars` /
+`traceback_pretty_chars` in `aitlc.toml` (2000/1500 by default; 0 disables
+a cap). It also shows `traceback` in place of `error` when both are
+present — printing both doubled an already-tall failure, worse for a step
+that chains two exceptions (a caught Playwright `TimeoutError` re-raised
+as the project's own `AssertionError` runs hundreds of lines uncapped
+otherwise). None of this touches the JSON reply or the journal, which
+always keep the complete, uncapped text either way.
 
 **This does not replace `breakpoint()`, it narrows when you need it.**
 `failed_at`/`traceback` answer "where did it fail, and why" for free, on

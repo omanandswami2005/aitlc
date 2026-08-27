@@ -31,7 +31,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import typer
-from aitlc.config import AitlcConfig
+from aitlc.config import AitlcConfig, DebugConfig
 from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch, journal
 from aitlc.core.cdp_attach import inspect as cdp_inspect
 from aitlc.core.dotenv import load_dotenv
@@ -40,10 +40,7 @@ from aitlc.core import workspace
 app = typer.Typer(help="Interactive debug session over one feature file.")
 
 
-_CAPTURED_OUTPUT_PRETTY_CHARS = 2000
-
-
-def _print_pretty_step(reply: dict) -> None:
+def _print_pretty_step(reply: dict, debug_config: "DebugConfig | None" = None) -> None:
     """Render one step's result the way a real run's console shows it.
 
     Printed to stderr so stdout stays exactly the same JSON a script would
@@ -51,6 +48,7 @@ def _print_pretty_step(reply: dict) -> None:
     live, matching the colored Given/When/Then line plus real captured
     stdout/log a plain run shows, instead of a bare JSON blob.
     """
+    debug_config = debug_config or DebugConfig()
     step_text = reply.get("step")
     if not step_text:
         return
@@ -81,8 +79,9 @@ def _print_pretty_step(reply: dict) -> None:
         # under thousands of lines of noise -- capped here, in the PRETTY
         # rendering only; the raw JSON on stdout keeps the real, complete
         # captured_output for a script that actually needs it.
-        if len(captured) > _CAPTURED_OUTPUT_PRETTY_CHARS:
-            typer.echo(captured[-_CAPTURED_OUTPUT_PRETTY_CHARS:], err=True)
+        cap = debug_config.captured_output_pretty_chars
+        if cap and len(captured) > cap:
+            typer.echo(captured[-cap:], err=True)
             typer.echo(
                 f"... ({len(captured)} chars total, truncated -- see the raw "
                 "JSON's captured_output for everything)",
@@ -90,9 +89,6 @@ def _print_pretty_step(reply: dict) -> None:
             )
         else:
             typer.echo(captured, err=True)
-    error = reply.get("error")
-    if error and status == "failed":
-        typer.echo(f"{color_on}{error}{color_off}", err=True)
     failed_at = reply.get("failed_at")
     if failed_at:
         typer.echo(
@@ -102,7 +98,27 @@ def _print_pretty_step(reply: dict) -> None:
         )
     tb = reply.get("traceback")
     if tb:
-        typer.echo(tb.rstrip("\n"), err=True)
+        # `error` is a short prefix of this same text (behave's
+        # error_message, capped) -- printing both live doubled the
+        # already-tall output. `traceback` wins when present: it's the
+        # complete picture (real gap found live: a step that catches a
+        # Playwright TimeoutError and re-raises its own AssertionError
+        # chains BOTH tracebacks here, easily hundreds of lines uncapped).
+        tb = tb.rstrip("\n")
+        cap = debug_config.traceback_pretty_chars
+        if cap and len(tb) > cap:
+            typer.echo(tb[-cap:], err=True)
+            typer.echo(
+                f"... ({len(tb)} chars total, truncated -- see the raw "
+                "JSON's traceback for everything)",
+                err=True,
+            )
+        else:
+            typer.echo(tb, err=True)
+    else:
+        error = reply.get("error")
+        if error and status == "failed":
+            typer.echo(f"{color_on}{error}{color_off}", err=True)
     page_state = reply.get("page_state")
     if page_state:
         url = page_state.get("url")
@@ -742,7 +758,7 @@ def _drive(config, test_id: str, cmd: str) -> None:
     if reply.get("index") is not None:
         session.index = reply["index"]
         debug_session.save(config.root_dir, session)
-    _print_pretty_step(reply)
+    _print_pretty_step(reply, config.debug)
     _journal_step(config, test_id, f"debug {cmd}", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
@@ -877,7 +893,7 @@ def continue_steps(
             reply["stale_modules"] = reload_reply["stale_modules"]
             reply["warning"] = reload_reply["warning"]
         results.append(reply)
-        _print_pretty_step(reply)
+        _print_pretty_step(reply, config.debug)
         if reply.get("index") is not None:
             session.index = reply["index"]
             debug_session.save(config.root_dir, session)
@@ -944,7 +960,7 @@ def run_text(
     if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
         reply["stale_modules"] = reload_reply["stale_modules"]
         reply["warning"] = reload_reply["warning"]
-    _print_pretty_step(reply)
+    _print_pretty_step(reply, config.debug)
     _journal_step(config, test_id, "debug run-text", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") in (None, "passed") else 1)
@@ -978,7 +994,7 @@ def run_line(
     if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
         reply["stale_modules"] = reload_reply["stale_modules"]
         reply["warning"] = reload_reply["warning"]
-    _print_pretty_step(reply)
+    _print_pretty_step(reply, config.debug)
     _journal_step(config, test_id, "debug run-line", reply)
     typer.echo(json.dumps(reply, indent=2))
     raise typer.Exit(code=0 if reply.get("status") == "passed" and not reply.get("error") else 1)

@@ -85,6 +85,18 @@ class DebugConfig:
     # of this setting, so nothing is actually lost by defaulting compact.
     continue_output: str = "compact"
 
+    # Caps on the LIVE pretty-printed view of a failed step (`next`/`retry`/
+    # `continue`'s per-step stderr line), not the JSON reply or the journal
+    # -- both always keep the complete text regardless of these. Real
+    # complaint hit live: a step whose traceback chains two exceptions (a
+    # caught Playwright TimeoutError re-raised as the project's own
+    # AssertionError, e.g. `wait_until_audience_create_for_search`) prints
+    # BOTH tracebacks end to end with no cap at all, unlike captured_output
+    # which was already capped -- one failure's live view ran to hundreds
+    # of lines. 0 disables the cap for a given field (print it whole).
+    captured_output_pretty_chars: int = 2000
+    traceback_pretty_chars: int = 1500
+
 
 @dataclass
 class LambdaTestConfig:

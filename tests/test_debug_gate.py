@@ -58,6 +58,8 @@ def _w2(context):
 class _DebugCfg:
     def __init__(self) -> None:
         self.continue_output = "compact"
+        self.captured_output_pretty_chars = 2000
+        self.traceback_pretty_chars = 1500
 
 
 class _Cfg:
@@ -933,6 +935,70 @@ def _w(context):
     assert payload["failed_at"]["function"] == "_w"
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_pretty_step_caps_the_live_traceback_and_drops_the_redundant_error_line():
+    """The live view of a failed step must not print BOTH `error` (a short
+    prefix of the same text) and the full `traceback` -- doubled, uncapped
+    output on every failure was a real complaint hit live, worse for a step
+    that chains two exceptions (a caught Playwright TimeoutError re-raised
+    as the project's own AssertionError easily runs hundreds of lines).
+    `traceback` is capped the same way `captured_output` already was.
+    """
+    from io import StringIO
+
+    from aitlc.commands import debug_cmd
+    from aitlc.config import DebugConfig
+
+    long_tb = "line\n" * 500
+    reply = {
+        "step": "When something happens",
+        "keyword": "When",
+        "status": "failed",
+        "error": "AssertionError: short version",
+        "traceback": long_tb + "AssertionError: short version\n",
+        "failed_at": {"file": "steps.py", "line": 5, "function": "_w"},
+    }
+
+    buf = StringIO()
+    orig_stderr = sys.stderr
+    sys.stderr = buf
+    try:
+        debug_cmd._print_pretty_step(reply, DebugConfig(traceback_pretty_chars=200))
+    finally:
+        sys.stderr = orig_stderr
+    output = buf.getvalue()
+
+    assert "short version" not in output.split("truncated")[0] or "truncated" in output
+    assert "truncated" in output
+    assert "AssertionError: short version" in output  # the tail survives the cap
+    # The short `error` field must not ALSO print on its own -- traceback,
+    # which contains the same text plus more, is the one live view shows.
+    assert output.count("AssertionError: short version") == 1
+
+
+def test_pretty_step_prints_error_when_there_is_no_traceback():
+    """A failure with no Python exception at all (e.g. "step did not pass")
+    only ever has `error` -- that must still reach the live view."""
+    from io import StringIO
+
+    from aitlc.commands import debug_cmd
+    from aitlc.config import DebugConfig
+
+    reply = {
+        "step": "When something happens",
+        "keyword": "When",
+        "status": "failed",
+        "error": "step did not pass (status=undefined)",
+    }
+    buf = StringIO()
+    orig_stderr = sys.stderr
+    sys.stderr = buf
+    try:
+        debug_cmd._print_pretty_step(reply, DebugConfig())
+    finally:
+        sys.stderr = orig_stderr
+    assert "step did not pass" in buf.getvalue()
 
 
 def test_debug_start_does_not_park_on_a_hook_injected_step(monkeypatch, tmp_path):
