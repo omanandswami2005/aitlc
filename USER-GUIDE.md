@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.12.
+Version 0.9.0.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -572,6 +572,37 @@ false failure this exists to prevent.
 > Verified: cookies restore byte-identically, attributes intact. Whether the
 > *application* accepts a restored session end to end is not yet proven — treat
 > restore as "session material replayed", not "you are signed in".
+
+---
+
+## StepAtlas: a searchable catalog of every real step
+
+StepAtlas is a separate, sibling tool that catalogs every Gherkin step definition via the same
+`behave.step_registry` walk `steps unused` uses — categorized, searchable,
+with usage cross-references and an API-usage flag. `aitlc stepatlas ...`
+is a thin wrapper: it shells out to StepAtlas's own CLI/site and reads its
+`catalog.json`, it doesn't reimplement any of it.
+
+```bash
+aitlc stepatlas build              # regenerate the catalog (no site preview)
+aitlc stepatlas serve              # regenerate + serve the site
+aitlc stepatlas serve --skip-build # just serve whatever's already built
+aitlc stepatlas info "select database"        # text search
+aitlc stepatlas info features/steps/step_definition_search_page.py:573  # by file:line
+```
+
+Requires `[stepatlas]` in `aitlc.toml`:
+
+```toml
+[stepatlas]
+path = "../StepAtlas"   # absolute, or relative to root_dir
+```
+
+`info` matches a text fragment against pattern/function/keywords (up to 20
+results), or resolves `file:line` to the step at that exact line, falling
+back to the nearest step at or before it in the same file. Both forms
+print the full catalog record (description, `used_by`, `uses_api`,
+`prefer_over`/`superseded_by`, curated notes, and the page `url`).
 
 ---
 

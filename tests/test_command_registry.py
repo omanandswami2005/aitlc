@@ -43,6 +43,7 @@ EXPECTED_ORDER = [
     "history",
     "journal",
     "locators",
+    "stepatlas",
     "",
 ]
 

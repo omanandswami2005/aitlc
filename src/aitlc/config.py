@@ -116,6 +116,14 @@ class RunConfig:
 
 
 @dataclass
+class StepAtlasConfig:
+    """Where the StepAtlas checkout lives, for `aitlc stepatlas ...`."""
+
+    # Absolute, or relative to root_dir. None means not configured.
+    path: str | None = None
+
+
+@dataclass
 class LambdaTestConfig:
     """Remote-execution settings for the LambdaTest platform."""
 
@@ -195,6 +203,7 @@ class AitlcConfig:
     lambdatest: LambdaTestConfig = field(default_factory=LambdaTestConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    stepatlas: StepAtlasConfig = field(default_factory=StepAtlasConfig)
     root_dir: Path = field(default_factory=Path.cwd)
     # None means find_and_load() never found an aitlc.toml -- root_dir then
     # silently defaulted to plain cwd, which is NOT the project root a real
@@ -242,6 +251,13 @@ class AitlcConfig:
             "inside the project, or check you're not one level too high)"
         )
 
+    def stepatlas_path(self) -> Path | None:
+        """Resolved StepAtlas checkout path, or None if unconfigured."""
+        if not self.stepatlas.path:
+            return None
+        path = Path(self.stepatlas.path).expanduser()
+        return path if path.is_absolute() else self.root_dir / path
+
     @classmethod
     def load(cls, path: Path) -> AitlcConfig:
         """Load configuration from a specific file."""
@@ -261,6 +277,7 @@ class AitlcConfig:
         lt_data = data.get("lambdatest", {})
         debug_data = data.get("debug", {})
         run_data = data.get("run", {})
+        stepatlas_data = data.get("stepatlas", {})
         xray_data = data.get("xray", {})
         jira_data = data.get("jira", {})
         s3_data = data.get("s3", {})
@@ -290,6 +307,7 @@ class AitlcConfig:
             lambdatest=LambdaTestConfig(**lt_data),
             debug=DebugConfig(**debug_data),
             run=RunConfig(**run_data),
+            stepatlas=StepAtlasConfig(**stepatlas_data),
             root_dir=root_dir,
             config_path=config_path,
         )
