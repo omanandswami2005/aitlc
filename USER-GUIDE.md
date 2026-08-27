@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.9.
+Version 0.8.10.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -329,14 +329,33 @@ across it.
 Before each `next`/`retry` the gate re-parses the feature with behave's own
 parser and swaps in the freshly-bound steps (behave binds the Examples row, so
 the new steps keep their real tables, docstrings and substituted text). The
-cursor follows the step it was on **by text, not index**: inserting a step above
-it shifts every index below, so keeping the number would silently move you onto
-a different step. If the step you were on is gone (you edited it), the index is
-clamped and reported.
+cursor follows the step it was on **through a real diff of the old/new step
+text** (`difflib.SequenceMatcher`), not a plain "does this text exist anywhere
+in the new list" check: inserting a step above it shifts every index below, so
+keeping the number would silently move you onto a different step, and a plain
+existence check gets the wrong occurrence whenever the current step's exact
+text repeats elsewhere in the same scenario (a real gap: `.index()` always
+resolves to the FIRST occurrence, not the one the cursor was actually on). A
+diff matches by position within the matching block instead, so both a pure
+shift and a duplicate-text scenario land correctly.
 
 ```json
 "feature": {"steps_before": 57, "steps_after": 58, "cursor": "followed", "index": 13}
 ```
+
+`"cursor"` is one of three values:
+
+- `"followed"` — the exact step, unchanged, found at its new position. Safe.
+- `"relocated"` — the current step's own WORDING changed (not just moved by
+  an edit elsewhere), so there's no exact match to confirm against; the
+  cursor is anchored to where that block of steps now starts — a
+  best-effort guess, not a guarantee. `next`/`retry` still runs whatever
+  step it landed on, so **this also comes with a `"warning"` on the reply,
+  printed live** (`warning: cursor relocated ...`) regardless of whether
+  that step happens to pass — a wrong-step-but-passing run is exactly the
+  case a silent field would never surface.
+- `"clamped"` — the cursor was already out of range before the reload;
+  nothing to follow. Rare in practice.
 
 The re-parse is gated on the file's mtime, so a step with no edit pays only a
 `stat` (nothing). The one step after an edit pays the parse — single-digit ms

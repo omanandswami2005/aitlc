@@ -306,6 +306,67 @@ def test_debug_picks_up_a_gherkin_edit_without_restart(monkeypatch, tmp_path):
     assert payload["step"] == "When the first real step runs FASTER"
     assert payload["status"] == "passed"
     assert "feature" in payload  # the cursor move was reported
+    # The step's own WORDING changed (not just moved by an edit elsewhere)
+    # -- text match can't confirm this is really the same step, so it must
+    # be reported as "relocated" (best-effort anchor), not silently
+    # "followed" as if nothing were in question. G98: this case used to be
+    # a plain index clamp with no distinct signal at all.
+    assert payload["feature"]["cursor"] == "relocated"
+    assert "relocated" in payload["warning"]
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_follows_the_cursor_through_a_diff_not_a_first_match(monkeypatch, tmp_path):
+    """G98: two steps with IDENTICAL text in the same scenario, plus an
+    edit elsewhere in the file -- a plain `text in new_texts` check always
+    resolves to the FIRST occurrence, silently landing the cursor on the
+    WRONG one of the two whenever the parked step is the second. A real
+    diff matches by position within the unchanged block instead.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    feature_path.write_text(
+        """Feature: gate demo
+
+  Scenario: dup steps
+    Given the setup step runs
+    When the first real step runs
+    When the first real step runs
+    Then the second real step runs
+"""
+    )
+
+    # Park on the SECOND of the two identical "When" steps.
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "2", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["current_step"] == "When the first real step runs"
+
+    # Insert a new, distinct step before both duplicates -- everything
+    # from the cursor onward shifts down by one index.
+    feature_path.write_text(
+        """Feature: gate demo
+
+  Scenario: dup steps
+    Given the setup step runs
+    When the first real step runs FASTER
+    When the first real step runs
+    When the first real step runs
+    Then the second real step runs
+"""
+    )
+
+    result = runner.invoke(debug_cmd.app, ["next", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # Must have run the SECOND duplicate (now at index 3), landing on
+    # "Then" next -- not re-run the first duplicate (index 2), which a
+    # first-match lookup would have silently done instead.
+    assert payload["step"] == "When the first real step runs"
+    assert payload["feature"]["cursor"] == "followed"
+    assert payload["feature"]["index"] == 3
+    assert payload["current_step"] == "Then the second real step runs"
+    assert "warning" not in payload
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
@@ -999,6 +1060,61 @@ def test_pretty_step_prints_error_when_there_is_no_traceback():
     finally:
         sys.stderr = orig_stderr
     assert "step did not pass" in buf.getvalue()
+
+
+def test_pretty_step_prints_a_warning_regardless_of_pass_fail():
+    """A cursor-relocation warning (or any other) must reach the live view
+    even on a PASSING step -- a step landing on the wrong one after a
+    Gherkin edit can easily still happen to pass, and that's exactly when
+    a silent warning would go unnoticed."""
+    from io import StringIO
+
+    from aitlc.commands import debug_cmd
+    from aitlc.config import DebugConfig
+
+    reply = {
+        "step": "When something happens",
+        "keyword": "When",
+        "status": "passed",
+        "warning": "cursor relocated after a Gherkin edit near the current step",
+    }
+    buf = StringIO()
+    orig_stderr = sys.stderr
+    sys.stderr = buf
+    try:
+        debug_cmd._print_pretty_step(reply, DebugConfig())
+    finally:
+        sys.stderr = orig_stderr
+    assert "warning: cursor relocated" in buf.getvalue()
+
+
+def test_follow_cursor_through_diff():
+    """Direct unit coverage of the matching logic `_reload_feature` uses,
+    isolated from a real gate process. See `_follow_cursor_through_diff`'s
+    own docstring for exactly what each status means.
+    """
+    from aitlc.runtime.runner import _follow_cursor_through_diff
+
+    # Pure insertion before the cursor: the current step's text is
+    # untouched, just shifted -- must FOLLOW to its new position.
+    old = ["Given a", "When b", "Then c"]
+    new = ["Given a", "When x", "When b", "Then c"]
+    assert _follow_cursor_through_diff(old, new, 1) == (2, "followed")
+
+    # The current step's own text changed -- can't be a confirmed follow.
+    old = ["Given a", "When b", "Then c"]
+    new = ["Given a", "When b renamed", "Then c"]
+    assert _follow_cursor_through_diff(old, new, 1) == (1, "relocated")
+
+    # Duplicate text: cursor on the SECOND occurrence must resolve to the
+    # second occurrence's new position, not the first (the historical bug
+    # a plain `.index()` lookup had).
+    old = ["Given a", "When dup", "When dup", "Then c"]
+    new = ["Given a", "When x", "When dup", "When dup", "Then c"]
+    assert _follow_cursor_through_diff(old, new, 2) == (3, "followed")
+
+    # Cursor already out of range -- nothing to follow.
+    assert _follow_cursor_through_diff(["a"], ["a", "b"], 5) == (2, "clamped")
 
 
 def test_debug_start_does_not_park_on_a_hook_injected_step(monkeypatch, tmp_path):

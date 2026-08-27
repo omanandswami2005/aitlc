@@ -65,6 +65,14 @@ def _print_pretty_step(reply: dict, debug_config: "DebugConfig | None" = None) -
     total = reply.get("total")
     prefix = f"[{step_index}/{total}] " if step_index is not None and total is not None else ""
     typer.echo(f"{color_on}{prefix}{line}{suffix}{color_off}", err=True)
+    warning = reply.get("warning")
+    if warning:
+        # Regardless of pass/fail -- a cursor that landed on the wrong step
+        # after a Gherkin edit (G98) is worth seeing whether or not the
+        # step it ran happened to pass.
+        warn_on = "\033[33m" if sys.stderr.isatty() else ""
+        warn_off = "\033[0m" if warn_on else ""
+        typer.echo(f"{warn_on}warning: {warning}{warn_off}", err=True)
     captured = reply.get("captured_output")
     # Only on a FAILURE -- a passing step's own real output (INFO:root:...
     # logging, GraphQL traffic, whatever the project logs) has nothing to
@@ -731,6 +739,36 @@ def _jump_first(config, session, from_line: int | None, rel: int | None) -> None
     debug_session.save(config.root_dir, session)
 
 
+def _append_warning(reply: dict, text: str) -> None:
+    """Add to `reply["warning"]` instead of clobbering one already there
+    (stale_modules and a cursor relocation can both fire on the same
+    reload)."""
+    existing = reply.get("warning")
+    reply["warning"] = f"{existing} | {text}" if existing else text
+
+
+def _cursor_relocation_warning(feature_info: dict) -> str | None:
+    """A loud warning when a Gherkin edit's cursor-follow was NOT a clean
+    match, instead of a field a caller has to remember to go check.
+
+    "relocated" means the current step's own wording changed and the
+    cursor was anchored to a best-guess position (see
+    `_follow_cursor_through_diff`'s docstring for exactly how); "clamped"
+    means the cursor was already out of range. Either way, `next`/`retry`
+    may not be about to run the step you think it is.
+    """
+    status = feature_info.get("cursor")
+    if status not in ("relocated", "clamped"):
+        return None
+    return (
+        f"cursor {status} after a Gherkin edit near the current step -- "
+        f"its own wording changed (not just moved by an edit elsewhere), "
+        f"so the new position (index {feature_info.get('index')}) is a "
+        f"best-effort guess, not a confirmed match. Run `debug status` to "
+        f"see current_step before trusting next/retry here."
+    )
+
+
 def _drive(config, test_id: str, cmd: str) -> None:
     """Send one stepping command to the gate and report the reply."""
     session = _require(config, test_id)
@@ -745,6 +783,9 @@ def _drive(config, test_id: str, cmd: str) -> None:
     if isinstance(reload_reply, dict) and reload_reply.get("feature"):
         # A Gherkin edit was picked up: report how the cursor moved.
         reply["feature"] = reload_reply["feature"]
+        relocation_warning = _cursor_relocation_warning(reload_reply["feature"])
+        if relocation_warning:
+            _append_warning(reply, relocation_warning)
     if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
         # G54: confirms a page-object/helper edit outside step_dir WAS picked
         # up automatically -- positive signal, not just silence when it works.
@@ -754,7 +795,7 @@ def _drive(config, test_id: str, cmd: str) -> None:
         # sys.modules -- surface it here so `retry`/`next` never look like a
         # clean run of code that was never actually re-executed.
         reply["stale_modules"] = reload_reply["stale_modules"]
-        reply["warning"] = reload_reply["warning"]
+        _append_warning(reply, reload_reply["warning"])
     if reply.get("index") is not None:
         session.index = reply["index"]
         debug_session.save(config.root_dir, session)
@@ -906,11 +947,14 @@ def continue_steps(
             reply["captured_output"] = _tail_log_since(session.log_path, bookmark)
             if isinstance(reload_reply, dict) and reload_reply.get("feature"):
                 reply["feature"] = reload_reply["feature"]
+                relocation_warning = _cursor_relocation_warning(reload_reply["feature"])
+                if relocation_warning:
+                    _append_warning(reply, relocation_warning)
             if isinstance(reload_reply, dict) and reload_reply.get("reloaded_modules"):
                 reply["reloaded_modules"] = reload_reply["reloaded_modules"]
             if isinstance(reload_reply, dict) and reload_reply.get("stale_modules"):
                 reply["stale_modules"] = reload_reply["stale_modules"]
-                reply["warning"] = reload_reply["warning"]
+                _append_warning(reply, reload_reply["warning"])
             results.append(reply)
             _print_pretty_step(reply, config.debug)
             if reply.get("index") is not None:

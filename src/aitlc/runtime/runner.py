@@ -50,6 +50,7 @@ plus behave itself (guaranteed present: behave is what loaded it).
 
 from __future__ import annotations
 
+import difflib
 import importlib
 import json
 import logging
@@ -122,6 +123,40 @@ def _stamp(epoch: float) -> str:
 
 
 _PAGE_STATE_TREE_CHARS = 3000
+
+
+def _follow_cursor_through_diff(
+    old_texts: list[str], new_texts: list[str], cursor: int
+) -> tuple[int, str]:
+    """Where does the step at `cursor` in `old_texts` now live in `new_texts`?
+
+    Real diff (`difflib.SequenceMatcher`) instead of a plain `in` check, so
+    the answer is right even when: the same step text repeats elsewhere in
+    the file (matches by POSITION within the matching block, not the
+    first occurrence anywhere), or the current step's own wording changed
+    (anchors to where that block now starts, accounting for every other
+    insertion/deletion in the same edit -- not just a raw index that
+    assumes nothing else moved).
+
+    Returns (new_index, status), status one of:
+      "followed"  -- the exact step, unchanged, found at its new position.
+      "relocated" -- the step's own text changed; anchored to the start of
+                     the corresponding new block (best available guess,
+                     not a guarantee -- surfaced distinctly so a caller can
+                     warn rather than silently trust it).
+      "clamped"   -- cursor was already out of range; nothing to follow.
+    """
+    if not (0 <= cursor < len(old_texts)):
+        return min(max(cursor, 0), len(new_texts)), "clamped"
+    matcher = difflib.SequenceMatcher(a=old_texts, b=new_texts, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if i1 <= cursor < i2:
+            if tag == "equal":
+                return j1 + (cursor - i1), "followed"
+            return min(j1, len(new_texts)), "relocated"
+    # get_opcodes() always covers every index in `a` -- this is unreachable
+    # in practice; kept as a safety net rather than raising.
+    return min(cursor, len(new_texts)), "clamped"
 
 
 def _find_step_index_for_line(steps: list, target_line: int) -> int | None:
@@ -571,7 +606,29 @@ class AitlcRunner(_BaseRunner):
 
         Returns None when there is nothing to change (so the caller reports no
         noise); otherwise updates ``self._aitlc_steps`` and reports what moved.
-        The cursor follows the step it was on by TEXT, not index.
+
+        The cursor follows the step it was on through a real diff of the
+        old/new step text sequences (`difflib.SequenceMatcher`), not a plain
+        `text in new_texts` membership check. Two real gaps that check had:
+
+        1. Duplicate step text is common (e.g. two identical "And wait for
+           wave Loader" steps in one scenario) -- `.index(old_current)`
+           always resolves to the FIRST occurrence, silently landing the
+           cursor on the wrong one whenever the current step's exact text
+           repeats elsewhere in the file.
+        2. When the current step's own wording changed (reworded, retyped
+           mid-edit) -- not just moved by edits elsewhere -- membership
+           fails entirely, and the old fallback ("clamp to the same
+           numeric index") is only correct if nothing else in the file
+           shifted position either. One reword AND one insertion in the
+           same edit reliably points the clamped index at an unrelated
+           step, silently.
+
+        A real diff fixes both: matching happens by POSITION within each
+        equal/changed block, so a repeated step text at the cursor's exact
+        block offset resolves correctly, and a rewording still anchors to
+        where that same block of steps now starts -- not a raw index that
+        ignores every other change in the file.
         """
         filename = self._feature_path(context)
         if filename:
@@ -592,13 +649,7 @@ class AitlcRunner(_BaseRunner):
         if new_texts == old_texts:
             self._aitlc_steps = new_steps  # refresh objects; no cursor change
             return None
-        old_current = old_texts[cursor] if 0 <= cursor < len(old_texts) else None
-        if old_current is not None and old_current in new_texts:
-            new_cursor = new_texts.index(old_current)
-            follow = "followed"
-        else:
-            new_cursor = min(cursor, len(new_steps))
-            follow = "clamped"
+        new_cursor, follow = _follow_cursor_through_diff(old_texts, new_texts, cursor)
         before = len(old_steps)
         self._aitlc_steps = new_steps
         return {
