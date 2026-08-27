@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.3.
+Version 0.8.4.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -237,6 +237,7 @@ aitlc debug status PROJ-1234           # where am I?
 aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url needed
 aitlc debug inspect PROJ-1234           # same, accessibility tree instead of pixels
 aitlc debug list --prune                # every tracked session; drop dead bookkeeping
+aitlc debug reap --dry-run              # real orphaned processes with no session record at all
 aitlc debug certify PROJ-1234 --times 2
 aitlc debug stop PROJ-1234              # THIS session's browser down; no cleanup hooks fired
 aitlc debug stop PROJ-1234 --cleanup    # + fires the suite's real after_scenario/after_feature first
@@ -415,6 +416,7 @@ lost, nothing restarts, the original call just continues from that exact line.
 
 ```bash
 aitlc cdp launch                       # detached browser that outlives your shell
+aitlc cdp launch --user-data-dir ~/ChromeDebugSession   # a persistent, named profile instead
 aitlc cdp inspect --port 9333 --a11y   # what a screen reader sees
 aitlc cdp inspect --port 9333 --storage
 aitlc cdp inspect --check '#save,[data-testid="row"]'
@@ -422,6 +424,12 @@ aitlc cdp time-until '#banner' --condition hidden
 aitlc cdp list                         # every tracked instance, alive or dead
 aitlc cdp stop --all
 ```
+
+`--user-data-dir` (alias `--profile-dir`, also on `debug start`) points the
+launched browser at a specific profile directory you keep across days
+(already-logged-in sessions, saved history), instead of aitlc's own
+auto-generated `.cdp/profile-<port>`. The underlying `chrome_cdp.launch()`
+already supported this; only the CLI was missing the flag.
 
 The accessibility tree answers "is the upgrade button on screen" in a fraction
 of a screenshot's size, and it is directly assertable.
@@ -583,6 +591,29 @@ state, or `aitlc cdp launch --new` for a genuinely fresh instance.
 test_id last drove the browser; the same test_id reusing its own browser
 across repeated `debug start` attempts previously got no warning from
 either path.
+
+### `debug start` stops any previous session for the same test_id first
+
+Real orphans found live: `debug start` used to overwrite a test_id's
+session record unconditionally, with no attempt to stop whatever gate
+process the LAST `debug start` for it had left running. Three separate
+real behave processes for the same test_id turned up still alive, from
+three separate `start` calls, none ever told to stop — `restart` already
+stopped the old one first; `start` needed the identical check.
+
+For anything already orphaned before this fix (or from some other cause a
+record-based check can't help with — a crash, a killed shell):
+
+```bash
+aitlc debug reap --dry-run   # what would be killed
+aitlc debug reap             # actually kill them
+```
+
+`debug list --prune` only ever prunes stale SESSION RECORDS — nothing to
+prune if a record never existed. `reap` scans real `ps` output instead,
+for this project's own gate invocations specifically (an unrelated
+`aitlc` session for a different project on the same machine is never
+touched), and kills only the ones no known session accounts for.
 
 ### `--extra-tag`: the generic fix for a browser that's already in a state your hooks don't expect
 

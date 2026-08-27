@@ -44,6 +44,13 @@ Run & investigate one test:
   resolve it from the session itself. `debug list` shows every tracked
   session across more than one live browser; `--prune` drops bookkeeping
   for any whose gate process is no longer actually running.
+- **A gate process running with no session record pointing at it at all**
+  (a crash, a killed shell, or an orphan from before `debug start` learned
+  to stop its own predecessor — see below) → `debug list --prune` can't
+  see these, since it only prunes stale RECORDS. `debug reap --dry-run` /
+  `debug reap` scans real `ps` output for this project's own gate
+  invocations instead and kills only the ones no known session accounts
+  for.
 - **A real `breakpoint()` in project code, not just JS `eval`** → `debug
   status` reports `"paused_at": "breakpoint"` when one is hit; `debug py
   "<python-expr>"` evaluates it in the paused frame's own locals/globals
@@ -175,6 +182,7 @@ aitlc -w PROJ-1234 debug resume PROJ-1234           # continue past that breakpo
 aitlc -w PROJ-1234 debug certify PROJ-1234 --times 2   # fresh instance, real feature, N passes
 aitlc -w PROJ-1234 debug stop PROJ-1234            # tear down the browser + session
 aitlc -w PROJ-1234 debug list --prune              # every tracked session; drop dead bookkeeping
+aitlc -w PROJ-1234 debug reap --dry-run            # real orphaned processes with no session record at all
 ```
 
 `stop` kills only the browser THIS session launched, by default — it does NOT
@@ -259,6 +267,23 @@ instance.
 `is_dirty_for` (the older check `run --debug` uses) only fires for a
 *different* driver, so the same test_id reusing its own browser across
 repeated `debug start` attempts previously got no warning at all.
+
+**`debug start` also stops any PREVIOUS session for the same test_id
+before launching a new one.** Real orphans found live: it used to
+overwrite that test_id's session record unconditionally, with no attempt
+to stop whatever gate process the last `debug start` for it left running
+-- three separate real processes for the same test_id turned up still
+alive, from three separate `start` calls, none ever told to stop. Now
+mirrors what `debug restart` already did. `debug reap` (above) cleans up
+anything that was already orphaned before this fix, or from some other
+cause (a crash, a killed shell) it can't prevent.
+
+**`aitlc cdp launch`/`debug start --user-data-dir <path>`** (alias
+`--profile-dir`) points a freshly launched browser at a specific Chrome
+profile directory -- a persistent, named one you reuse across days
+(already-logged-in sessions, saved history), instead of aitlc's own
+auto-generated `.cdp/profile-<port>`. `chrome_cdp.launch()` already
+supported this internally; only the CLI was missing the option.
 
 **`--extra-tag` is the generic fix**, available on `run`, `debug start` and
 `debug restart`: it adds a tag (without `@`) onto `feature.tags`/

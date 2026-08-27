@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -261,11 +263,38 @@ def start(
         "a project's own tag-driven hook logic behave as if it were tagged. "
         "Repeatable.",
     ),
+    user_data_dir: Path | None = typer.Option(
+        None,
+        "--user-data-dir",
+        "--profile-dir",
+        help="Chrome profile directory for a freshly LAUNCHED browser (a "
+        "persistent named profile you reuse across days, instead of "
+        "aitlc's own auto-generated .cdp/profile-<port>). Only used when "
+        "no live tracked instance is being reused and no --cdp-url is "
+        "given -- pass --no-cdp too if a tracked instance would otherwise "
+        "win.",
+    ),
 ) -> None:
     """Attach to a live `cdp launch` browser (or launch one), drive REAL behave to a step, then park."""
     config = AitlcConfig.find_and_load()
     load_dotenv(config.root_dir / env_file)
     test_id = _default_id(config, test_id)
+
+    # G89, real orphans found live: `start` used to overwrite this test_id's
+    # session record unconditionally, with no attempt to stop whatever gate
+    # process the PREVIOUS `debug start` for it left running -- three
+    # separate real behave processes for the same test_id were found still
+    # alive, from three separate `start` calls, none of which had ever been
+    # told to stop. `restart` already does this same check; `start` needs
+    # it just as much, since calling it again for a test_id that already
+    # has a session is exactly the same situation.
+    existing = debug_session.load(config.root_dir, test_id)
+    if existing is not None and existing.socket:
+        try:
+            gate_client.request(existing.socket, "stop", cleanup=False)
+        except (gate_client.GateUnavailable, OSError):
+            pass
+
     feature = config.resolve_feature_path(test_id)
     if feature is None:
         typer.echo(json.dumps({"error": f"could not resolve feature for {test_id!r}"}), err=True)
@@ -300,7 +329,9 @@ def start(
         # No live tracked instance (or --no-cdp/unresolvable --cdp-url): a
         # fresh, isolated debug Chrome the suite will attach to; it survives
         # the gate's hard exit, so `stop` owns its teardown.
-        instance, reused = chrome_cdp.launch(config.root_dir, port=None, window_size=window_size)
+        instance, reused = chrome_cdp.launch(
+            config.root_dir, port=None, window_size=window_size, user_data_dir=user_data_dir
+        )
         resolved_cdp_url = instance.cdp_url
         resolved_port = instance.port
 
@@ -1139,6 +1170,82 @@ def list_sessions(
     if prune:
         payload["pruned"] = pruned
     typer.echo(json.dumps(payload, indent=2))
+
+
+def _find_orphaned_gate_pids(root_dir: Path, known_pids: set[int]) -> list[int]:
+    """PIDs of real OS processes running THIS project's gate that no known
+    session record points at.
+
+    `debug list --prune` only ever prunes SESSION RECORDS whose gate is
+    unreachable -- it has nothing to check if there was never a session
+    record to begin with (a crash, a killed shell, or `debug start`
+    overwriting one without stopping the old process first, the exact gap
+    G89 fixed -- pre-existing orphans from before that fix have no record
+    at all). This looks at real `ps` output instead: any process whose
+    command line shows it was launched with this exact `--runner`/
+    `--runner-class` attach AND whose feature-file argument sits under
+    THIS project's root, that isn't one of the pids known sessions already
+    account for.  Unix-only (`ps`), same assumption the whole gate/socket
+    mechanism already makes.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,args"], capture_output=True, text=True, check=True, timeout=5
+        ).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+    root = str(Path(root_dir).resolve())
+    pids = []
+    for line in out.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, rest = line.partition(" ")
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid in known_pids:
+            continue
+        is_gate = (
+            "aitlc.runtime.runner:AitlcRunner" in rest
+            or "aitlc.runtime.runner.AitlcRunner" in rest
+        )
+        if is_gate and root in rest:
+            pids.append(pid)
+    return pids
+
+
+@app.command("reap")
+def reap(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List what would be killed, without killing anything."
+    ),
+) -> None:
+    """Kill every real gate process for THIS project that no session record points at.
+
+    For orphans `debug list --prune` can't see -- it only prunes stale
+    SESSION RECORDS; a process that was orphaned before a record-based fix
+    existed (or from a crash, a killed shell) has no record at all, so
+    there's nothing for `--prune` to find. This looks at real OS processes
+    instead, scoped to this project's own gate invocations only -- an
+    unrelated `aitlc` session for a different project on the same machine
+    is never touched.
+    """
+    config = AitlcConfig.find_and_load()
+    known_pids = {s.pid for s in debug_session.list_all(config.root_dir) if s.pid}
+    orphans = _find_orphaned_gate_pids(config.root_dir, known_pids)
+    if dry_run:
+        typer.echo(json.dumps({"would_kill": orphans, "count": len(orphans)}, indent=2))
+        return
+    killed = []
+    for pid in orphans:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            pass
+    typer.echo(json.dumps({"killed": killed, "count": len(killed)}, indent=2))
 
 
 @app.command("stop")

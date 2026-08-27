@@ -137,6 +137,16 @@ def launch(
             "agents each needing their own)."
         ),
     ),
+    user_data_dir: Path | None = typer.Option(
+        None,
+        "--user-data-dir",
+        "--profile-dir",
+        help="Chrome profile directory to use, e.g. a persistent named "
+        "profile you reuse across days (already-logged-in sessions, saved "
+        "history) instead of aitlc's own auto-generated .cdp/profile-<port>. "
+        "Passed straight through to chrome_cdp.launch, which already "
+        "supports this -- only the CLI was missing the option.",
+    ),
 ) -> None:
     """Start (or reuse) a detached debug Chrome that outlives this command."""
     config = AitlcConfig.find_and_load()
@@ -147,6 +157,7 @@ def launch(
             port=None if new else port,
             window_size=resolved_size,
             chrome_binary=chrome_binary,
+            user_data_dir=user_data_dir,
         )
     except chrome_cdp.ChromeCdpError as exc:
         typer.echo(json.dumps({"error": str(exc)}), err=True)

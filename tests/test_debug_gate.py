@@ -1020,6 +1020,110 @@ def before_feature(context, feature):
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_debug_start_stops_a_pre_existing_session_instead_of_orphaning_it(
+    monkeypatch, tmp_path
+):
+    """G89: calling `start` again for a test_id that already has a session
+    must stop the OLD gate process first, not just silently overwrite its
+    session record -- real orphans found live: three separate `debug
+    start` calls for the same test_id left three real behave processes
+    running, none ever told to stop, because only `restart` used to do
+    this check.
+    """
+    import os
+    import time as _time
+
+    from aitlc.core import debug_session
+
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    config = debug_cmd.AitlcConfig.find_and_load()
+    old_pid = debug_session.load(config.root_dir, "PROJ-1").pid
+
+    # Confirm the OLD process is genuinely alive before the second start.
+    os.kill(old_pid, 0)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    # The OLD pid must actually exit -- not just look "alive" because
+    # nothing reaped it (os.kill(pid, 0) succeeds against an unreaped
+    # zombie too; this test process IS the real parent, so os.waitpid is
+    # the honest check -- see gate_launch.await_park_or_exit's own
+    # docstring for the same lesson learned elsewhere in this codebase).
+    deadline = _time.time() + 10
+    old_gate_gone = False
+    while _time.time() < deadline:
+        wpid, _status = os.waitpid(old_pid, os.WNOHANG)
+        if wpid == old_pid:
+            old_gate_gone = True
+            break
+        _time.sleep(0.2)
+    assert old_gate_gone, f"old gate (pid {old_pid}) was never told to stop"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_reap_kills_a_real_orphan_with_no_session_record(monkeypatch, tmp_path):
+    """`debug list --prune` only prunes stale SESSION RECORDS -- an orphan
+    from before that record existed (a crash, a killed shell) has no
+    record to prune. `reap` must find and kill it anyway, by scanning
+    real `ps` output for this project's own gate invocations, and must
+    never touch a PID a known session still legitimately points at.
+    """
+    import os
+    import time as _time
+
+    from aitlc.core import debug_session
+
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    config = debug_cmd.AitlcConfig.find_and_load()
+    orphan_pid = debug_session.load(config.root_dir, "PROJ-1").pid
+
+    # Simulate the real-world case: the session record is gone (deleted,
+    # never written, whatever) but the real process is still alive.
+    debug_session.clear(config.root_dir, "PROJ-1")
+
+    result = runner.invoke(debug_cmd.app, ["reap", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert orphan_pid in payload["would_kill"]
+
+    result = runner.invoke(debug_cmd.app, ["reap"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert orphan_pid in payload["killed"]
+
+    deadline = _time.time() + 10
+    reaped = False
+    while _time.time() < deadline:
+        wpid, _status = os.waitpid(orphan_pid, os.WNOHANG)
+        if wpid == orphan_pid:
+            reaped = True
+            break
+        _time.sleep(0.2)
+    assert reaped, f"orphan (pid {orphan_pid}) was never actually killed"
+
+
+def test_reap_never_touches_a_pid_a_known_session_still_points_at(monkeypatch, tmp_path):
+    _wire(monkeypatch, tmp_path)
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(debug_cmd.app, ["reap", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["would_kill"] == []
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_next_attaches_page_state_on_a_failing_step(monkeypatch, tmp_path):
     """A failed step's reply must carry the live page's URL + a compact
     accessibility snapshot -- answers "was there an unexpected page?" (an

@@ -240,7 +240,11 @@ failing silently mid-scenario (a leftover login, say, skipping past a step
 that expected a fresh one). `debug list` shows every tracked session across
 more than one live browser; `--prune` drops the bookkeeping for any whose
 gate process is no longer actually running, without ever touching a browser
-still in use.
+still in use. `debug start` now also stops any PREVIOUS session for the same
+test_id before launching a new one — it used to just overwrite the record,
+orphaning whatever was already running under it. `debug reap` cleans up
+anything already orphaned before that fix (or from a crash, a killed shell)
+by scanning real processes, not session records.
 
 `--extra-tag skip_login` (on `run`, `debug start` and `debug restart`) is
 the generic fix for that warning: it adds the tag onto `feature.tags`/
