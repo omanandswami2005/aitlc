@@ -139,6 +139,17 @@ def run(
     toon_output: bool = typer.Option(
         False, "--toon", help="Emit the failures table as TOON instead of JSON."
     ),
+    full_output: bool = typer.Option(
+        None,
+        "--full/--compact",
+        help="Final stdout JSON: --full always includes every step's full "
+        "record (the same shape debug next/retry use); --compact (default) "
+        "drops it when the run passed with zero failures, since it just "
+        "repeats behave's own human-readable summary printed just above. "
+        "Defaults to [run].output in aitlc.toml (\"compact\" if unset). The "
+        "journal always keeps the full record either way -- see `aitlc "
+        "journal list --last 1`.",
+    ),
     no_lock: bool = typer.Option(
         False, "--no-lock", help="Skip the per-test-ID concurrency lock (FR-1.6)."
     ),
@@ -687,13 +698,26 @@ def run(
             "just re-run; re-running reproduces the identical empty crash."
         )
 
+    # Real complaint hit live: a fully-passing 37-step scenario still dumped
+    # every step's full record on stdout, right after behave's own human-
+    # readable summary already said the same thing -- redundant on a clean
+    # pass. Compact by default; on a FAILURE the full "steps" array stays
+    # (useful for the surrounding narrative, not just the failure entries),
+    # and the journal always keeps the complete record either way regardless
+    # of this -- `payload` itself (used below for journal.record) is
+    # untouched, only the ECHOED copy is trimmed.
+    compact_output = not full_output if full_output is not None else config.run.output != "full"
+    echo_payload = payload
+    if compact_output and not payload["failures"]:
+        echo_payload = {k: v for k, v in payload.items() if k != "steps"}
+
     if toon_output and payload["failures"]:
         output = toon.encode_table(payload["failures"], name="failures")
         output += f"\n\nsteps_by_status: {json.dumps(payload['steps_by_status'])}"
         if retry > 0:
             output += f"\nretry: {json.dumps(retry_info)}"
     else:
-        output = json.dumps(payload)
+        output = json.dumps(echo_payload)
 
     output = redact_text(output, secret_values)
     typer.echo(output)

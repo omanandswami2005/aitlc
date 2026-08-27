@@ -84,6 +84,15 @@ continue_output = "compact"
 captured_output_pretty_chars = 2000
 traceback_pretty_chars = 1500
 
+[run]
+# Plain `aitlc run`'s final stdout JSON: "compact" (default) drops the
+# per-step "steps" array when the run passed with zero failures -- it just
+# repeats behave's own human-readable summary printed just above it. A run
+# with any failure keeps "steps" regardless. "full" always includes it.
+# The journal always keeps the complete record either way. Override per
+# call with `run --full` / `--compact`.
+output = "compact"
+
 [mobile]
 mobile_feature_title_pattern = "Mobile browser:"
 mobile_device_env_var = "DEVICE_NAME"

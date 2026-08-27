@@ -99,6 +99,23 @@ class DebugConfig:
 
 
 @dataclass
+class RunConfig:
+    """Defaults for the `run` command."""
+
+    # `run`'s final stdout JSON always included every step's full record
+    # (the same shape debug next/retry use) even on a clean pass with zero
+    # failures -- redundant with behave's own human-readable summary that
+    # already printed just above it, real complaint hit live on a 37-step
+    # scenario that fully passed. "compact" (default) drops the per-step
+    # "steps" array when the run passed, keeping steps_by_status/failures/
+    # exit_code; "full" always includes it. The journal always keeps the
+    # complete record either way (`aitlc journal list --last 1`), so
+    # nothing is actually lost by defaulting compact -- same contract as
+    # `[debug].continue_output`. Override per call with `run --full`/`--compact`.
+    output: str = "compact"
+
+
+@dataclass
 class LambdaTestConfig:
     """Remote-execution settings for the LambdaTest platform."""
 
@@ -177,6 +194,7 @@ class AitlcConfig:
     mobile: MobileConfig = field(default_factory=MobileConfig)
     lambdatest: LambdaTestConfig = field(default_factory=LambdaTestConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    run: RunConfig = field(default_factory=RunConfig)
     root_dir: Path = field(default_factory=Path.cwd)
     # None means find_and_load() never found an aitlc.toml -- root_dir then
     # silently defaulted to plain cwd, which is NOT the project root a real
@@ -242,6 +260,7 @@ class AitlcConfig:
         mobile_data = data.get("mobile", {})
         lt_data = data.get("lambdatest", {})
         debug_data = data.get("debug", {})
+        run_data = data.get("run", {})
         xray_data = data.get("xray", {})
         jira_data = data.get("jira", {})
         s3_data = data.get("s3", {})
@@ -270,6 +289,7 @@ class AitlcConfig:
             mobile=MobileConfig(**mobile_data),
             lambdatest=LambdaTestConfig(**lt_data),
             debug=DebugConfig(**debug_data),
+            run=RunConfig(**run_data),
             root_dir=root_dir,
             config_path=config_path,
         )

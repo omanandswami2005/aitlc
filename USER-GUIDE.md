@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.8.11.
+Version 0.8.12.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -896,6 +896,21 @@ continue_output = "compact"   # or "full"
 ```
 
 The CLI flag always wins over the config when passed.
+
+**Plain `aitlc run` has the same knob, for the same reason.** A fully
+passing scenario still dumped every step's complete record on stdout,
+redundant with behave's own human-readable summary printed just above it
+in the same output — real complaint hit live on a 37-step scenario that
+fully passed. `--compact` (default) drops the `"steps"` array when the
+run passed with zero failures; a run with any failure keeps it regardless
+(the surrounding narrative matters there, not just the failure entries).
+`--full` always includes it. Same journal guarantee: nothing is lost
+either way, only what's echoed to the terminal changes.
+
+```toml
+[run]
+output = "compact"   # or "full"
+```
 
 ---
 
