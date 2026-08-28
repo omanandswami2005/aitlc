@@ -52,6 +52,13 @@ def _t(context):
 @when("the first real step runs FASTER")
 def _w2(context):
     pass
+
+
+@when("the table step runs")
+def _table_step(context):
+    context.last_table = (
+        [dict(row.as_dict()) for row in context.table.rows] if context.table else None
+    )
 '''
 
 
@@ -320,6 +327,59 @@ def test_debug_picks_up_a_gherkin_edit_without_restart(monkeypatch, tmp_path):
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
 
+def test_retry_picks_up_a_table_only_edit_same_step_text(monkeypatch, tmp_path):
+    """A step whose own wording is unchanged but whose DATA TABLE was edited
+    -- the common case for the unified UI-action pattern, where every
+    scenario step reads as the identical "When user performs UI action
+    with parameters" and all the real content lives in the table.
+
+    `_reload_feature` takes the `new_texts == old_texts` fast path here
+    (same step text sequence), which must still swap in the freshly
+    parsed Step objects -- not silently keep serving the OLD table
+    alongside a reply that looks perfectly normal otherwise.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    feature_path.write_text(
+        """Feature: gate demo
+
+  Scenario: table step
+    Given the setup step runs
+    When the table step runs
+      | key | value |
+      | a   | 1     |
+"""
+    )
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "1", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["current_step"] == "When the table step runs"
+
+    # Edit ONLY the table -- the step's own text is byte-identical.
+    feature_path.write_text(
+        """Feature: gate demo
+
+  Scenario: table step
+    Given the setup step runs
+    When the table step runs
+      | key | value |
+      | a   | 2     |
+"""
+    )
+
+    result = runner.invoke(debug_cmd.app, ["retry", "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["step"] == "When the table step runs"
+    assert payload["status"] == "passed"
+    # The reply must carry the EDITED row, not the one the session parked
+    # on -- a stale Step object here is exactly what a real run's `retry`
+    # after a table edit must never do.
+    assert payload["table"] == [{"key": "a", "value": "2"}]
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
 def test_debug_follows_the_cursor_through_a_diff_not_a_first_match(monkeypatch, tmp_path):
     """G98: two steps with IDENTICAL text in the same scenario, plus an
     edit elsewhere in the file -- a plain `text in new_texts` check always
@@ -409,6 +469,24 @@ def test_debug_eval_reports_no_page_for_pure_python_steps(monkeypatch, tmp_path)
     assert result.exit_code == 1, result.output
     payload = json.loads(result.stdout)
     assert payload["error"] == "no live page found on context"
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_debug_eval_for_ai_prints_compact_json_not_indented(monkeypatch, tmp_path):
+    """--for-ai: same reply, printed without indent=2 -- a token-paying AI
+    caller doesn't need the human-terminal pretty-printing."""
+    _wire(monkeypatch, tmp_path)
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "1", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    plain = runner.invoke(debug_cmd.app, ["eval", "1 + 1", "PROJ-1"])
+    assert "\n" in plain.stdout.strip()  # indent=2 -- multi-line
+
+    compact = runner.invoke(debug_cmd.app, ["eval", "1 + 1", "PROJ-1", "--for-ai"])
+    assert json.loads(compact.stdout) == json.loads(plain.stdout)
+    assert "\n" not in compact.stdout.strip()  # single line, no indentation
+    assert ": " not in compact.stdout  # minimal separators, not indent=2's ": "
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 
@@ -1500,6 +1578,53 @@ def test_jump_moves_the_cursor_without_running_anything(monkeypatch, tmp_path):
 
     result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
     assert json.loads(result.stdout)["parked_at"] == 0
+
+    runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
+
+
+def test_jump_to_line_lands_on_that_line_not_an_earlier_duplicate(monkeypatch, tmp_path):
+    """G98-class bug on the `jump`/`resolve_line` path: two steps with
+    IDENTICAL text in the same scenario. behave's `Step.__eq__` compares
+    only `(step_type, name)`, ignoring file location, so `list.index()`
+    on a step found by line resolves to the FIRST identical-text step in
+    the whole scenario -- silently landing `jump <line>` (and therefore
+    `continue --from <line>`) on the wrong occurrence whenever the line
+    given is the SECOND of two duplicates. `_follow_cursor_through_diff`
+    already guards against this exact class of bug on the reload/edit
+    path (see test_debug_follows_the_cursor_through_a_diff_not_a_first_match);
+    this is the same class of bug on the line-lookup path.
+    """
+    _wire(monkeypatch, tmp_path)
+    feature_path = tmp_path / "features" / "g.feature"
+    feature_path.write_text(
+        """Feature: gate demo
+
+  Scenario: dup steps
+    Given the setup step runs
+    When the first real step runs
+    When the first real step runs
+    Then the second real step runs
+"""
+    )
+    lines = feature_path.read_text().splitlines()
+    second_dup_line = [
+        i for i, l in enumerate(lines, start=1) if "the first real step runs" in l
+    ][1]
+
+    result = runner.invoke(debug_cmd.app, ["start", "PROJ-1", "--at", "0", "--timeout", "60"])
+    assert result.exit_code == 0, result.output
+
+    # Jump straight to the SECOND "When the first real step runs" by line.
+    result = runner.invoke(debug_cmd.app, ["jump", str(second_dup_line), "PROJ-1"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # Index 2, not 1 -- landing on index 1 would mean it silently resolved
+    # to the FIRST duplicate instead of the one actually at this line.
+    assert payload["jumped_to"] == 2
+    assert payload["current_step"] == "When the first real step runs"
+
+    result = runner.invoke(debug_cmd.app, ["status", "PROJ-1"])
+    assert json.loads(result.stdout)["parked_at"] == 2
 
     runner.invoke(debug_cmd.app, ["stop", "PROJ-1"])
 

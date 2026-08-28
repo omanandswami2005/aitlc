@@ -107,7 +107,21 @@ CI and history:
 Environment and setup:
 - **Read a live page as text, storage, or a raw call** → `aitlc cdp
   inspect --a11y` / `--storage`.
+- **Turn a spotted control into a real locator** → `aitlc cdp inspect
+  --interactive --interactive-query "<text>"` — the concrete id/name/role/
+  type/value/checked/text `--a11y` alone doesn't carry (it's a pure aria
+  role/name/state tree), in the same one call.
+- **Token-cheap reply for an AI caller** → add `--for-ai` to `debug eval` /
+  `cdp inspect` / `debug inspect` — strips trailing whitespace and blank-line
+  runs, compact (not indented) JSON. Never touches indentation that carries
+  meaning (an `--a11y` tree's nesting).
 - **Manage the persistent debug browser** → `aitlc cdp launch/status/list/stop`.
+- **What steps already exist for this page/feature?** → `aitlc stepatlas
+  info --page <slug-or-label>` (no query needed), or free text / `file:line`
+  / `--group`/`--keyword`/`--uses-api`/`--file`, all composable. Only have a
+  live URL, not the page slug? → `--url <url>` — a static token heuristic
+  (no stored URL-to-step mapping exists), scored categories shown in
+  `url_match`.
 - **Is the environment even set up right?** → `aitlc doctor` (behave/playwright
   versions **from the target project's own environment**, not aitlc's own —
   add `--remote` for LT credential/tunnel/proxy checks).
@@ -388,10 +402,11 @@ driving it, on this project or any other:
   browser/step side of this; for a Python-logic bug, a temporary
   `breakpoint()` in the page object plus a foreground, `--no-capture` run is
   still the way to get a real local-variable frame.
-- **Page introspection beyond `cdp inspect --a11y`/`debug eval` is limited.**
-  No first-class console-log or network-request capture from a paused
-  session yet — a project's own request/response logging (if it has any) is
-  the fallback.
+- **No first-class console-log or network-request capture from a paused
+  session yet** — a project's own request/response logging (if it has any)
+  is the fallback. (DOM-identity lookup for locator authoring — id/name/
+  value a spotted control needs — is covered now: `cdp inspect
+  --interactive`/`debug inspect --interactive`, alongside `--a11y`.)
 - Two gaps from real dogfooding aren't root-caused yet: a live `next`/`retry`
   session can report `status=undefined` for a step that should clearly match,
   after many edits and cursor moves in one long session (workaround: start a

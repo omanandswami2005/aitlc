@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 
 import typer
 from aitlc.config import AitlcConfig, DebugConfig
-from aitlc.core import behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch, journal
+from aitlc.core import ai_compact, behave_runner, checkpoint, chrome_cdp, debug_session, gate_client, gate_launch, journal
 from aitlc.core.cdp_attach import inspect as cdp_inspect
 from aitlc.core.dotenv import load_dotenv
 from aitlc.core import workspace
@@ -1118,6 +1118,14 @@ def eval_js(
     expr: str = typer.Argument(..., help="JavaScript expression to evaluate on the live page."),
     test_id: str = typer.Argument(None),
     env_file: str = typer.Option(".env", "--env-file"),
+    for_ai: bool = typer.Option(
+        False,
+        "--for-ai",
+        help="Compact the reply for a token-paying AI caller: strip trailing "
+        "whitespace and collapse blank-line runs in every string (never "
+        "touches meaningful indentation), and print compact JSON instead of "
+        "indent=2.",
+    ),
 ) -> None:
     """Evaluate a JS expression against the live paused browser page.
 
@@ -1141,7 +1149,7 @@ def eval_js(
             reply = {"error": "the breakpoint pause is no longer reachable"}
     else:
         reply = _request_or_die(session, "eval", expr=expr)
-    typer.echo(json.dumps(reply, indent=2))
+    typer.echo(ai_compact.dumps_for_ai(reply, for_ai=for_ai))
     raise typer.Exit(code=0 if not reply.get("error") else 1)
 
 
@@ -1255,11 +1263,48 @@ def inspect_page(
     all_nodes: bool = typer.Option(
         False, "--a11y-all", help="Keep semantically uninteresting nodes too."
     ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        help=(
+            "Include a compact list of visible interactive elements with real "
+            "DOM identity: id/name/role/type/value/checked/text. --a11y alone "
+            "has no id/name/value -- turning a spotted control into a locator "
+            "otherwise takes a second, hand-written `debug eval` JS round "
+            "trip. This is that lookup, built in."
+        ),
+    ),
+    interactive_query: str | None = typer.Option(
+        None,
+        "--interactive-query",
+        help="Return only interactive elements whose id/name/role/type/value/"
+        "text/aria-label contains this text (case-insensitive).",
+    ),
+    interactive_selector: str | None = typer.Option(
+        None,
+        "--interactive-selector",
+        help="Scope the interactive-element walk to this selector's subtree.",
+    ),
+    interactive_limit: int = typer.Option(
+        80,
+        "--interactive-limit",
+        help="Cap on returned interactive elements. Narrow with "
+        "--interactive-query/--interactive-selector instead of raising this "
+        "on a dense page.",
+    ),
+    for_ai: bool = typer.Option(
+        False,
+        "--for-ai",
+        help="Compact the reply for a token-paying AI caller: strip trailing "
+        "whitespace and collapse blank-line runs in every string (never "
+        "touches meaningful indentation, e.g. the a11y tree's nesting), and "
+        "print compact JSON instead of indent=2.",
+    ),
 ) -> None:
     """Accessibility snapshot of the live paused page -- no CDP port needed.
 
-    Session-aware version of `cdp inspect --a11y`: same accessibility tree
-    (cheap, greppable, shows nesting and control state), resolved from the
+    Session-aware version of `cdp inspect --a11y`/`--interactive`: same
+    accessibility tree and/or interactive-element list, resolved from the
     session's own `cdp_url` instead of a port you have to look up and type.
     """
     config = AitlcConfig.find_and_load()
@@ -1270,8 +1315,12 @@ def inspect_page(
         interesting_only=not all_nodes,
         a11y_selector=a11y_selector,
         a11y_query=a11y_query,
+        interactive=interactive,
+        interactive_selector=interactive_selector,
+        interactive_query=interactive_query,
+        interactive_limit=interactive_limit,
     )
-    typer.echo(json.dumps(result.to_dict(), indent=2))
+    typer.echo(ai_compact.dumps_for_ai(result.to_dict(), for_ai=for_ai))
 
 
 def _gate_alive(session: debug_session.DebugSession) -> bool:

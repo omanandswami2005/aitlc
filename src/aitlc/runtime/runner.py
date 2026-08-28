@@ -165,22 +165,30 @@ def _find_step_index_for_line(steps: list, target_line: int) -> int | None:
     Shared by `jump`'s line branch and the read-only `resolve_line` --
     same nearest-at-or-before matching, one mutates the cursor, one
     doesn't.
+
+    Tracks the index directly during the scan instead of `steps.index(step)`
+    afterwards: behave's `Step.__eq__` compares only `(step_type, name)`,
+    deliberately ignoring file location, so two steps with identical text
+    (e.g. two "And wait for Loader" rows in the same scenario) are `==` to
+    each other. `list.index()` would then silently return the position of
+    the FIRST identical-text step in the whole scenario -- not the one this
+    function actually matched by line -- exactly the "resolves to the first
+    occurrence" class of bug `_follow_cursor_through_diff` already guards
+    against for the reload/edit path; this is the same class of bug on the
+    `jump`/`resolve_line` path.
     """
-    match = None
-    for step in steps:
+    match_index = None
+    match_line = None
+    for index, step in enumerate(steps):
         step_line = getattr(step, "line", None)
         if step_line is None:
             continue
         if step_line == target_line:
-            match = step
-            break
-        if step_line <= target_line and (
-            match is None or step_line > getattr(match, "line", 0)
-        ):
-            match = step
-    if match is None:
-        return None
-    return steps.index(match)
+            return index
+        if step_line <= target_line and (match_line is None or step_line > match_line):
+            match_index = index
+            match_line = step_line
+    return match_index
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -264,6 +272,75 @@ def _capture_page_state(context: Any) -> dict | None:
     except Exception as exc:  # noqa: BLE001 - page may be navigating; URL alone still helps
         result["accessibility"] = {"error": f"{type(exc).__name__}: {exc}"}
     return result
+
+
+def _split_top_level_js_statements(expr: str) -> list[str]:
+    """Split a JS snippet on top-level `;` only -- depth-aware over
+    `()`/`{}`/`[]` and `'`/`"`/`` ` `` string literals (backslash-escaped
+    quotes honored), so a `;` inside a string, a for-loop header, or an
+    object/array literal is never mistaken for a statement boundary.
+
+    Known, accepted limitation: a `${...}` interpolation inside a
+    template literal re-enters "code" (quotes/braces are live JS again,
+    not template text) -- this treats the whole backtick-to-backtick span
+    as opaque instead, so a `;` inside a `${}` interpolation is not
+    split on either (safe: it just stays glued to whichever statement the
+    template literal started in, never silently corrupts anything).
+    """
+    statements: list[str] = []
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    start = 0
+    for i, ch in enumerate(expr):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "'\"`":
+            quote = ch
+        elif ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            statements.append(expr[start:i])
+            start = i + 1
+    statements.append(expr[start:])
+    return [s for s in (s.strip() for s in statements) if s]
+
+
+def _to_async_iife(expr: str) -> str:
+    """Wrap a JS expression/script for `page.evaluate()` so top-level
+    `await` and REPL-style "value of the last statement" both work --
+    exactly what a browser devtools console (and Claude-in-Chrome's own
+    `javascript_tool`, which explicitly documents top-level `await`)
+    already give you, and what a bare `page.evaluate()` call does not.
+
+    Real gap hit live: `page.evaluate("await somePromise(); window.location
+    .href")` raises "await is only valid in async functions and the top
+    level bodies of modules" -- a bare top-level `await` is invalid
+    outside a module/async-function context, full stop, no matter what
+    Playwright does with the eventual result. Wrapping the WHOLE thing in
+    an async IIFE fixes `await` unconditionally; only the LAST top-level
+    statement is turned into an explicit `return (...)` -- every statement
+    before it (e.g. a `let`/`const` declaration, which is not itself a
+    valid expression and can't be jammed into a comma-expression) is left
+    exactly as written, so declaring and using an intermediate variable
+    across statements keeps working, same as it always has.
+    """
+    statements = _split_top_level_js_statements(expr)
+    if not statements:
+        return "(async () => {})()"
+    *setup, last = statements
+    lines = [f"{stmt};" for stmt in setup]
+    lines.append(f"return (\n{last}\n);")
+    body = "\n".join(lines)
+    return f"(async () => {{\n{body}\n}})()"
 
 
 def _find_page(context: Any) -> Any:
@@ -664,6 +741,32 @@ class AitlcRunner(_BaseRunner):
             return ""
         return f"{getattr(step, 'keyword', '')} {getattr(step, 'name', '')}".strip()
 
+    def _step_line(self, step: Any) -> int | None:
+        """The step's real line in the feature file, or None.
+
+        Step text alone is routinely ambiguous -- the unified UI-action
+        pattern means many steps in one scenario read as the identical
+        "When user performs UI action with parameters", distinguished only
+        by their data table and their position in the file. The line
+        number is what actually pins a reply to one exact Gherkin source
+        location.
+        """
+        return getattr(step, "line", None)
+
+    def _step_table(self, step: Any) -> list[dict] | None:
+        """The step's data table as a list of row dicts, or None if it has none.
+
+        Same motivation as `_step_line`: a step's real content, for the
+        unified UI-action pattern (and any other table-driven step), lives
+        in the table, not the step text -- reporting text alone leaves a
+        caller unable to tell two same-text steps apart, or to tell what a
+        step actually did.
+        """
+        table = getattr(step, "table", None)
+        if table is None:
+            return None
+        return [dict(row.as_dict()) for row in table.rows]
+
     def _side_run(self, step: Any, context: Any = None) -> dict:
         """Re-run one real behave Step object against the live Context.
 
@@ -674,7 +777,12 @@ class AitlcRunner(_BaseRunner):
         """
         self._aitlc_suspended = True
         started = time.time()
-        record: dict = {"step": self._step_text(step), "started_at": _stamp(started)}
+        record: dict = {
+            "step": self._step_text(step),
+            "line": self._step_line(step),
+            "table": self._step_table(step),
+            "started_at": _stamp(started),
+        }
         try:
             # capture=True has no effect here: the gate process is launched
             # with --no-capture (see gate_launch.launch), so behave's own
@@ -783,6 +891,13 @@ class AitlcRunner(_BaseRunner):
         advancing the cursor, touching the step registry, or leaving the
         gate. Never raises into the server loop; a bad expression or a
         page that can't be found both come back as `{"error": ...}`.
+
+        Runs as an async IIFE (`_to_async_iife`), not the raw string, so
+        top-level `await` works -- matching a browser devtools console (and
+        Claude-in-Chrome's own `javascript_tool`, which explicitly supports
+        it) instead of the bare SyntaxError a raw `page.evaluate("await
+        x; y")` throws. Transparent for the common case: a plain single
+        expression still evaluates to exactly the same value.
         """
         self._aitlc_suspended = True
         started = time.time()
@@ -793,7 +908,7 @@ class AitlcRunner(_BaseRunner):
                     "error": "no live page found on context",
                     "duration_s": round(time.time() - started, 2),
                 }
-            result = page.evaluate(expr)
+            result = page.evaluate(_to_async_iife(expr))
             return {"result": result, "duration_s": round(time.time() - started, 2)}
         except Exception as exc:  # noqa: BLE001 - report, never crash the server
             return {
@@ -1153,11 +1268,14 @@ class AitlcRunner(_BaseRunner):
         return {"reloaded": sorted(reloaded), "failed": failed}
 
     def _status(self, cursor: int, steps: list) -> dict:
+        current = steps[cursor] if cursor < len(steps) else None
         return {
             "event": "status",
             "index": cursor,
             "total": len(steps),
-            "current_step": self._step_text(steps[cursor]) if cursor < len(steps) else None,
+            "current_step": self._step_text(current),
+            "current_step_line": self._step_line(current),
+            "current_step_table": self._step_table(current),
             "finished": cursor >= len(steps),
             # None for a plain `debug start --at N` park (nothing failed --
             # there is nothing to explain); the captured assertion/exception
@@ -1254,6 +1372,7 @@ class AitlcRunner(_BaseRunner):
             done=cursor,
             total=len(steps),
             current_step=self._step_text(steps[cursor]) if cursor < len(steps) else None,
+            current_step_line=self._step_line(steps[cursor]) if cursor < len(steps) else None,
             socket=socket_path,
         )
         # Announced on stderr too, so a launcher watching output knows the
@@ -1296,6 +1415,11 @@ class AitlcRunner(_BaseRunner):
                                     if cursor < len(steps)
                                     else None
                                 ),
+                                "current_step_line": (
+                                    self._step_line(steps[cursor])
+                                    if cursor < len(steps)
+                                    else None
+                                ),
                             }
                         )
                         self._write_progress(state="parked", done=cursor, total=len(steps))
@@ -1334,8 +1458,22 @@ class AitlcRunner(_BaseRunner):
                     # Pick up a Gherkin edit too: re-parse and follow the cursor,
                     # so the debugging loop's most common edit needs no restart.
                     feature_info = self._reload_feature(context, cursor)
+                    # Always resync from self._aitlc_steps, not only when
+                    # feature_info is truthy: _reload_feature returns None
+                    # for its "step text unchanged, table/other content
+                    # edited" fast path too (see its docstring/body), but it
+                    # still swaps in freshly parsed Step objects there. This
+                    # loop's local `steps` used to only pick that up when
+                    # feature_info carried relocation info -- a real edit
+                    # that keeps the step's own wording identical (e.g. only
+                    # its data table changed) otherwise left `next`/`retry`
+                    # silently re-running the STALE pre-edit Step object
+                    # (old table, old docstring) despite `reload` claiming
+                    # to have picked up the edit. When nothing changed at
+                    # all, self._aitlc_steps IS `steps` already, so this is
+                    # a no-op in that case.
+                    steps = self._aitlc_steps
                     if feature_info is not None:
-                        steps = self._aitlc_steps
                         cursor = feature_info["index"]
                     reply = {"reloaded": reloaded, "feature": feature_info}
                     if module_reload["reloaded"]:
@@ -1388,6 +1526,8 @@ class AitlcRunner(_BaseRunner):
                                     "jumped_to": cursor,
                                     "total": len(steps),
                                     "current_step": self._step_text(steps[cursor]),
+                                    "current_step_line": self._step_line(steps[cursor]),
+                                    "current_step_table": self._step_table(steps[cursor]),
                                     "finished": cursor >= len(steps),
                                 },
                             )
@@ -1406,6 +1546,8 @@ class AitlcRunner(_BaseRunner):
                                     "jumped_to": cursor,
                                     "total": len(steps),
                                     "current_step": self._step_text(steps[cursor]),
+                                    "current_step_line": self._step_line(steps[cursor]),
+                                    "current_step_table": self._step_table(steps[cursor]),
                                     "finished": cursor >= len(steps),
                                 },
                             )
@@ -1428,6 +1570,8 @@ class AitlcRunner(_BaseRunner):
                                 "resolved_index": match_index,
                                 "total": len(steps),
                                 "current_step": self._step_text(steps[match_index]),
+                                "current_step_line": self._step_line(steps[match_index]),
+                                "current_step_table": self._step_table(steps[match_index]),
                             },
                         )
                 elif cmd == "stop":

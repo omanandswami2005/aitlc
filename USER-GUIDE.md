@@ -3,7 +3,7 @@
 A debugging CLI for Behave + Playwright suites. Structured JSON output, and it
 never asks you to edit the suite it debugs.
 
-Version 0.9.1.
+Version 0.10.0.
 
 Every rule here came from a real investigation that went wrong. Where something
 is stated firmly, it is because the opposite was tried first.
@@ -228,6 +228,8 @@ aitlc debug next PROJ-1234             # run the step under the cursor, then adv
 aitlc debug continue PROJ-1234         # run every remaining step, stop at the first failure
 aitlc debug retry PROJ-1234            # after an edit, re-run that step
 aitlc debug eval PROJ-1234 "document.title"          # raw JS on the live page
+aitlc debug eval PROJ-1234 "document.body.innerText" --for-ai  # + compacted for an AI caller's token budget
+aitlc debug eval PROJ-1234 "await new Promise(r=>setTimeout(r,500)); window.location.href"  # top-level await works
 aitlc debug run-text PROJ-1234 "click on element ID: \"save_btn\""  # any step, no cursor move
 aitlc debug run-line PROJ-1234 42       # same, by file line number instead of retyping text
 aitlc debug jump PROJ-1234 42           # move the cursor there instead -- no execution at all
@@ -236,12 +238,26 @@ aitlc debug restart PROJ-1234 --extra-tag skip_login  # same browser, re-run fro
 aitlc debug status PROJ-1234           # where am I?
 aitlc debug screenshot PROJ-1234        # this session's page, no --cdp-url needed
 aitlc debug inspect PROJ-1234           # same, accessibility tree instead of pixels
+aitlc debug inspect PROJ-1234 --interactive --interactive-query "direct mail"  # + real id/name/value
 aitlc debug list --prune                # every tracked session; drop dead bookkeeping
 aitlc debug reap --dry-run              # real orphaned processes with no session record at all
 aitlc debug certify PROJ-1234 --times 2
 aitlc debug stop PROJ-1234              # THIS session's browser down; no cleanup hooks fired
 aitlc debug stop PROJ-1234 --cleanup    # + fires the suite's real after_scenario/after_feature first
 ```
+
+**`debug eval` supports top-level `await`.** A bare `page.evaluate("await x;
+y")` raises "await is only valid in async functions and the top level
+bodies of modules" — real gap hit live, and the opposite of what a browser
+devtools console (or Claude-in-Chrome's own `javascript_tool`) gives you.
+Every expression now runs wrapped in an async IIFE, so `await` works
+unconditionally; only the LAST top-level statement becomes the return
+value (matching the existing "value of the last statement" REPL
+convention) — everything before it, including a `let`/`const`
+declaration, is left exactly as written, so declaring and using an
+intermediate variable across statements still works. Transparent for the
+overwhelmingly common case, a single expression with no `;`: identical
+value, identical behavior.
 
 `stop --cleanup` calls `after_scenario`/`after_feature` directly, in the live
 paused process, with the real context/scenario/feature — not reconstructed
@@ -462,6 +478,8 @@ lost, nothing restarts, the original call just continues from that exact line.
 aitlc cdp launch                       # detached browser that outlives your shell
 aitlc cdp launch --user-data-dir ~/ChromeDebugSession   # a persistent, named profile instead
 aitlc cdp inspect --port 9333 --a11y   # what a screen reader sees
+aitlc cdp inspect --port 9333 --interactive --interactive-query "direct mail"  # real id/name/value for a locator
+aitlc cdp inspect --port 9333 --a11y --interactive --for-ai   # same, compacted for a token-paying AI caller
 aitlc cdp inspect --port 9333 --storage
 aitlc cdp inspect --check '#save,[data-testid="row"]'
 aitlc cdp time-until '#banner' --condition hidden
@@ -469,6 +487,41 @@ aitlc cdp list                         # every tracked instance, alive or dead
 aitlc cdp stop                          # stops the newest RUNNING instance -- see below
 aitlc cdp stop --all
 ```
+
+**`--a11y` and `--interactive` answer different questions, and compose.**
+`--a11y` is Playwright's `aria_snapshot()` — role/name/state, the cheapest
+way to answer "what's on screen" or "is this checked" as text. It carries
+no DOM identity by design: no `id`, `name`, or attribute value, since
+`aria_snapshot` is a pure accessibility tree. Turning "there's a checked
+radio labelled X" into a real locator from `--a11y` alone used to mean a
+second, hand-written `debug eval`/`cdp eval` JS query. `--interactive`
+is that lookup built in: a compact list of visible interactive elements
+(`a[href], button, input, select, textarea, [role], [onclick]`) with
+`id`/`name`/`role`/`type`/`value`/`checked`/`text`/`aria-label`/
+`data-testid` — the handful of fields a locator actually needs, not a
+full `outerHTML` dump. `--interactive-query <text>` filters by substring
+across every field (case-insensitive); `--interactive-selector <sel>`
+scopes the walk to one subtree; `--interactive-limit N` (default 80) caps
+the returned list while still reporting the true count
+(`total_visible_interactive`/`matched`/`truncated`) — narrow with query/
+selector instead of raising this on a dense page. Both flags exist on
+`cdp inspect` and on the session-aware `aitlc debug inspect` (no port to
+look up). Practical loop: `--a11y --a11y-query "<text>"` to confirm a
+control is on screen and see its accessible name, `--interactive
+--interactive-query "<text>"` to get the concrete `id`/`name`/`value`
+to actually put in the locator map — one round trip each, not one
+followed by hand-written JS.
+
+**`--for-ai`** (on `debug eval`, `cdp inspect`, `debug inspect`) compacts the
+reply for a token-paying AI caller: strips trailing whitespace and collapses
+blank-line runs in every string (via one centralized function,
+`aitlc.core.ai_compact` — the definition of "safe to trim" lives in exactly
+one place, not reinvented per command), and prints compact JSON instead of
+`indent=2`. It never touches leading/interior indentation — an `--a11y`
+tree's nesting is encoded entirely in indentation, so that stays intact;
+this is whitespace cleanup, not summarization or truncation (a length cap
+like `captured_output_pretty_chars` is a separate, still-available concern
+and composes fine with `--for-ai`).
 
 **`cdp stop` with no `--port` targets the newest RUNNING tracked instance**,
 not a fixed port. Real confusion hit live: it used to always default to a
@@ -524,8 +577,9 @@ Already inside a paused `debug` session (not a bare `cdp launch`)? `aitlc
 debug eval TEST-ID "<js-expr>"` reads the same live page without needing the
 port — it runs against whichever page the gate finds on the paused Context.
 `aitlc debug screenshot TEST-ID` and `aitlc debug inspect TEST-ID` are
-the same idea for a screenshot or the accessibility tree: both resolve the
-CDP endpoint from the session itself, so there's nothing to look up first.
+the same idea for a screenshot or the accessibility tree (add `--interactive`
+for real `id`/`name`/`value` alongside it): both resolve the CDP endpoint
+from the session itself, so there's nothing to look up first.
 
 ---
 
@@ -590,6 +644,10 @@ aitlc stepatlas serve --rebuild     # force a fresh regenerate even if already b
 aitlc stepatlas serve --skip-build  # force serving what's there, never regenerate
 aitlc stepatlas info "select database"        # text search
 aitlc stepatlas info features/steps/step_definition_search_page.py:573  # by file:line
+aitlc stepatlas info --page admin-page                    # everything on one page/category, no query needed
+aitlc stepatlas info --page "Account Settings" --uses-api # page + structured filters, composable
+aitlc stepatlas info select --group pages --keyword when  # free text + structured filters together
+aitlc stepatlas info --url "https://app.example.com/admin/accounts/settings/directMail"  # from a live URL
 ```
 
 Requires `[stepatlas]` in `aitlc.toml`:
@@ -599,11 +657,58 @@ Requires `[stepatlas]` in `aitlc.toml`:
 path = "../StepAtlas"   # absolute, or relative to root_dir
 ```
 
-`info` matches a text fragment against pattern/function/keywords (up to 20
-results), or resolves `file:line` to the step at that exact line, falling
-back to the nearest step at or before it in the same file. Both forms
-print the full catalog record (description, `used_by`, `uses_api`,
-`prefer_over`/`superseded_by`, curated notes, and the page `url`).
+`info` takes four kinds of input, freely combined:
+
+- `"file.py:line"` as the query — exact/nearest-before lookup; ignores every
+  other filter, since it already names one precise location.
+- A free-text query — substring match against pattern/function/keywords (up
+  to 20 results).
+- Structured filters — `--page`/`-p` (category slug or label, e.g.
+  `admin-page` or `"Account Settings"`), `--group` (`pages` vs `common`),
+  `--keyword`/`-k` (given/when/then), `--uses-api`/`--no-uses-api`, `--file`
+  (fuzzy path substring, unlike the exact `file:line` form). The query is
+  optional once at least one filter is given, so `--page admin-page` alone
+  lists everything catalogued under that page — this is the answer to "what
+  steps already exist for this page" without guessing a text fragment first.
+- `--url` — heuristic page match from a live URL's path, when you don't
+  already know which `--page` slug it corresponds to (see below).
+
+Every match (any of the four forms) prints the full catalog record
+(description, `used_by`, `uses_api`, `prefer_over`/`superseded_by`, curated
+notes, and the page `url`).
+
+**`--url` is a static token heuristic, not a stored URL-to-step mapping —
+no such mapping exists anywhere.** An SPA's client-side route (e.g.
+`/admin/accounts/settings/directMail`) lives entirely in the frontend's own
+router; a Python/behave catalog has no visibility into it, and building a
+real mapping would mean runtime capture (logging the URL alongside every
+step that actually ran, across many real runs) — a much heavier feature,
+and incomplete until exercised. Instead, `--url` tokenizes the URL's path
+segments (camelCase/kebab-case/snake_case all normalized to the same
+lowercase words — `directMail`, `direct-mail`, and `Direct Mail` all become
+`{"direct", "mail"}`) and scores every category's own slug+label tokens
+against them by Jaccard similarity (intersection / union). The top 3
+scoring categories are kept (a route can legitimately span more than one —
+an `admin-page` step to navigate there, a `direct-mail` step once there),
+and the reply's `url_match` always shows which categories matched and their
+score, so a weak match is visible rather than silently trusted:
+
+```bash
+$ aitlc stepatlas info --url "https://.../admin/accounts/settings/directMail?acId=..."
+{
+  "url_match": [
+    {"slug": "direct-mail", "label": "Direct Mail", "score": 0.4, "matched_tokens": ["direct", "mail"]},
+    {"slug": "admin-page", "label": "Admin Page", "score": 0.2, "matched_tokens": ["admin"]},
+    {"slug": "account-settings", "label": "Account Settings", "score": 0.167, "matched_tokens": ["settings"]}
+  ],
+  "matches": [ ... ]
+}
+```
+
+Query-string params (`?acId=...`) are never tokenized — an opaque id adds
+noise, not a real word. Bridges straight from `debug eval "window.location.
+href"` / `cdp inspect --interactive` (which already tell you the live URL)
+to "what steps exist here", without hand-picking a `--page` slug first.
 
 ---
 

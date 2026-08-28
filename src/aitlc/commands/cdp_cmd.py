@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 from aitlc.config import AitlcConfig
+from aitlc.core import ai_compact
 from aitlc.core import chrome_cdp
 from aitlc.core import cdp_attach
 from aitlc.core import debug_session
@@ -65,6 +66,37 @@ def inspect(
         "--a11y-selector",
         help="Scope the accessibility tree to this selector's subtree.",
     ),
+    interactive: bool = typer.Option(
+        False,
+        "--interactive",
+        help=(
+            "Include a compact list of visible interactive elements with real "
+            "DOM identity: id/name/role/type/value/checked/text. --a11y alone "
+            "has no id/name/value (aria_snapshot is a pure role/name/state "
+            "tree) -- turning a spotted control into a locator otherwise takes "
+            "a second, hand-written `cdp eval`/`debug eval` JS round trip. "
+            "This is that lookup, built in."
+        ),
+    ),
+    interactive_query: str | None = typer.Option(
+        None,
+        "--interactive-query",
+        help="Return only interactive elements whose id/name/role/type/value/"
+        "text/aria-label contains this text (case-insensitive).",
+    ),
+    interactive_selector: str | None = typer.Option(
+        None,
+        "--interactive-selector",
+        help="Scope the interactive-element walk to this selector's subtree.",
+    ),
+    interactive_limit: int = typer.Option(
+        80,
+        "--interactive-limit",
+        help="Cap on returned interactive elements (the true count is still "
+        "reported as truncated/matched/total_visible_interactive). Narrow "
+        "with --interactive-query/--interactive-selector instead of raising "
+        "this on a dense page.",
+    ),
     storage: bool = typer.Option(
         False,
         "--storage",
@@ -74,6 +106,14 @@ def inspect(
         False,
         "--reveal",
         help="Print storage values in full. A session cookie is a working credential.",
+    ),
+    for_ai: bool = typer.Option(
+        False,
+        "--for-ai",
+        help="Compact the reply for a token-paying AI caller: strip trailing "
+        "whitespace and collapse blank-line runs in every string (never "
+        "touches meaningful indentation, e.g. the a11y tree's nesting), and "
+        "print compact JSON instead of indent=2.",
     ),
 ) -> None:
     """Inspect a live page over CDP."""
@@ -101,10 +141,14 @@ def inspect(
         interesting_only=not all_nodes,
         a11y_selector=a11y_selector,
         a11y_query=a11y_query,
+        interactive=interactive,
+        interactive_selector=interactive_selector,
+        interactive_query=interactive_query,
+        interactive_limit=interactive_limit,
         storage=storage,
         reveal_values=reveal,
     )
-    typer.echo(json.dumps(result.to_dict(), indent=2))
+    typer.echo(ai_compact.dumps_for_ai(result.to_dict(), for_ai=for_ai))
 
 
 @app.command("launch")

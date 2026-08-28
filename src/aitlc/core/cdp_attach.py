@@ -121,6 +121,10 @@ class InspectionResult:
     # Present only when explicitly requested, since it is much larger than
     # the rest of the payload.
     accessibility: dict[str, Any] | None = None
+    # Compact list of visible interactive elements with real DOM identity
+    # (id/name/role/type/value/checked/text). Present only when explicitly
+    # requested, same reasoning as `accessibility`.
+    interactive: dict[str, Any] | None = None
     storage: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -144,6 +148,7 @@ class InspectionResult:
                 for c in self.checks
             ],
             "accessibility": self.accessibility,
+            **({"interactive": self.interactive} if self.interactive is not None else {}),
         }
 
 
@@ -180,6 +185,103 @@ def _shape_yaml(tree: str, *, query: str | None, selector: str | None) -> dict:
             "full_chars": len(tree),
         }
     )
+    return result
+
+
+_INTERACTIVE_ELEMENTS_JS = """
+(root) => {
+  root = root || document;
+  const SEL = "a[href], button, input, select, textarea, [role], [onclick]";
+  const out = [];
+  for (const el of root.querySelectorAll(SEL)) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === "hidden" || style.display === "none") continue;
+    const entry = { tag: el.tagName.toLowerCase() };
+    if (el.id) entry.id = el.id;
+    const name = el.getAttribute("name");
+    if (name) entry.name = name;
+    const role = el.getAttribute("role");
+    if (role) entry.role = role;
+    const type = el.getAttribute("type");
+    if (type) entry.type = type;
+    if ("value" in el && el.value) entry.value = String(el.value).slice(0, 80);
+    if ("checked" in el) entry.checked = !!el.checked;
+    if ("disabled" in el) entry.disabled = !!el.disabled;
+    const text = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 80);
+    if (text) entry.text = text;
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel) entry.aria_label = ariaLabel;
+    const testid = el.getAttribute("data-testid") || el.getAttribute("data-test-id");
+    if (testid) entry.data_testid = testid;
+    out.push(entry);
+  }
+  return out;
+}
+"""
+
+
+def _matches_query(entry: dict, needle: str) -> bool:
+    return any(needle in str(v).lower() for v in entry.values())
+
+
+def _interactive_elements(
+    page: Any,
+    *,
+    selector: str | None = None,
+    query: str | None = None,
+    limit: int = 80,
+) -> dict:
+    """Compact list of live, visible interactive elements: id/name/role/type/
+    value/checked/text -- the concrete DOM attributes a locator needs, in
+    one call.
+
+    `_accessibility_tree` (Playwright's `aria_snapshot()`) answers "what's
+    on screen" cheaply, but by design carries no DOM identity -- no `id`,
+    `name`, or attribute value, since aria_snapshot is a pure role/name/
+    state tree. Turning "there's a checked radio labelled X" into a real
+    locator has, in practice, meant a *second* round trip: a hand-written
+    `debug eval` JS query to pull `id`/`name`/`value` off the matching
+    input. This collapses that into the same call: a plain
+    `querySelectorAll` walk over interactive elements (`a[href], button,
+    input, select, textarea, [role], [onclick]`), filtered to visible
+    ones, each entry capped to the handful of fields a locator actually
+    needs -- not a full outerHTML dump.
+
+    `selector` scopes the walk to one subtree (evaluated with that
+    element as `root`, same convention `_accessibility_tree`'s
+    `a11y_selector` uses). `query` filters by substring (case-insensitive)
+    over every field's string value. `limit` caps the returned list (the
+    raw count is still reported) so a dense page doesn't flood the reply
+    -- narrow with `selector`/`query` instead of raising this.
+    """
+    try:
+        if selector:
+            root = page.locator(selector).element_handle()
+            if root is None:
+                return {"error": f"no element matched selector {selector!r}"}
+            elements = page.evaluate(_INTERACTIVE_ELEMENTS_JS, root)
+        else:
+            elements = page.evaluate(_INTERACTIVE_ELEMENTS_JS, None)
+    except Exception as exc:  # noqa: BLE001 - page may be navigating
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    total = len(elements)
+    if query:
+        needle = query.lower()
+        elements = [e for e in elements if _matches_query(e, needle)]
+    matched = len(elements)
+    result: dict[str, Any] = {
+        "total_visible_interactive": total,
+        "matched": matched,
+        "truncated": matched > limit,
+        "elements": elements[:limit],
+    }
+    if selector:
+        result["scoped_to"] = selector
+    if query:
+        result["query"] = query
     return result
 
 
@@ -249,6 +351,10 @@ def inspect(
     interesting_only: bool = True,
     a11y_selector: str | None = None,
     a11y_query: str | None = None,
+    interactive: bool = False,
+    interactive_selector: str | None = None,
+    interactive_query: str | None = None,
+    interactive_limit: int = 80,
     storage: bool = False,
     reveal_values: bool = False,
 ) -> InspectionResult:
@@ -264,6 +370,14 @@ def inspect(
     vision model to yield the same answer. `interesting_only` keeps
     Playwright's own filtering, which drops nodes that carry no semantic
     information.
+
+    `interactive` adds a compact list of live, visible interactive
+    elements with their real DOM identity (id/name/role/type/value/
+    checked/text) -- what `accessibility` intentionally omits (a pure
+    aria role/name/state tree has no `id`). Answering "what do I put in
+    the locator map for this checked radio" from `accessibility` alone
+    means a second, hand-written `debug eval` JS round trip; this is that
+    lookup built in.
     """
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(cdp_url)
@@ -278,6 +392,15 @@ def inspect(
                 interesting_only=interesting_only,
                 selector=a11y_selector,
                 query=a11y_query,
+            )
+
+        interactive_elements: dict | None = None
+        if interactive:
+            interactive_elements = _interactive_elements(
+                page,
+                selector=interactive_selector,
+                query=interactive_query,
+                limit=interactive_limit,
             )
 
         checks: list[LocatorCheck] = []
@@ -322,6 +445,7 @@ def inspect(
             screenshot_path=saved_path,
             checks=checks,
             accessibility=tree,
+            interactive=interactive_elements,
             storage=(
                 collect_storage(context, page, reveal=reveal_values)
                 if storage

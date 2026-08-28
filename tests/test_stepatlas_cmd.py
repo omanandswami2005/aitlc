@@ -51,6 +51,44 @@ CATALOG = {
 }
 
 
+CATALOG_URL = {
+    "steps": CATALOG["steps"]
+    + [
+        {
+            "pattern": "click on the element locator \"{locator}\" and wait for the "
+            "next element locator \"{next_locator}\"",
+            "function": "click_and_wait_direct_mail_menu_item",
+            "file": "features/steps/step_definition_admin_page.py",
+            "line": 304,
+            "keywords": ["when"],
+            "description": "",
+            "uses_api": False,
+            "used_by": [],
+            "prefer_over": [],
+            "superseded_by": [],
+            "curator_notes": [],
+            "category": {"group": "pages", "slug": "direct-mail", "label": "Direct Mail"},
+            "url": "/pages/direct-mail/#anchor-c",
+        },
+        {
+            "pattern": "Open Admin Panel and select \"{options}\"",
+            "function": "open_admin_panel_and_select_option_from_list",
+            "file": "features/steps/step_definition_admin_page.py",
+            "line": 91,
+            "keywords": ["when"],
+            "description": "",
+            "uses_api": False,
+            "used_by": [],
+            "prefer_over": [],
+            "superseded_by": [],
+            "curator_notes": [],
+            "category": {"group": "pages", "slug": "admin-page", "label": "Admin Page"},
+            "url": "/pages/admin-page/#anchor-d",
+        },
+    ]
+}
+
+
 @pytest.fixture
 def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     stepatlas_dir = tmp_path / "StepAtlas"
@@ -111,6 +149,69 @@ def test_info_no_match_exits_nonzero(project):
     (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
     result = runner.invoke(app, ["stepatlas", "info", "totally-unrelated-xyz"])
     assert result.exit_code == 2
+
+
+def test_info_filters_by_page_slug_alone_no_query_needed(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    result = runner.invoke(app, ["stepatlas", "info", "--page", "search-page"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["matches"][0]["function"] == "select_database"
+
+
+def test_info_filters_by_page_label_case_insensitive_substring(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    result = runner.invoke(app, ["stepatlas", "info", "--page", "common page"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["matches"][0]["function"] == "click_on_element_by_id"
+
+
+def test_info_filters_by_group(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    result = runner.invoke(app, ["stepatlas", "info", "--group", "pages"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["count"] == 1
+    assert payload["matches"][0]["function"] == "select_database"
+
+
+def test_info_uses_api_filter_composes_with_page(project):
+    catalog = json.loads(json.dumps(CATALOG))
+    catalog["steps"][1]["uses_api"] = True
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(catalog))
+
+    result = runner.invoke(app, ["stepatlas", "info", "--group", "pages", "--uses-api"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["matches"][0]["function"] == "select_database"
+
+    result = runner.invoke(app, ["stepatlas", "info", "--group", "pages", "--no-uses-api"])
+    assert result.exit_code == 2
+
+
+def test_info_filters_by_file_substring(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    result = runner.invoke(app, ["stepatlas", "info", "--file", "search_page"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["matches"][0]["function"] == "select_database"
+
+
+def test_info_page_filter_composes_with_free_text_query(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    # "click" only appears in the common-page step's pattern -- --page narrows
+    # to search-page first, so this must find nothing despite the query alone
+    # matching a step elsewhere in the catalog.
+    result = runner.invoke(app, ["stepatlas", "info", "click", "--page", "search-page"])
+    assert result.exit_code == 2
+
+
+def test_info_requires_a_query_or_at_least_one_filter(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG))
+    result = runner.invoke(app, ["stepatlas", "info"])
+    assert result.exit_code == 2
+    assert "provide a query" in result.output
 
 
 def test_build_shells_out_with_project_config(project, monkeypatch):
@@ -207,3 +308,79 @@ def test_stop_reports_empty_when_nothing_running(project, monkeypatch):
     result = runner.invoke(app, ["stepatlas", "stop"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {"stopped": []}
+
+
+def test_info_url_matches_camel_case_path_segment_to_kebab_case_slug(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG_URL))
+    result = runner.invoke(
+        app,
+        [
+            "stepatlas",
+            "info",
+            "--url",
+            "https://app.example.com/admin/accounts/settings/directMail?acId=abc123",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    functions = {m["function"] for m in payload["matches"]}
+    # "directMail" (camelCase path segment) must resolve to the "direct-mail"
+    # (kebab-case slug) category -- tokenization has to normalize past the
+    # casing convention mismatch, not assume one.
+    assert "click_and_wait_direct_mail_menu_item" in functions
+    assert "select_database" not in functions  # unrelated category, excluded
+
+
+def test_info_url_reports_matched_categories_and_scores(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG_URL))
+    result = runner.invoke(
+        app, ["stepatlas", "info", "--url", "https://app.example.com/admin/accounts"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["url"] == "https://app.example.com/admin/accounts"
+    slugs = {c["slug"] for c in payload["url_match"]}
+    assert "admin-page" in slugs
+    for c in payload["url_match"]:
+        assert 0 < c["score"] <= 1
+        assert c["matched_tokens"]
+
+
+def test_info_url_with_no_token_overlap_errors_with_a_hint(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG_URL))
+    result = runner.invoke(
+        app, ["stepatlas", "info", "--url", "https://app.example.com/totally/unrelated/zzz"]
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["url_match"] == []
+    assert "hint" in payload
+
+
+def test_info_url_composes_with_keyword_filter(project):
+    (project / "StepAtlas" / "catalog.json").write_text(json.dumps(CATALOG_URL))
+    result = runner.invoke(
+        app,
+        [
+            "stepatlas",
+            "info",
+            "--url",
+            "https://app.example.com/admin/accounts/settings/directMail",
+            "--keyword",
+            "then",
+        ],
+    )
+    # Every step in CATALOG_URL is "when" -- --keyword then must narrow to nothing
+    # despite --url matching real categories.
+    assert result.exit_code == 2
+
+
+def test_info_url_query_param_is_never_tokenized():
+    from aitlc.commands.stepatlas_cmd import _url_path_tokens
+
+    tokens = _url_path_tokens(
+        "https://app.example.com/admin/accounts?acId=QWNjb3VudFR5cGU6NDk1MWVj"
+    )
+    assert "admin" in tokens
+    assert "accounts" in tokens
+    assert not any("qwnjb3vudfr5" in t for t in tokens)
